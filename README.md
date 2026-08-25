@@ -421,7 +421,8 @@ After the kernel equilibrium converges, the mean-field trajectory
 (`solve_bar_equilibrium`) is obtained by solving the affine 2N x 2N system for
 the mean controls directly: the matrix is built by 2N applications of the map
 (one pair of backward bar adjoints each) and factored (bar residual ~1e-14);
-matrix-free GMRES is used only above 2N = 1600.  Restarted GMRES stagnated in
+matrix-free GMRES is used only above 2N = 1600.  The 2N columns are built in
+parallel (N=160: 12 -> 4 ms, 8 threads).  Restarted GMRES stagnated in
 the cheap-effort regime and its relaxed fallback then diverged, producing
 mean-field costs of 1e303 in cases whose kernel equilibrium had converged --
 the stress test now requires the whole pipeline (kernels, mean-field solve,

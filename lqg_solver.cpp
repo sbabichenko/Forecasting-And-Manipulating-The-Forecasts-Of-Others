@@ -1410,8 +1410,9 @@ BarSolution solve_bar_equilibrium(
         // Direct solve: build I - L column by column (2N applications of the affine map, each a
         // pair of backward bar adjoints) and factor.  Robust when the effort cost is small and
         // the map is far from a contraction, where restarted GMRES can stagnate.
-        Eigen::MatrixXd Mtx(dim, dim); Eigen::VectorXd col;
-        for (int k = 0; k < dim; ++k) { Eigen::VectorXd e = Eigen::VectorXd::Unit(dim, k); apply_M(e, col); Mtx.col(k) = col; }
+        Eigen::MatrixXd Mtx(dim, dim);
+        #pragma omp parallel for schedule(dynamic, 4) if (!omp_in_parallel())
+        for (int k = 0; k < dim; ++k) { Eigen::VectorXd e = Eigen::VectorXd::Unit(dim, k), col; apply_M(e, col); Mtx.col(k) = col; }   // columns are independent
         d = Mtx.partialPivLu().solve(c);
     } else
     // GMRES(m) with modified Gram-Schmidt for large N
