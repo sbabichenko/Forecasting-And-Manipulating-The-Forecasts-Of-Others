@@ -669,7 +669,11 @@ struct Solver {
     Out solve(VectorXd z, double tol, int pre = 0, double relax = 0.1, int maxsteps = 30) {
         Out o; o.jacobians = 0; o.ok = false;
         { double lam = relax, best = std::numeric_limits<double>::infinity(); VectorXd zbest = z;
-          for (int k = 0; k < pre; ++k) { const VectorXd r = have_cur ? M.residual(z, nullptr, &cur) : M.residual(z); ++evals; const double rn = r.cwiseAbs().maxCoeff();
+          for (int k = 0; k < pre; ++k) {
+              VectorXd r;
+              if (!have_cur || k % 10 == 0) { cur = Model::Diag(); r = M.residual(z, &cur); have_cur = true; }   // refresh factorizations periodically
+              else r = M.residual(z, nullptr, &cur);                                                          // preconditioned in between
+              ++evals; const double rn = r.cwiseAbs().maxCoeff();
               if (verbose && k % 20 == 0) std::fprintf(stderr, "  pre %d: |r| %.3e relax %.3g\n", k, rn, lam);
               if (!std::isfinite(rn) || rn > 2.0 * best) { z = zbest; lam *= 0.5; if (lam < 1e-3) break; continue; }
               if (rn < best) { best = rn; zbest = z; } if (rn < 1e-3) break; z += lam * r; }
@@ -833,7 +837,7 @@ int main(int argc, char* argv[]) {
     std::vector<VectorXd> gam;
     { std::string s = argv[6]; size_t p = 0; while (p <= s.size()) { size_t e = s.find(';', p); if (e == std::string::npos) e = s.size(); auto v = parse_list(s.substr(p, e - p)); VectorXd g(q); for (int k = 0; k < q; ++k) g[k] = v.size() == 1 ? v[0] : v[k]; gam.push_back(g); p = e + 1; } }
     MatrixXd SV = MatrixXd::Identity(q, q), SZ = MatrixXd::Identity(q, q);
-    double tol = 1e-10, split_b = 0.0, map_alpha = 0.0; int uniform = 0, coarse = 0, n1 = 0; bool verbose = false, eval_only = false, adaptive = true, tangent = true, use_jfnk = true, use_analytic = true, check_jac = false, exact_nt = true, range_nt = false, lagged_nt = true; int gm_max = 12, lag_its = 8; double gm_tol = 1e-3; std::vector<double> path; std::string init_file;
+    double tol = 1e-10, split_b = 0.0, map_alpha = 0.0; int uniform = 0, coarse = 0, n1 = 0; bool verbose = false, eval_only = false, adaptive = true, tangent = true, use_jfnk = true, use_analytic = true, check_jac = false, exact_nt = true, range_nt = false, lagged_nt = true; int gm_max = 12, lag_its = 8, pre_steps = 60; double min_ratio = 0.25; double gm_tol = 1e-3; std::vector<double> path; std::string init_file;
     for (int i = 7; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--sigma-v") && i + 1 < argc) { auto v = parse_list(argv[++i]); for (int r = 0; r < q; ++r) for (int c = 0; c < q; ++c) SV(r, c) = v[r * q + c]; }
         else if (!std::strcmp(argv[i], "--sigma-z") && i + 1 < argc) { auto v = parse_list(argv[++i]); for (int r = 0; r < q; ++r) for (int c = 0; c < q; ++c) SZ(r, c) = v[r * q + c]; }
@@ -849,6 +853,8 @@ int main(int argc, char* argv[]) {
         else if (!std::strcmp(argv[i], "--range")) range_nt = true;
         else if (!std::strcmp(argv[i], "--lagged") && i + 1 < argc) { lagged_nt = true; lag_its = std::atoi(argv[++i]); }
         else if (!std::strcmp(argv[i], "--no-lag")) lagged_nt = false;
+        else if (!std::strcmp(argv[i], "--pre") && i + 1 < argc) pre_steps = std::atoi(argv[++i]);
+        else if (!std::strcmp(argv[i], "--min-ratio") && i + 1 < argc) min_ratio = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "--gmres") && i + 2 < argc) { gm_max = std::atoi(argv[++i]); gm_tol = std::atof(argv[++i]); }
         else if (!std::strcmp(argv[i], "--fd-jacobian")) use_analytic = false;
         else if (!std::strcmp(argv[i], "--check-jacobian")) check_jac = true;
@@ -877,7 +883,7 @@ int main(int argc, char* argv[]) {
     auto continuation = [&](Model& M, Solver& S, VectorXd z, std::vector<double> path, int pre0, bool& ok_out) {
         VectorXd zprev; double eprev = 0; bool have_prev = false;
         Solver::Out o; o.ok = false;
-        int bisections = 0; double factor = 0.5;                   // adaptive: next eps = factor * current
+        int bisections = 0; double factor = std::max(min_ratio, 0.5);                   // adaptive: next eps = factor * current
         for (size_t k = 0; k < path.size(); ++k) {
             M.eps = path[k];
             VectorXd zstart = z;
@@ -912,7 +918,7 @@ int main(int argc, char* argv[]) {
                 // replace the rest of the path by one geometric step, sized by how easy this step was:
                 // quick solve -> allow a somewhat larger ratio, slow solve -> smaller; never below 0.25 per step
                 if (o.steps <= 5) factor *= 0.8; else if (o.steps >= 12) factor = std::sqrt(factor);
-                factor = std::max(0.25, std::min(0.7, factor));
+                factor = std::max(min_ratio, std::min(0.7, factor));
                 const double target = path.back();
                 double next = path[k] * factor; if (next < target) next = target;
                 path.erase(path.begin() + k + 1, path.end()); path.push_back(next); if (next > target) path.push_back(target);
@@ -965,7 +971,7 @@ int main(int argc, char* argv[]) {
         Solver Sc(Mc); Sc.verbose = verbose; Sc.jfnk = use_jfnk; Sc.analytic = use_analytic; Sc.exact_newton = exact_nt; Sc.range_newton = range_nt; Sc.lagged = lagged_nt; Sc.lag_max_its = lag_its;
         VectorXd zc = VectorXd::Zero(Mc.dim() * Mc.NT);
         bool okc = false;
-        const Solver::Out oc = continuation(Mc, Sc, zc, path, 60, okc);
+        const Solver::Out oc = continuation(Mc, Sc, zc, path, pre_steps, okc);
         S.evals += Sc.evals;
         if (!okc) { std::fprintf(stderr, "coarse continuation failed\n"); return 2; }
         const MatrixXd P = Grid(coarse, L).interp(M.K.x);            // (N x coarse)
@@ -979,7 +985,7 @@ int main(int argc, char* argv[]) {
         if (verbose) std::fprintf(stderr, "[N=%d] eps=%g from coarse N=%d: %s |r| %.2e, %d steps, %d jacobians, %ld evals, %.1f s elapsed\n", N, eps, coarse, o.ok ? "ok" : "FAIL", o.resid, o.steps, o.jacobians, S.evals, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
         if (o.ok) z = o.z;
     } else {
-        o = continuation(M, S, z, path, init_file.empty() ? 60 : 0, ok);
+        o = continuation(M, S, z, path, init_file.empty() ? pre_steps : 0, ok);
         z = o.z;
     }
     const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
