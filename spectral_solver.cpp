@@ -495,6 +495,8 @@ void print_kernel(const char* name, const MatrixXd& v, bool last = false) {
 
 }  // namespace
 
+static bool threads_set = false;
+
 int main(int argc, char* argv[]) {
     if (argc < 5) {
         std::fprintf(stderr, "usage: %s p1 p2 r1 r2 [--N 24] [--L 3] [--tol 1e-12] [--pre 40] [--relax 0.1] [--pre 15] [--relax 0.1] [--jac-ftol 1e-9] [--pre-ftol 1e-6] [--threads t] [--uniform n] [--eval-only] [--verbose]\n", argv[0]);
@@ -520,7 +522,7 @@ int main(int argc, char* argv[]) {
         else if (!std::strcmp(argv[i], "--pre-ftol") && i + 1 < argc) pre_ftol = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "--threads") && i + 1 < argc) { 
 #ifdef _OPENMP
-            omp_set_num_threads(std::atoi(argv[++i]));
+            omp_set_num_threads(std::atoi(argv[++i])); threads_set = true;
 #else
             ++i;
 #endif
@@ -529,7 +531,7 @@ int main(int argc, char* argv[]) {
 #ifdef _OPENMP
     // Jacobian columns parallelize; beyond the physical cores the extra
     // threads only spin.  8 matches the development machine.
-    if (!std::getenv("OMP_NUM_THREADS")) omp_set_num_threads(std::min(8, omp_get_num_procs()));
+    if (!threads_set && !std::getenv("OMP_NUM_THREADS")) omp_set_num_threads(std::min(8, omp_get_num_procs()));
 #endif
     const auto t0 = std::chrono::steady_clock::now();
     Model M(N, L, p1, p2, r1, r2);

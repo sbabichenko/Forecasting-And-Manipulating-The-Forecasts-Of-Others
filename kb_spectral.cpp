@@ -373,6 +373,8 @@ void print_kernel(const char* name, const MatrixXd& k, bool last = false) {
 
 }  // namespace
 
+static bool threads_set = false;
+
 int main(int argc, char* argv[]) {
     // Large Eigen temporaries would otherwise be mmap'ed and freed on every
     // evaluation, which serializes the parallel Jacobian in the kernel.
@@ -394,14 +396,14 @@ int main(int argc, char* argv[]) {
         else if (!std::strcmp(argv[i], "--eps-path") && i + 1 < argc) { std::string s = argv[++i]; size_t p = 0; while (p <= s.size()) { size_t q = s.find(',', p); if (q == std::string::npos) q = s.size(); path.push_back(std::atof(s.substr(p, q - p).c_str())); p = q + 1; } }
         else if (!std::strcmp(argv[i], "--threads") && i + 1 < argc) {
 #ifdef _OPENMP
-            omp_set_num_threads(std::atoi(argv[++i]));
+            omp_set_num_threads(std::atoi(argv[++i])); threads_set = true;
 #else
             ++i;
 #endif
         }
     }
 #ifdef _OPENMP
-    if (!std::getenv("OMP_NUM_THREADS")) omp_set_num_threads(std::min(8, omp_get_num_procs()));
+    if (!threads_set && !std::getenv("OMP_NUM_THREADS")) omp_set_num_threads(std::min(8, omp_get_num_procs()));
 #endif
     // default continuation path: from a well-posed cost down to the target
     if (path.empty()) { for (double e : {0.3, 0.05, 0.01, 0.002}) if (e > eps) path.push_back(e); path.push_back(eps); }

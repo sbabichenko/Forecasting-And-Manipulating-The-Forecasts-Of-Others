@@ -303,6 +303,7 @@ struct Solver {
         Out o; o.jacobians = 0; o.ok = false;
         { double lam = relax, best = std::numeric_limits<double>::infinity(); VectorXd zbest = z;
           for (int k = 0; k < pre; ++k) { const VectorXd r = M.residual(z); ++evals; const double rn = r.cwiseAbs().maxCoeff();
+              if (verbose && k % 20 == 0) std::fprintf(stderr, "  pre %d: |r| %.3e relax %.3g\n", k, rn, lam);
               if (!std::isfinite(rn) || rn > 2.0 * best) { z = zbest; lam *= 0.5; if (lam < 1e-3) break; continue; }
               if (rn < best) { best = rn; zbest = z; } if (rn < 1e-3) break; z += lam * r; }
           z = zbest; }
@@ -338,6 +339,8 @@ void print_mat(const MatrixXd& A) { std::printf("["); for (int r = 0; r < A.rows
 
 }  // namespace
 
+static bool threads_set = false;
+
 int main(int argc, char* argv[]) {
     mallopt(M_MMAP_THRESHOLD, 1 << 30); mallopt(M_TRIM_THRESHOLD, 1 << 30); mallopt(M_TOP_PAD, 256 << 20);
     if (argc < 7) { std::fprintf(stderr, "usage: %s N L eps rho q \"g11,..;g21,..\" [--sigma-v ...] [--sigma-z ...] [--eps-path ...] [--tol t] [--uniform n] [--threads t] [--verbose]\n", argv[0]); return 1; }
@@ -355,14 +358,14 @@ int main(int argc, char* argv[]) {
         else if (!std::strcmp(argv[i], "--verbose")) verbose = true;
         else if (!std::strcmp(argv[i], "--threads") && i + 1 < argc) {
 #ifdef _OPENMP
-            omp_set_num_threads(std::atoi(argv[++i]));
+            omp_set_num_threads(std::atoi(argv[++i])); threads_set = true;
 #else
             ++i;
 #endif
         }
     }
 #ifdef _OPENMP
-    if (!std::getenv("OMP_NUM_THREADS")) omp_set_num_threads(std::min(8, omp_get_num_procs()));
+    if (!threads_set && !std::getenv("OMP_NUM_THREADS")) omp_set_num_threads(std::min(8, omp_get_num_procs()));
 #endif
     if (path.empty()) { for (double e : {0.3, 0.1, 0.05, 0.02, 0.01, 0.005, 0.002}) if (e > eps) path.push_back(e); path.push_back(eps); }   // correlated-value cases need the finer path
     const auto t0 = std::chrono::steady_clock::now();
@@ -374,9 +377,9 @@ int main(int argc, char* argv[]) {
         M.eps = path[k];
         VectorXd zstart = z;
         if (have_prev) zstart = z + (z - zprev) * ((path[k] - path[k - 1]) / (path[k - 1] - eprev));
-        o = S.solve(zstart, tol, k == 0 ? 200 : 0, 0.1);
+        o = S.solve(zstart, tol, k == 0 ? 60 : 0, 0.1);
         if (!o.ok) { S.have_J = false; o = S.solve(z, tol, k == 0 ? 0 : 30, 0.1); }
-        if (verbose) std::fprintf(stderr, "eps=%g: %s |r| %.2e, %d steps, %d jacobians, %ld evals\n", path[k], o.ok ? "ok" : "FAIL", o.resid, o.steps, o.jacobians, S.evals);
+        if (verbose) std::fprintf(stderr, "eps=%g: %s |r| %.2e, %d steps, %d jacobians, %ld evals, %.1f s elapsed\n", path[k], o.ok ? "ok" : "FAIL", o.resid, o.steps, o.jacobians, S.evals, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
         if (!o.ok) break;
         if (k > 0) { zprev = z; eprev = path[k - 1]; have_prev = true; }
         z = o.z;
