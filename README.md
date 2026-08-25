@@ -26,7 +26,7 @@ C++ solver code). Sliders control all game parameters in real time:
 ```bash
 # Requires Emscripten SDK
 source /path/to/emsdk/emsdk_env.sh
-em++ -O3 -s WASM=1 -s EXPORTED_RUNTIME_METHODS='["cwrap","UTF8ToString"]' \
+em++ -O3 -s WASM=1 -s SINGLE_FILE=1 -s EXPORTED_RUNTIME_METHODS='["cwrap","UTF8ToString"]' \
      -s ALLOW_MEMORY_GROWTH=1 -s MODULARIZE=1 -s EXPORT_NAME=SolverModule \
      -I/path/to/eigen3 \
      wasm_solver.cpp lqg_solver.cpp -o solver.js
@@ -39,8 +39,16 @@ python3 build_html.py   # inlines solver.js into interactive_template.html
 # Dependencies: Eigen 3.3+, CMake 3.14+, C++17 compiler, OpenMP (optional)
 mkdir build && cd build
 cmake .. && make -j$(nproc)
-cd .. && ./build/generate_figures   # writes CSV to data/
-python3 plot_figures.py             # renders Figures 3-12 as PDF
+cd ..
+./build/generate_figures 40 data_N40     # writes CSV at N=40
+./build/generate_figures 79 data_N79     # same at N=79 (nested grid: every second point coincides)
+python3 richardson.py data_N40 data_N79 data   # first-order Richardson extrapolation -> data/
+python3 plot_figures.py                  # renders Figures 3-12 as PDF from data/
+
+The kernel scheme is first order in the grid spacing (observed order 1.04-1.06 on
+costs and kernel values; N=40 alone is ~3% off, N=160 ~0.7%).  The extrapolated
+data 2 f(79) - f(40) are accurate to about 0.1% at the cost of ~1 min; the
+residual-history table (fig3) and the 2-D kernel tables are copied from N=40.
 ```
 
 ## Project structure
@@ -48,11 +56,13 @@ python3 plot_figures.py             # renders Figures 3-12 as PDF
 ```
 Core solver
   lqg_solver.h             type definitions, constants, function declarations
-  lqg_solver.cpp           solver implementation (kernels, fixed-point loops, Anderson acceleration)
+  lqg_solver.cpp           solver implementation (kernels and fixed-point loops)
 
 Native executables
   generate_figures.cpp     batch driver: solves equilibria, writes CSV to data/
   solve_interactive.cpp    terminal-based interactive solver (reads parameters from stdin)
+  solve_stationary.cpp     standalone infinite-horizon/stationary lag solver
+  stationary_neural_solver.py  experimental neural/Galerkin stationary residual solver
   benchmark.cpp            performance benchmark across grid sizes
 
 Interactive web app
@@ -70,13 +80,107 @@ Build & config
   data/                    generated CSV files (created by generate_figures)
 ```
 
+## Stationary solver
+
+`solve_stationary` is a separate infinite-horizon solver based on
+`stationary_two_sided_H_memo.pdf`. It does not change the finite-horizon or
+WASM paths. It works on a truncated lag grid:
+
+- causal lags `a in [0,L]` for `x(a)`, `d_i(a)`, and `calD_i(a)`;
+- two-sided primitive-shock lags `b in [-L,L]` for `h_X^i(b)` and the wedge;
+- the backward wedge block is solved as a dense linear system for the
+  discretized affine map `(I - T)v = c`, rather than by Picard iteration.
+
+Example:
+
+```bash
+cmake --build build --target solve_stationary
+./build/solve_stationary 3 3 0.1 0.1 --N 15 --iters 1800 --relax 0.01 \
+  --tol 3e-5 --abs-tol 1e-4 --quadrature simpson \
+  | jq '{converged,relative_residual,absolute_residual,tail,zero_lag}'
+```
+
+### Fast configuration
+
+`--forward exact` replaces the inner state--filter Picard iteration with an
+exact per-observer projection solve (unconditionally stable; the Picard
+iteration loses contractivity at fine grids as the near-interface layer
+sharpens). `--anderson 5` enables Anderson acceleration of the outer policy
+iteration (depth 5, mixing 0.6, engaged below relative residual 0.5), and
+`--forward-iters 8` is a sufficient inner budget once warm starts are active.
+`--pcg` switches the forward Gram solves from dense Cholesky to FFT-based
+conjugate gradients with a Strang circulant preconditioner. `--init <csv>`
+warm-starts the policy kernels from a previous run (rows
+`lag,d1_ch0..d2_ch2`; use Richardson extrapolation across grids for the best
+starting point). The wedge backward system is upper triangular (anti-causal
+transport) and is solved exactly by matrix-free back-substitution.
+
+Recommended:
+
+```bash
+./build/solve_stationary 3 3 0.1 0.1 --N 1000 --iters 1800 --relax 0.01 \
+  --tol 3e-5 --abs-tol 1e-4 --forward exact --anderson 5 --forward-iters 8 --pcg
+```
+
+Reference timings (16-core desktop): N=120 in ~0.15 s, N=1000 in ~2 s,
+N=4000 in ~23 s. Defaults preserve the historical Picard behavior.
+
+The stationary problem can fail to converge for some high-precision/cheap-control
+settings on a given truncation window. In that case the executable returns the
+last finite iterate and reports tail diagnostics (`tail.x`, `tail.calD`,
+`tail.hx_left`, `tail.hx_right`) so the lag truncation and stability can be
+checked explicitly. The reported fixed-point diagnostics include both a
+weighted relative policy residual and a weighted absolute policy residual. The
+stationary quadrature defaults to composite Simpson weights, with
+`--quadrature trapezoid` available for direct discretization comparisons.
+The primitive-control kernel is predictable, so `calD_i(0)` is constrained to
+zero.
+
+There is also an experimental random-feature neural/Galerkin solver for the
+same stationary equations:
+
+```bash
+.venv/bin/python stationary_neural_solver.py 3 3 0.1 0.1 \
+  --quadrature gauss --N 13 --inner-quad 13 --features 12 \
+  --backend jax --max-nfev 30 --out data/stationary_nn_jax_N13.npz
+```
+
+This script parameterizes the one-sided kernels, two-sided adjoints, and
+two-sided response maps with fixed tanh features, then fits the linear readouts
+by minimizing the state/filter/adjoint/wedge/policy residuals. The default
+`--backend auto` uses JAX when available, with a JIT-compiled residual and exact
+autodiff Jacobian passed to SciPy's least-squares driver; `--backend numpy`
+keeps the finite-difference fallback. The wedge residual includes the diagonal
+innovation-birth term `Gamma^T E H(0,b)`. The reported `converged` flag is based
+on a weighted residual RMS threshold (`--accept-rms`), so inspect the block
+residuals before treating a fit as numerically reliable. It is useful for
+experiments with mesh-free residual fitting, but the deterministic C++ lag-grid
+solver remains the baseline for reported stationary results.
+
+For the HTML stationary slider mode, the browser does not run JAX. The offline
+trainer fits a parameter-conditioned MLP from random parameter draws to the JAX
+stationary fits, exports the dense-layer weights as JSON, and `build_html.py`
+inlines those weights:
+
+```bash
+.venv/bin/python train_stationary_param_nn.py \
+  --out data/stationary_param_nn.json --n-train 160 --n-val 40 \
+  --hidden 128 --depth 2 --fit adam --steps 120000
+.venv/bin/python build_html.py
+```
+
+The current embedded fit uses 200 random log-space parameter tuples, plus
+player-symmetry augmentation, over `p_i in [0.1,40]` and `r_i in [0.05,1]`.
+The Stationary tab reports the train and validation RMSE for the embedded
+weights so slider plots are not confused with a fresh solve at every parameter.
+
 ## Algorithm overview
 
 The equilibrium is found by a three-level nested iteration:
 
-1. **Picard / Anderson outer loop** (`solve_equilibrium`):
+1. **Relaxed Picard outer loop** (`solve_equilibrium`):
    update feedback kernels D&#x2081;, D&#x2082; via the best-response map
-   G(D) = -(1/rho) H_x, accelerated with Anderson(5) mixing.
+   G(D) = -(1/rho) H_x, with damping controlled by `PICARD_RELAX`.
 
 2. **Forward environment** (`forward_environment`):
    given D&#x2081;, D&#x2082;, iterate the coupled filter-control system
@@ -99,23 +203,18 @@ the form  sum_u F[j][u][s]^T v[u]  is evaluated directly from
 the rank-1 factorization F[j][u][s] = border(u,s) + sum_{k>max(u,s)} X&#x0303;[k][u] * A[k][s]^T,
 using the already-available factors X&#x0303; and A.
 
-### Anderson acceleration
+### Picard relaxation
 
-The outer Picard loop uses Anderson(m=5) acceleration with damped
-mixing (beta=0.6) and Tikhonov regularization (lambda=10^-12).
-This typically reduces iteration count by 2-3x compared to simple
-relaxation, converging in 19-47 iterations depending on problem
-parameters.
-
-**Note**: At small r (large control gains), the Picard residual trace
-may appear jagged or non-monotonic. This is expected behavior for
-Anderson acceleration on stiff problems -- Anderson mixing is not a
-descent method and can overshoot before converging.
+The outer loop now uses only damped Picard updates. If a step raises the
+fixed-point residual, the solver restores the previous iterate and retries
+with a smaller step length. This avoids fixed-point history storage and keeps
+the iteration rule simple. Small r (large control gains) can still make the
+fixed point stiff, so convergence may require more iterations.
 
 ## Complexity
 
 **Time**: O(K * N^3 * D) per equilibrium solve, where N = grid points,
-D = 3 (noise dimension), K = 19-47 Picard iterations.
+D = 3 (noise dimension), and K is the number of damped Picard iterations.
 
 **Memory**: O(N^2 * D) working set during equilibrium solve (~1.3 MB at N=40).
 The 3D filter kernel F (O(N^3 * D^2), ~36 MB at N=40) is only allocated
@@ -137,8 +236,10 @@ All solver constants are in `lqg_solver.h`:
 | `FILTER_RELAX` | 0.55 | Filter relaxation parameter |
 | `PICARD_TOL` | 10^-5 | Outer convergence tolerance |
 | `MAX_PICARD_ITERS` | 10000 | Outer iteration cap |
-| `PICARD_RELAX` | 0.15 | Picard relaxation parameter |
+| `PICARD_RELAX` | 0.15 | Initial Picard step length |
+| `PICARD_RELAX_MIN` | 0.01 | Smallest adaptive Picard step length |
+| `PICARD_RELAX_MAX` | 0.25 | Largest adaptive Picard step length |
 
 The interactive app exposes runtime parameters via sliders:
 p&#x2081;, p&#x2082; (observation precision), b&#x2081;, b&#x2082; (bliss points),
-r&#x2081;, r&#x2082; (control cost weights), N (grid size, up to 160), T (horizon, up to 5).
+r&#x2081;, r&#x2082; (control cost weights), N (grid size, up to 160), T (horizon, up to 1.25).

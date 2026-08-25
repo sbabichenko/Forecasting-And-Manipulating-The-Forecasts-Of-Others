@@ -3,6 +3,7 @@
 // Outputs CSV data files to data/ directory; plot with plot_figures.py
 // ============================================================
 
+#include <cstdlib>
 #include "lqg_solver.h"
 #include <chrono>
 #include <cmath>
@@ -11,6 +12,7 @@
 #include <iomanip>
 #include <iostream>
 #include <sstream>
+#include <utility>
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -18,13 +20,13 @@
 
 namespace fs = std::filesystem;
 
-static const std::string DATA_DIR = "data";
+static std::string DATA_DIR = "data";   // overridable: generate_figures [N] [data_dir]
 
 // ---------- equilibrium storage ----------
 // All equilibria are pre-solved in parallel, stored in a vector.
-// Lookup by (p1, p2, obs1, obs2) uses linear scan (~15 entries).
+// Lookup by paper-level precision pair (p1, p2, obs1, obs2) uses linear scan.
 struct SolveSpec {
-    double p1, p2;
+    double p1_prec, p2_prec;
     Mat3 Pi_1, Pi_2;
     int obs1, obs2;
     EquilibriumResult result;
@@ -32,14 +34,65 @@ struct SolveSpec {
 };
 static std::vector<SolveSpec> specs;
 
-static EquilibriumResult& find_eq(double p1, double p2, int obs1 = 1, int obs2 = 2) {
+static EquilibriumResult& find_eq(double p1_prec, double p2_prec, int obs1 = 1, int obs2 = 2) {
     for (auto& sp : specs)
-        if (sp.p1 == p1 && sp.p2 == p2 && sp.obs1 == obs1 && sp.obs2 == obs2)
+        if (sp.p1_prec == p1_prec && sp.p2_prec == p2_prec &&
+            sp.obs1 == obs1 && sp.obs2 == obs2)
             return sp.result;
     // Should never happen if all specs were registered during setup
-    std::cerr << "ERROR: equilibrium not found for p1=" << p1 << " p2=" << p2
+    std::cerr << "ERROR: equilibrium not found for p1=" << p1_prec
+              << " p2=" << p2_prec
               << " obs1=" << obs1 << " obs2=" << obs2 << "\n";
     std::abort();
+}
+
+static std::string make_eq_key(double p1_prec, double p2_prec, int obs1, int obs2) {
+    std::ostringstream ss;
+    ss << std::setprecision(17) << p1_prec << "," << p2_prec << ","
+       << obs1 << "," << obs2;
+    return ss.str();
+}
+
+static std::string make_bar_key(double p1_prec, double p2_prec, int obs1, int obs2) {
+    std::ostringstream ss;
+    ss << std::setprecision(17) << p1_prec << "," << p2_prec << ","
+       << obs1 << "," << obs2 << "," << g_b1 << "," << g_b2;
+    return ss.str();
+}
+
+static std::map<std::string, EquilibriumResult> eq_cache;
+static std::map<std::string, BarSolution> bar_cache;
+
+static EquilibriumResult& cached_solve(double p1_prec, double p2_prec,
+                                       int obs1 = 1, int obs2 = 2,
+                                       const Mat3& Pi_1 = Pi1(),
+                                       const Mat3& Pi_2 = Pi2()) {
+    auto key = make_eq_key(p1_prec, p2_prec, obs1, obs2);
+    auto it = eq_cache.find(key);
+    if (it == eq_cache.end()) {
+        auto inserted = eq_cache.emplace(
+            key,
+            solve_equilibrium(std::sqrt(p1_prec), std::sqrt(p2_prec),
+                              false, Pi_1, obs1, Pi_2, obs2));
+        it = inserted.first;
+    }
+    return it->second;
+}
+
+static BarSolution& cached_bar_solve(const EquilibriumResult& eq,
+                                     double prec1, double prec2,
+                                     double p1_prec, double p2_prec,
+                                     int obs1, int obs2) {
+    auto key = make_bar_key(p1_prec, p2_prec, obs1, obs2);
+    auto it = bar_cache.find(key);
+    if (it == bar_cache.end()) {
+        auto inserted = bar_cache.emplace(
+            key,
+            solve_bar_equilibrium(eq.env, eq.D1, eq.D2,
+                                  prec1, prec2, 2000, 0.08, 1e-10));
+        it = inserted.first;
+    }
+    return it->second;
 }
 
 // ---------- CSV helpers ----------
@@ -70,10 +123,48 @@ static void write_F1_T(const std::string& path, const Kernel3D& F1) {
                       << row << "," << col << "," << F1[g_n-1][u][s](row, col) << "\n";
 }
 
+static void write_source_zero_response_slice(const std::string& path,
+                                             const EquilibriumResult& eq,
+                                             double p1_prec,
+                                             double p2_prec) {
+    std::ofstream f(path);
+    f << std::setprecision(12);
+    f << "t,p1,p2,X,Xhat1,Xhat2,calD1,calD2\n";
+    const auto& tg = t_grid();
+    for (int j = 0; j < g_n; ++j) {
+        const Vec3 X = eq.env.X[j][0];
+        const Vec3 Xhat1 = eq.env.X[j][0] - eq.env.Xtilde1[j][0];
+        const Vec3 Xhat2 = eq.env.X[j][0] - eq.env.Xtilde2[j][0];
+        f << tg[j] << "," << p1_prec << "," << p2_prec << ","
+          << X(0) << "," << Xhat1(0) << "," << Xhat2(0) << ","
+          << eq.calD1[j][0](0) << "," << eq.calD2[j][0](0) << "\n";
+    }
+}
+
+static std::pair<double, double> mean_wedge_component_maxima(
+    const Kernel2D& Xtildek, const Kernel2D& barHk,
+    double prec_k, double obs_gain_k, int obs_idx_k) {
+    double max_diag = 0.0;
+    double max_accum = 0.0;
+    for (int j = 1; j < g_n; ++j) {
+        double accum = 0.0;
+        for (int z = 0; z <= j; ++z)
+            accum += Xtildek[j][z].dot(barHk[j][z]);
+        double diag = obs_gain_k * barHk[j][j](obs_idx_k);
+        max_diag = std::max(max_diag, std::abs(diag));
+        max_accum = std::max(max_accum, std::abs(g_dt * prec_k * accum));
+    }
+    return {max_diag, max_accum};
+}
+
 // ---------- main ----------
-int main() {
-    // Initialize grid to default (N=40, T=1.0)
-    set_grid(40, 1.0);
+int main(int argc, char** argv) {
+    // Grid size and output directory from the command line (defaults N=40, data/); the
+    // scheme is first order in 1/N, so the figures are built from Richardson
+    // extrapolation of the N=40 and N=79 runs (nested grids), see richardson.py.
+    const int n_grid = argc > 1 ? std::atoi(argv[1]) : 40;
+    if (argc > 2) DATA_DIR = argv[2];
+    set_grid(n_grid, 1.0);
 
     fs::create_directories(DATA_DIR);
     const auto& tg = t_grid();
@@ -89,12 +180,13 @@ int main() {
     std::cout << "Pre-solving all equilibria in parallel ...\n";
 
     // Register all unique solve parameters
-    auto add_spec = [&](double p1, double p2, const Mat3& Pi_1, int obs1,
+    auto add_spec = [&](double p1_prec, double p2_prec, const Mat3& Pi_1, int obs1,
                         const Mat3& Pi_2, int obs2) {
         for (auto& sp : specs)
-            if (sp.p1 == p1 && sp.p2 == p2 && sp.obs1 == obs1 && sp.obs2 == obs2)
+            if (sp.p1_prec == p1_prec && sp.p2_prec == p2_prec &&
+                sp.obs1 == obs1 && sp.obs2 == obs2)
                 return;  // already registered
-        specs.push_back({p1, p2, Pi_1, Pi_2, obs1, obs2, {}, false});
+        specs.push_back({p1_prec, p2_prec, Pi_1, Pi_2, obs1, obs2, {}, false});
     };
 
     // (3,3) benchmark
@@ -107,7 +199,7 @@ int main() {
         add_spec(p1_fixed, p2v, Pi1(), 1, Pi2(), 2);
     // Fig 12: pooled info
     for (int p2v : p_values) {
-        double p_common = std::sqrt(p1_fixed * p1_fixed + p2v * p2v);
+        double p_common = p1_fixed + p2v;
         add_spec(p_common, p_common, Pi1(), 1, Pi1(), 1);
     }
 
@@ -115,7 +207,7 @@ int main() {
 
     // Solve (3,3) first with verbose output + timing
     auto t0 = std::chrono::high_resolution_clock::now();
-    specs[0].result = solve_equilibrium(3, 3, true);
+    specs[0].result = solve_equilibrium(std::sqrt(3.0), std::sqrt(3.0), true);
     specs[0].solved = true;
     auto t1 = std::chrono::high_resolution_clock::now();
     std::cout << "  Solve (3,3) time: "
@@ -127,7 +219,7 @@ int main() {
     for (size_t i = 0; i < specs.size(); ++i) {
         if (specs[i].solved) continue;
         auto& sp = specs[i];
-        sp.result = solve_equilibrium(sp.p1, sp.p2, false,
+        sp.result = solve_equilibrium(std::sqrt(sp.p1_prec), std::sqrt(sp.p2_prec), false,
                                        sp.Pi_1, sp.obs1, sp.Pi_2, sp.obs2);
         sp.solved = true;
     }
@@ -140,12 +232,14 @@ int main() {
     auto& D2 = eq.D2;
     auto& env = eq.env;
 
-    auto bar_sol = solve_bar_equilibrium(env, D1, D2, 9, 9, 500, 0.35, 1e-10);
+    auto bar_sol = solve_bar_equilibrium(env, D1, D2, 3, 3, 500, 0.35, 1e-10);
     std::cout << "  Bar residual: " << bar_sol.bar_residual << "\n";
 
     // Backward bar adjoints for Figure 9
-    auto prec9 = make_constant_prec(9.0);
-    auto bba = backward_bar_adjoints(env.X, env.Xtilde2, D2, bar_sol.barX, g_b1, prec9, 0.0);
+    auto prec3 = make_constant_prec(3.0);
+    auto bba = backward_bar_adjoints(env.X, env.Xtilde2, D2,
+                                     bar_sol.barX, g_b1, prec3,
+                                     env.obs_gain2, env.obs_idx2, g_terminal_weight);
 
     // ============================================================
     // FIGURE 3: Picard residual
@@ -181,7 +275,8 @@ int main() {
     // FIGURE 7: F1 at t=T
     // ============================================================
     std::cout << "Figure 7: Filtering kernel F1 at t=T ...\n";
-    {
+    if (g_n > N_MAX_3D) std::cout << "  skipped: N exceeds N_MAX_3D\n";
+    else {
         Kernel3D F1;
         materialize_F(env.Xtilde1, env.A_store1, env.obs_gain1, env.obs_idx1, F1);
         write_F1_T(DATA_DIR + "/fig7_F1_T.csv", F1);
@@ -195,7 +290,7 @@ int main() {
     // Perfect-info benchmark
     std::array<double, N_MAX> S_pi;
     S_pi.fill(0.0);
-    S_pi[g_n - 1] = TERMINAL_STATE_WEIGHT;
+    S_pi[g_n - 1] = g_terminal_weight;
     for (int j = g_n - 2; j >= 0; --j)
         S_pi[j] = S_pi[j + 1] + g_dt * (1.0 - (2.0 / RHO) * S_pi[j + 1] * S_pi[j + 1]);
 
@@ -223,7 +318,7 @@ int main() {
         for (int p : p_values) {
             std::cout << "  Solving p=" << p << " ...\n";
             auto& eq_p = find_eq(p, p);
-            auto bar_p = solve_bar_equilibrium(eq_p.env, eq_p.D1, eq_p.D2, p*p, p*p);
+            auto bar_p = solve_bar_equilibrium(eq_p.env, eq_p.D1, eq_p.D2, p, p);
             barD1_curves[p] = bar_p.barD1;
             std::cout << "    bar residual: " << bar_p.bar_residual << "\n";
         }
@@ -257,7 +352,7 @@ int main() {
             std::cout << "  Solving p1=" << p1_fixed << ", p2=" << p2v << " ...\n";
             auto& eq_a = find_eq(p1_fixed, p2v);
             auto bar_a = solve_bar_equilibrium(eq_a.env, eq_a.D1, eq_a.D2,
-                                               p1_fixed*p1_fixed, p2v*p2v);
+                                               p1_fixed, p2v);
             std::cout << "    bar residual: " << bar_a.bar_residual << "\n";
 
             for (int i = 0; i < g_n; ++i)
@@ -275,6 +370,14 @@ int main() {
     }
 
     // ============================================================
+    // FIGURE 10b: Source-zero response slice for p1=3, p2=10
+    // ============================================================
+    std::cout << "Figure 10b: Source-zero response slice (p1=3, p2=10) ...\n";
+    write_source_zero_response_slice(
+        DATA_DIR + "/fig10_response_p1_3_p2_10.csv",
+        find_eq(3, 10), 3.0, 10.0);
+
+    // ============================================================
     // FIGURE 11: Information wedges V^1(t) and V^2(t) as p2 varies
     // ============================================================
     std::cout << "Figure 11: Information wedges V^1(t) and V^2(t) ...\n";
@@ -282,30 +385,42 @@ int main() {
         std::ofstream f(DATA_DIR + "/fig11_wedges.csv");
         f << std::setprecision(12);
         f << "t,p2,V1,V2\n";
+        bool wedge_diag_checked = false;
 
         for (int p2v : p2_values) {
             std::cout << "  Computing wedges for p1=" << p1_fixed << ", p2=" << p2v << " ...\n";
             auto& eq_a = find_eq(p1_fixed, p2v);
             auto bar_a = solve_bar_equilibrium(eq_a.env, eq_a.D1, eq_a.D2,
-                                               p1_fixed*p1_fixed, p2v*p2v);
+                                               p1_fixed, p2v);
 
-            auto prec2_arr = make_constant_prec(static_cast<double>(p2v * p2v));
-            auto prec1_arr = make_constant_prec(static_cast<double>(p1_fixed * p1_fixed));
+            auto prec2_arr = make_constant_prec(static_cast<double>(p2v));
+            auto prec1_arr = make_constant_prec(static_cast<double>(p1_fixed));
 
             auto bba1 = backward_bar_adjoints(eq_a.env.X, eq_a.env.Xtilde2, eq_a.D2,
-                                              bar_a.barX, B1_DEFAULT, prec2_arr, 0.0);
+                                              bar_a.barX, B1_DEFAULT, prec2_arr,
+                                              eq_a.env.obs_gain2, eq_a.env.obs_idx2, g_terminal_weight);
             auto bba2 = backward_bar_adjoints(eq_a.env.X, eq_a.env.Xtilde1, eq_a.D1,
-                                              bar_a.barX, B2_DEFAULT, prec1_arr, 0.0);
+                                              bar_a.barX, B2_DEFAULT, prec1_arr,
+                                              eq_a.env.obs_gain1, eq_a.env.obs_idx1, g_terminal_weight);
+
+            if (!wedge_diag_checked) {
+                auto [diag_max, accum_max] = mean_wedge_component_maxima(
+                    eq_a.env.Xtilde2, bba1.barHk, static_cast<double>(p2v),
+                    eq_a.env.obs_gain2, eq_a.env.obs_idx2);
+                std::cout << "    Wedge diagnostic: max diagonal=" << diag_max
+                          << " max accumulated=" << accum_max << "\n";
+                if (diag_max <= 1e-12)
+                    std::cerr << "WARNING: diagonal wedge term is numerically zero in diagnostic run\n";
+                wedge_diag_checked = true;
+            }
 
             for (int j = 0; j < g_n; ++j) {
-                int m = j + 1;
-                double V1 = 0.0, V2 = 0.0;
-                for (int z = 0; z < m; ++z) {
-                    V1 += eq_a.env.Xtilde2[j][z].dot(bba1.barHk[j][z]);
-                    V2 += eq_a.env.Xtilde1[j][z].dot(bba2.barHk[j][z]);
-                }
-                V1 *= static_cast<double>(p2v * p2v) * g_dt;
-                V2 *= static_cast<double>(p1_fixed * p1_fixed) * g_dt;
+                double V1 = mean_information_wedge_at(
+                    eq_a.env.Xtilde2, bba1.barHk, prec2_arr,
+                    eq_a.env.obs_gain2, eq_a.env.obs_idx2, j);
+                double V2 = mean_information_wedge_at(
+                    eq_a.env.Xtilde1, bba2.barHk, prec1_arr,
+                    eq_a.env.obs_gain1, eq_a.env.obs_idx1, j);
 
                 f << tg[j] << "," << p2v << "," << V1 << "," << V2 << "\n";
             }
@@ -343,15 +458,15 @@ int main() {
                 std::cout << "    Private: p2=" << p2v << " ...\n";
                 auto& eq_a = find_eq(p1_fixed, p2v);
                 auto bar_a = solve_bar_equilibrium(eq_a.env, eq_a.D1, eq_a.D2,
-                                                   p1_fixed*p1_fixed, p2v*p2v);
+                                                   p1_fixed, p2v);
                 auto [j1p, j2p_priv] = compute_costs_general(eq_a.env, eq_a.calD1, eq_a.calD2, bar_a, g_r1, g_r2, cfg.b1, cfg.b2);
 
                 // Pooled
-                double p_common = std::sqrt(p1_fixed * p1_fixed + p2v * p2v);
+                double p_common = p1_fixed + p2v;
                 std::cout << "    Pooled: p_common=" << p_common << " ...\n";
                 auto& eq_c = find_eq(p_common, p_common, 1, 1);
                 auto bar_c = solve_bar_equilibrium(eq_c.env, eq_c.D1, eq_c.D2,
-                                                   p_common*p_common, p_common*p_common);
+                                                   p_common, p_common);
                 auto [j1pool, j2pool] = compute_costs_general(eq_c.env, eq_c.calD1, eq_c.calD2, bar_c, g_r1, g_r2, cfg.b1, cfg.b2);
 
                 f << cfg.label << "," << p2v << ","
@@ -366,7 +481,7 @@ int main() {
 
     // ============================================================
     // FIGURE 13: Precision allocation sweep
-    // Budget: p1^2 + p2^2 = Pbar (total actual precision)
+    // Budget: p1 + p2 = Pbar (total actual precision)
     // Symmetric costs r1=r2=0.1, sigma=0.5, T=1
     // Competitive (theta1=1, theta2=-1) and cooperative (theta1=theta2=0)
     // ============================================================
@@ -376,7 +491,7 @@ int main() {
     eq_cache.clear();
     bar_cache.clear();
 
-    const double PBAR = 20.0;       // total actual precision budget: p1^2 + p2^2 = PBAR
+    const double PBAR = 20.0;       // total actual precision budget: p1 + p2 = PBAR
     const double R1_ALLOC = 0.1;    // symmetric control costs
     const double R2_ALLOC = 0.1;
     const double SIGMA_ALLOC = 0.5; // reduced state diffusion amplifies strategic effects
@@ -396,18 +511,16 @@ int main() {
         {0.0,  0.0, "cooperative"},
     };
 
-    // Budget: p1^2 + p2^2 = PBAR  =>  p2 = sqrt(PBAR - p1^2)
-    // Sweep p1 (root precision) from near 0 to near sqrt(PBAR)
-    const double P1_MAX_ROOT = std::sqrt(PBAR);  // max root precision for player 1
+    // Budget: p1 + p2 = PBAR.
     const double MARGIN = 0.15;
     std::vector<double> p1_sweep(N_SWEEP);
     for (int i = 0; i < N_SWEEP; ++i)
-        p1_sweep[i] = MARGIN + (P1_MAX_ROOT - 2.0 * MARGIN) * i / (N_SWEEP - 1);
+        p1_sweep[i] = MARGIN + (PBAR - 2.0 * MARGIN) * i / (N_SWEEP - 1);
 
     // Precompute p2 values from budget constraint
     std::vector<double> p2_sweep(N_SWEEP);
     for (int i = 0; i < N_SWEEP; ++i)
-        p2_sweep[i] = std::sqrt(PBAR - p1_sweep[i] * p1_sweep[i]);
+        p2_sweep[i] = PBAR - p1_sweep[i];
 
     std::cout << "  Pre-solving " << N_SWEEP << " equilibria for precision sweep (warm-started) ...\n";
     {
@@ -416,18 +529,19 @@ int main() {
         std::vector<EquilibriumResult> eq_results(N_SWEEP);
 
         // Cold-start from the middle
-        eq_results[mid] = solve_equilibrium(p1_sweep[mid], p2_sweep[mid], false);
+        eq_results[mid] = solve_equilibrium(
+            std::sqrt(p1_sweep[mid]), std::sqrt(p2_sweep[mid]), false);
 
         // Sweep rightward from mid
         for (int i = mid + 1; i < N_SWEEP; ++i) {
             eq_results[i] = solve_equilibrium_warm(
-                p1_sweep[i], p2_sweep[i],
+                std::sqrt(p1_sweep[i]), std::sqrt(p2_sweep[i]),
                 eq_results[i - 1].D1, eq_results[i - 1].D2, false);
         }
         // Sweep leftward from mid
         for (int i = mid - 1; i >= 0; --i) {
             eq_results[i] = solve_equilibrium_warm(
-                p1_sweep[i], p2_sweep[i],
+                std::sqrt(p1_sweep[i]), std::sqrt(p2_sweep[i]),
                 eq_results[i + 1].D1, eq_results[i + 1].D2, false);
         }
 
@@ -457,7 +571,7 @@ int main() {
     {
         std::ofstream f(DATA_DIR + "/fig13_precision_allocation.csv");
         f << std::setprecision(12);
-        f << "config,r_config,r1,r2,p1_root,p1_prec,J1_eq,J2_eq,Jtotal_eq,J1_fi,J2_fi,Jtotal_fi,V1_total,V2_total,barD1sq_eq,barD2sq_eq,barD1sq_fi,barD2sq_fi,barD1_avg_eq,barD2_avg_eq,barX_avg_eq,barD1_avg_fi,barD2_avg_fi,barX_avg_fi\n";
+        f << "config,r_config,r1,r2,p1_prec,p2_prec,J1_eq,J2_eq,Jtotal_eq,J1_fi,J2_fi,Jtotal_fi,V1_total,V2_total,barD1sq_eq,barD2sq_eq,barD1sq_fi,barD2sq_fi,barD1_avg_eq,barD2_avg_eq,barX_avg_eq,barD1_avg_fi,barD2_avg_fi,barX_avg_fi\n";
 
         for (auto& rcfg : r_configs) {
             g_r1 = rcfg.r1;
@@ -471,8 +585,8 @@ int main() {
             // Ṡ_i = S_i²/r_i + 2·S_i·S_j/r_j − 1,  S_i(T)=0
             // Variance cost for player i: ∫ σ² S_i dt
             std::array<double, N_MAX> S_fi1{}, S_fi2{};
-            S_fi1[g_n - 1] = TERMINAL_STATE_WEIGHT;
-            S_fi2[g_n - 1] = TERMINAL_STATE_WEIGHT;
+            S_fi1[g_n - 1] = g_terminal_weight;
+            S_fi2[g_n - 1] = g_terminal_weight;
             for (int j = g_n - 2; j >= 0; --j) {
                 double s1 = S_fi1[j + 1], s2 = S_fi2[j + 1];
                 S_fi1[j] = s1 + g_dt * (1.0 - s1 * s1 / rcfg.r1 - 2.0 * s1 * s2 / rcfg.r2);
@@ -504,14 +618,15 @@ int main() {
             {
                 int mid = N_SWEEP / 2;
                 std::vector<EquilibriumResult> eq_results(N_SWEEP);
-                eq_results[mid] = solve_equilibrium(p1_sweep[mid], p2_sweep[mid], false);
+                eq_results[mid] = solve_equilibrium(
+                    std::sqrt(p1_sweep[mid]), std::sqrt(p2_sweep[mid]), false);
                 for (int i = mid + 1; i < N_SWEEP; ++i)
                     eq_results[i] = solve_equilibrium_warm(
-                        p1_sweep[i], p2_sweep[i],
+                        std::sqrt(p1_sweep[i]), std::sqrt(p2_sweep[i]),
                         eq_results[i - 1].D1, eq_results[i - 1].D2, false);
                 for (int i = mid - 1; i >= 0; --i)
                     eq_results[i] = solve_equilibrium_warm(
-                        p1_sweep[i], p2_sweep[i],
+                        std::sqrt(p1_sweep[i]), std::sqrt(p2_sweep[i]),
                         eq_results[i + 1].D1, eq_results[i + 1].D2, false);
                 for (int i = 0; i < N_SWEEP; ++i) {
                     auto key = make_eq_key(p1_sweep[i], p2_sweep[i], 1, 2);
@@ -583,30 +698,31 @@ int main() {
 
                     // --- Equilibrium cost ---
                     auto& eq_a = cached_solve(p1v, p2v);
-                    auto& bar_a = cached_bar_solve(eq_a, p1v*p1v, p2v*p2v,
+                    auto& bar_a = cached_bar_solve(eq_a, p1v, p2v,
                                                    p1v, p2v, 1, 2);
                     auto [j1_eq, j2_eq] = compute_costs_general(
                         eq_a.env, eq_a.calD1, eq_a.calD2, bar_a,
                         rcfg.r1, rcfg.r2, cfg.b1, cfg.b2);
 
                     // --- Compute wedges V1, V2 at terminal time ---
-                    auto prec1_arr = make_constant_prec(p1v * p1v);
-                    auto prec2_arr = make_constant_prec(p2v * p2v);
+                    auto prec1_arr = make_constant_prec(p1v);
+                    auto prec2_arr = make_constant_prec(p2v);
                     auto bba1 = backward_bar_adjoints(eq_a.env.X, eq_a.env.Xtilde2, eq_a.D2,
-                                                      bar_a.barX, cfg.b1, prec2_arr, 0.0);
+                                                      bar_a.barX, cfg.b1, prec2_arr,
+                                                      eq_a.env.obs_gain2, eq_a.env.obs_idx2, g_terminal_weight);
                     auto bba2 = backward_bar_adjoints(eq_a.env.X, eq_a.env.Xtilde1, eq_a.D1,
-                                                      bar_a.barX, cfg.b2, prec1_arr, 0.0);
+                                                      bar_a.barX, cfg.b2, prec1_arr,
+                                                      eq_a.env.obs_gain1, eq_a.env.obs_idx1, g_terminal_weight);
 
                     // Integrate wedges over time (sum across all t)
                     double V1_total = 0.0, V2_total = 0.0;
                     for (int j = 0; j < g_n; ++j) {
-                        double v1_t = 0.0, v2_t = 0.0;
-                        for (int z = 0; z <= j; ++z) {
-                            v1_t += eq_a.env.Xtilde2[j][z].dot(bba1.barHk[j][z]);
-                            v2_t += eq_a.env.Xtilde1[j][z].dot(bba2.barHk[j][z]);
-                        }
-                        V1_total += v1_t * (p2v * p2v) * g_dt;
-                        V2_total += v2_t * (p1v * p1v) * g_dt;
+                        V1_total += mean_information_wedge_at(
+                            eq_a.env.Xtilde2, bba1.barHk, prec2_arr,
+                            eq_a.env.obs_gain2, eq_a.env.obs_idx2, j) * g_dt;
+                        V2_total += mean_information_wedge_at(
+                            eq_a.env.Xtilde1, bba2.barHk, prec1_arr,
+                            eq_a.env.obs_gain1, eq_a.env.obs_idx1, j) * g_dt;
                     }
 
                     // --- Mean control energy and time-averaged bar quantities ---
@@ -629,7 +745,7 @@ int main() {
                     }
 
                     f << cfg.label << "," << rcfg.label << "," << rcfg.r1 << "," << rcfg.r2 << ","
-                      << p1v << "," << (p1v*p1v) << ","
+                      << p1v << "," << p2v << ","
                       << j1_eq << "," << j2_eq << "," << (j1_eq + j2_eq) << ","
                       << j1_fi << "," << j2_fi << "," << (j1_fi + j2_fi) << ","
                       << V1_total << "," << V2_total << ","
