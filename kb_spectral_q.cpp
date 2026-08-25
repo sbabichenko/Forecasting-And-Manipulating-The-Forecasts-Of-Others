@@ -348,7 +348,7 @@ int main(int argc, char* argv[]) {
     std::vector<VectorXd> gam;
     { std::string s = argv[6]; size_t p = 0; while (p <= s.size()) { size_t e = s.find(';', p); if (e == std::string::npos) e = s.size(); auto v = parse_list(s.substr(p, e - p)); VectorXd g(q); for (int k = 0; k < q; ++k) g[k] = v.size() == 1 ? v[0] : v[k]; gam.push_back(g); p = e + 1; } }
     MatrixXd SV = MatrixXd::Identity(q, q), SZ = MatrixXd::Identity(q, q);
-    double tol = 1e-10; int uniform = 0; bool verbose = false; std::vector<double> path;
+    double tol = 1e-10; int uniform = 0; bool verbose = false, eval_only = false; std::vector<double> path; std::string init_file;
     for (int i = 7; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--sigma-v") && i + 1 < argc) { auto v = parse_list(argv[++i]); for (int r = 0; r < q; ++r) for (int c = 0; c < q; ++c) SV(r, c) = v[r * q + c]; }
         else if (!std::strcmp(argv[i], "--sigma-z") && i + 1 < argc) { auto v = parse_list(argv[++i]); for (int r = 0; r < q; ++r) for (int c = 0; c < q; ++c) SZ(r, c) = v[r * q + c]; }
@@ -356,6 +356,8 @@ int main(int argc, char* argv[]) {
         else if (!std::strcmp(argv[i], "--tol") && i + 1 < argc) tol = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "--uniform") && i + 1 < argc) uniform = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--verbose")) verbose = true;
+        else if (!std::strcmp(argv[i], "--eval-only")) eval_only = true;
+        else if (!std::strcmp(argv[i], "--init") && i + 1 < argc) init_file = argv[++i];
         else if (!std::strcmp(argv[i], "--threads") && i + 1 < argc) {
 #ifdef _OPENMP
             omp_set_num_threads(std::atoi(argv[++i])); threads_set = true;
@@ -373,11 +375,27 @@ int main(int argc, char* argv[]) {
     Solver S(M); S.verbose = verbose;
     VectorXd z = VectorXd::Zero(M.dim() * M.NT), zprev; double eprev = 0; bool have_prev = false;
     Solver::Out o;
+    if (!init_file.empty()) {
+        // plain text: NT blocks of NC*q lines, each line N nodal values (channel-major, then component)
+        std::FILE* f = std::fopen(init_file.c_str(), "r");
+        if (!f) { std::fprintf(stderr, "cannot read %s\n", init_file.c_str()); return 1; }
+        std::vector<MatrixXd> cs(M.NT, MatrixXd::Zero(M.NC * N, q));
+        for (int i = 0; i < M.NT; ++i) for (int ch = 0; ch < M.NC; ++ch) for (int k = 0; k < q; ++k) for (int a = 0; a < N; ++a) { double x; if (std::fscanf(f, "%lf", &x) != 1) { std::fprintf(stderr, "short init file\n"); return 1; } cs[i](ch * N + a, k) = x; }
+        std::fclose(f);
+        z = M.pack(cs);
+        path = {eps};   // solve at the target cost directly from the warm start
+    }
+    if (eval_only) {
+        M.eps = eps;
+        const VectorXd r = M.residual(z);
+        std::fprintf(stderr, "eval-only: |r|_max %.3e  |r|_2 %.3e\n", r.cwiseAbs().maxCoeff(), r.norm());
+        o.z = z; o.resid = r.cwiseAbs().maxCoeff(); o.steps = 0; o.jacobians = 0; o.ok = true; path.clear();
+    }
     for (size_t k = 0; k < path.size(); ++k) {
         M.eps = path[k];
         VectorXd zstart = z;
         if (have_prev) zstart = z + (z - zprev) * ((path[k] - path[k - 1]) / (path[k - 1] - eprev));
-        o = S.solve(zstart, tol, k == 0 ? 60 : 0, 0.1);
+        o = S.solve(zstart, tol, (k == 0 && init_file.empty()) ? 60 : 0, 0.1);
         if (!o.ok) { S.have_J = false; o = S.solve(z, tol, k == 0 ? 0 : 30, 0.1); }
         if (verbose) std::fprintf(stderr, "eps=%g: %s |r| %.2e, %d steps, %d jacobians, %ld evals, %.1f s elapsed\n", path[k], o.ok ? "ok" : "FAIL", o.resid, o.steps, o.jacobians, S.evals, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
         if (!o.ok) break;
