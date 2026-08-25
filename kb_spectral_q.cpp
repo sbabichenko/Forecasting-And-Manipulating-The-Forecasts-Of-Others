@@ -656,7 +656,7 @@ struct Model {
 struct Solver {
     Model& M; bool have_J = false; long evals = 0; bool verbose = false; double refresh_ratio = 0.8; int max_jacobians = 3;
     // inverse Jacobian as an LU plus Broyden rank-one corrections: Jinv r = LU^{-1} r + sum_k u_k (v_k . r)
-    Eigen::PartialPivLU<MatrixXd> Jlu; std::vector<VectorXd> bu, bv;
+    MatrixXd Jstore; Eigen::PartialPivLU<Eigen::Ref<MatrixXd>> Jlu{Jstore}; std::vector<VectorXd> bu, bv;
     VectorXd apply_Jinv(const VectorXd& r) const { VectorXd x = Jlu.solve(r); for (size_t k = 0; k < bu.size(); ++k) x += bu[k] * bv[k].dot(r); return x; }
     struct JinvOp { const Solver* S; VectorXd operator*(const VectorXd& r) const { return S->apply_Jinv(r); } };
     JinvOp Jinv{this};
@@ -681,7 +681,7 @@ struct Solver {
             if (step == 10) rn_at10 = rn;
             if (step == 20 && rn > 0.3 * rn_at10) break;      // not making progress: hand back for eps bisection
             if (!range_newton && (exact_newton || !have_J || (last_ratio > refresh_ratio && o.jacobians < (use_krylov ? 1 : max_jacobians)))) {   // under JFNK the Broyden-updated inverse is only a preconditioner: refresh at most once per solve
-                MatrixXd Jm(n, n); const double eps_fd = 1e-7 * std::max(1.0, z.cwiseAbs().maxCoeff());
+                Jstore.resize(n, n); MatrixXd& Jm = Jstore; const double eps_fd = 1e-7 * std::max(1.0, z.cwiseAbs().maxCoeff());
                 Model::Diag& base = cur; const VectorXd rb = r;   // factorizations at z precondition the columns
                 if (analytic) {
                     const Model::LinBase LB = M.linbase(base);
@@ -691,7 +691,7 @@ struct Solver {
 #pragma omp parallel for schedule(dynamic, 4)
                     for (int i = 0; i < n; ++i) { VectorXd zp = z; zp[i] += eps_fd; Jm.col(i) = (M.residual(zp, nullptr, &base) - rb) / eps_fd; }
                     evals += n;
-                } Jlu.compute(Jm); bu.clear(); bv.clear(); have_J = true; ++o.jacobians; last_ratio = 0.0; fresh = true;
+                } new (&Jlu) Eigen::PartialPivLU<Eigen::Ref<MatrixXd>>(Jstore); bu.clear(); bv.clear(); have_J = true; ++o.jacobians; last_ratio = 0.0; fresh = true;   // factors in place
             } else fresh = false;
             VectorXd dz;
             if (range_newton) {
@@ -957,13 +957,25 @@ int main(int argc, char* argv[]) {
     std::printf("{\"converged\":%s,\"residual\":%.3e,\"map_alpha\":%.15g,\"split_b\":%.15g,\"N1\":%d,\"N\":%d,\"L\":%.15g,\"eps\":%.15g,\"rho\":%.15g,\"q\":%d,\"NT\":%d,\"NC\":%d,\"seconds\":%.3f,\"evaluations\":%ld,\"gmres_iterations\":%ld,",
                 o.ok ? "true" : "false", o.resid, map_alpha, split_b, n1, N, L, M.eps, rho, q, M.NT, M.NC, secs, S.evals, S.gmres_its);
     std::printf("\"lambda\":"); print_mat(dg.lam); std::printf(",");
+    {   // unrevealed first value factor (channel 0, component 0) at lags 0, 1, 2, 4
+        VectorXd qq(4); qq << 0.0, 1.0, 2.0, 4.0;
+        const VectorXd gv = M.K.interp(qq) * dg.g.block(0, 0, N, 1);
+        std::printf("\"gapV_0_1_2_4\":"); print_array(gv); std::printf(",");
+    }
     std::printf("\"sigma_v\":"); print_mat(SV); std::printf(",\"sigma_z\":"); print_mat(SZ); std::printf(",");
     std::printf("\"lag\":"); print_array(M.K.x); std::printf(",");
     std::printf("\"traders\":[");
     for (int i = 0; i < M.NT; ++i) {
         const MatrixXd P = M.profit(cs, dg, i);
         std::printf("%s{\"gamma\":", i ? "," : ""); print_array(gam[i]);
-        std::printf(",\"flow\":%.15g,\"margin\":%.6g,\"flow_by_channel_and_stock\":", P.sum(), dg.margin[i]); print_mat(P);
+        double half_lag = L;
+        {   // lag by which half of the trader's profit has accrued
+            VectorXd tot = VectorXd::Zero(N);
+            for (int ch = 0; ch < M.NC; ++ch) for (int nu = 0; nu < q; ++nu) { const VectorXd a = cs[i].block(ch * N, nu, N, 1), b = dg.a_lin[i].block(ch * N, nu, N, 1); tot += a.cwiseProduct(b); }
+            const double total = M.wq.dot(tot);
+            for (int k = 1; k <= 400; ++k) { const double a = L * k / 400.0; VectorXd u, w; M.K.quad(0.0, a, {}, u, w, M.m); const double cum = (w.transpose() * M.K.interp(u) * tot)(0); if (cum >= 0.5 * total) { half_lag = a; break; } }
+        }
+        std::printf(",\"flow\":%.15g,\"margin\":%.6g,\"half_profit_lag\":%.6g,\"flow_by_channel_and_stock\":", P.sum(), dg.margin[i], half_lag); print_mat(P);
         // kernel c[ch][comp] = vector over nodes
         std::printf(",\"c\":[");
         for (int ch = 0; ch < M.NC; ++ch) { std::printf("%s[", ch ? "," : ""); for (int k = 0; k < q; ++k) { std::printf("%s", k ? "," : ""); print_array(cs[i].block(ch * N, k, N, 1)); } std::printf("]"); }
