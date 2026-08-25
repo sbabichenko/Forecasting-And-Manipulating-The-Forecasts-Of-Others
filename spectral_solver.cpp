@@ -121,52 +121,31 @@ struct Forward {
     double L;
     Panel K;
     VectorXd e0;
-    // tensors: HS[j] (m x N), TY[j] (m x N); HW, TW (N x m); HX, TX ((N m) x N)
-    std::vector<MatrixXd> HS, TY;
-    MatrixXd HW, TW, HX, TX, cumint, AH, AT;
+    // Linear maps x -> H and x -> Ht (N x N^2 each), built one node at a time:
+    //   H(j, ch*N + i)  = gain * sum_k x(k, ch) AH(k, j*N + i),
+    //   Ht(ch*N + j, i) = gain * sum_k x(k, ch) AT(k, j*N + i).
+    MatrixXd AH, AT, cumint;
     VectorXd wfull;
 
     Forward(int N_, double L_) : N(N_), m(N_ + 8), L(L_), K(N_, 0.0, L_), e0(3) {
         e0 << 1.0, 0.0, 0.0;
-        HS.assign(N, MatrixXd::Zero(m, N));
-        TY.assign(N, MatrixXd::Zero(m, N));
-        HW = MatrixXd::Zero(N, m); TW = MatrixXd::Zero(N, m);
-        VectorXd hu_all(N * m), tu_all(N * m);
-        hu_all.setZero(); tu_all.setZero();
+        AH = MatrixXd::Zero(N, N * N); AT = MatrixXd::Zero(N, N * N);
+        cumint = MatrixXd::Zero(N, N);
         VectorXd u, w;
         for (int j = 0; j < N; ++j) {
             const double a = K.x[j];
             if (L - a > 0) {
+                // (H s)(a_j) = s_chan(a_j) + gain int_0^{L-a_j} x(u) . s(a_j + u) du
                 gauss_legendre(m, 0.0, L - a, u, w);
-                HW.row(j) = w; HS[j] = K.interp((u.array() + a).matrix());
-                hu_all.segment(j * m, m) = u;
+                const MatrixXd X = K.interp(u), S = K.interp((u.array() + a).matrix());
+                AH.block(0, j * N, N, N).noalias() = X.transpose() * w.asDiagonal() * S;
             }
             if (a > 0) {
+                // (Ht y)(a_j) = y(a_j) e_chan + gain int_0^{a_j} y(j') x(a_j - j') dj'
                 gauss_legendre(m, 0.0, a, u, w);
-                TW.row(j) = w; TY[j] = K.interp(u);
-                tu_all.segment(j * m, m) = (a - u.array()).matrix();
-            }
-        }
-        HX = K.interp(hu_all);
-        TX = K.interp(tu_all);
-        // H and Ht are linear in x: precompute AH, AT (N x N^2) with
-        //   H(j, ch*N + i)  = gain * sum_k x(k, ch) AH(k, j*N + i),
-        //   Ht(ch*N + j, i) = gain * sum_k x(k, ch) AT(k, j*N + i).
-        AH = MatrixXd::Zero(N, N * N); AT = MatrixXd::Zero(N, N * N);
-        for (int j = 0; j < N; ++j)
-            for (int q = 0; q < m; ++q) {
-                AH.block(0, j * N, N, N).noalias() += HW(j, q) * HX.row(j * m + q).transpose() * HS[j].row(q);
-                AT.block(0, j * N, N, N).noalias() += TW(j, q) * TX.row(j * m + q).transpose() * TY[j].row(q);
-            }
-        // the layouts are only needed to build AH and AT
-        HS.clear(); HS.shrink_to_fit(); TY.clear(); TY.shrink_to_fit();
-        HX.resize(0, 0); TX.resize(0, 0); HW.resize(0, 0); TW.resize(0, 0);
-        // cumulative integral (C f)(a_j) = int_0^{a_j} f
-        cumint = MatrixXd::Zero(N, N);
-        for (int j = 0; j < N; ++j) {
-            if (K.x[j] > 0) {
-                gauss_legendre(m, 0.0, K.x[j], u, w);
-                cumint.row(j) = w.transpose() * K.interp(u);
+                const MatrixXd Y = K.interp(u), Xt = K.interp((a - u.array()).matrix());
+                AT.block(0, j * N, N, N).noalias() = Xt.transpose() * w.asDiagonal() * Y;
+                cumint.row(j) = w.transpose() * Y;
             }
         }
         gauss_legendre(m, 0.0, L, u, w);
@@ -265,17 +244,13 @@ struct Backward {
     double L;
     Panel K;
     TwoSided T;
-    MatrixXd J;                                  // tail integral (2N x 2N)
-    MatrixXd SW;                                 // (N x m)
-    std::vector<MatrixXd> SPf, SPg;              // (m x N)
-    // two-sided shifted-product layout: up to two pieces per node
-    std::vector<std::vector<std::tuple<VectorXd, MatrixXd, MatrixXd>>> lay;   // (w, PB (m x N), PV (m x 2N))
+    MatrixXd J;                  // tail integral (2N x 2N)
     MatrixXd QT;                 // (N x 4N^2): shifted product is linear in the coefficient, T_flat = coef^T QT
     std::vector<MatrixXd> R;     // R[j] (N x N): shifted inner product is bilinear, A_j = sum_ch f_ch^T R[j] g_ch
 
     Backward(int N_, double L_) : N(N_), m(N_ + 8), L(L_), K(N_, 0.0, L_), T(N_, L_) {
         VectorXd u, w;
-        // J
+        // J: (J v)(l_j) = int_{l_j}^{L} v
         J = MatrixXd::Zero(2 * N, 2 * N);
         gauss_legendre(m, 0.0, L, u, w);
         const Eigen::RowVectorXd pos_full = w.transpose() * T.pos.interp(u);
@@ -289,21 +264,21 @@ struct Backward {
                 J.block(j, N, 1, N) = pos_full;
             }
         }
-        // shifted inner products
-        SW = MatrixXd::Zero(N, m);
-        SPf.assign(N, MatrixXd::Zero(m, N)); SPg.assign(N, MatrixXd::Zero(m, N));
+        // R[j]: int_0^{L-s_j} f(a) . g(a + s_j) da = sum_ch f_ch^T R[j] g_ch
+        R.assign(N, MatrixXd::Zero(N, N));
         for (int j = 0; j < N; ++j) {
             const double s = K.x[j];
             if (L - s > 0) {
                 gauss_legendre(m, 0.0, L - s, u, w);
-                SW.row(j) = w; SPf[j] = K.interp(u); SPg[j] = K.interp((u.array() + s).matrix());
+                const MatrixXd Pf = K.interp(u), Pg = K.interp((u.array() + s).matrix());
+                R[j].noalias() = Pf.transpose() * w.asDiagonal() * Pg;
             }
         }
-        // shifted products
-        lay.resize(2 * N);
+        // QT: (T v)(l_j) = int_0^{min(L, L - l_j)} B(s) v(l_j + s) ds, split where l_j + s crosses 0
+        QT = MatrixXd::Zero(N, 4 * N * N);
         for (int j = 0; j < 2 * N; ++j) {
             const double lj = T.l[j];
-            const double smax = std::min(L, L - lj);
+            const double smax = std::min(L, L - lj);   // B vanishes beyond L
             if (smax <= 0) continue;
             std::vector<double> br = {0.0};
             if (lj < 0) br.push_back(-lj);
@@ -311,22 +286,10 @@ struct Backward {
             for (size_t k = 0; k + 1 < br.size(); ++k) {
                 if (br[k + 1] - br[k] <= 0) continue;
                 gauss_legendre(m, br[k], br[k + 1], u, w);
-                lay[j].emplace_back(w, K.interp(u), T.interp((u.array() + lj).matrix()));
+                const MatrixXd PB = K.interp(u), PV = T.interp((u.array() + lj).matrix());
+                QT.block(0, j * 2 * N, N, 2 * N).noalias() += PB.transpose() * w.asDiagonal() * PV;
             }
         }
-        // linear map coef -> shifted product matrix (row-major flattening, j*2N + i)
-        QT = MatrixXd::Zero(N, 4 * N * N);
-        for (int j = 0; j < 2 * N; ++j)
-            for (const auto& [w, PB, PV] : lay[j])
-                for (int q = 0; q < w.size(); ++q)
-                    QT.block(0, j * 2 * N, N, 2 * N).noalias() += w[q] * PB.row(q).transpose() * PV.row(q);
-        // bilinear form for the shifted inner product
-        R.assign(N, MatrixXd::Zero(N, N));
-        for (int j = 0; j < N; ++j)
-            for (int q = 0; q < m; ++q)
-                if (SW(j, q) != 0.0) R[j].noalias() += SW(j, q) * SPf[j].row(q).transpose() * SPg[j].row(q);
-        // the layouts are only needed to build QT and R
-        lay.clear(); lay.shrink_to_fit(); SPf.clear(); SPf.shrink_to_fit(); SPg.clear(); SPg.shrink_to_fit(); SW.resize(0, 0);
     }
 
     VectorXd shifted_inner(const MatrixXd& f, const MatrixXd& g) const {
