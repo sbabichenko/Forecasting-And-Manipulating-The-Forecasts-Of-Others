@@ -42,7 +42,7 @@ static void march(const Kernel2D& D1, const Kernel2D& D2, double g1, double g2, 
 }
 int main(int argc, char** argv) {
     const int n = std::atoi(argv[1]); const double p1 = std::atof(argv[2]), p2 = std::atof(argv[3]), r = std::atof(argv[4]); const double scale = std::atof(argv[5]); const bool freeze = std::atoi(argv[6]); const bool diag_cost = argc > 7 && std::atoi(argv[7]);
-    SolverContext ctx = SolverContext::capture_current(); ctx.n = n; ctx.T = 1.0; ctx.b1 = 1.0; ctx.b2 = -1.0; ctx.r1 = r; ctx.r2 = r; ctx.sigma = 1.0; ctx.terminal_weight = 0.0;
+    SolverContext ctx = SolverContext::capture_current(); ctx.n = n; ctx.T = 1.0; ctx.b1 = 1.0; ctx.b2 = -1.0; ctx.r1 = r; ctx.r2 = r; ctx.sigma = 1.0; ctx.terminal_weight = std::getenv("STAT_TW") ? std::atof(std::getenv("STAT_TW")) : 0.0;
     ScopedSolverContext guard(ctx);
     const double g1 = std::sqrt(p1), g2 = std::sqrt(p2);
     auto eq = solve_equilibrium(g1, g2, false);
@@ -63,7 +63,7 @@ int main(int argc, char** argv) {
     // per-entry: FD gradient at the fixed point (scale 1) and at 0.9 x equilibrium, ratio
     Kernel2D D1eq = eq.D1;
     std::printf("N=%d  entries (t,s,c): |dJ/dD| at fixed point | at 0.9 x eq | ratio\n", n);
-    for (int t : {n / 2, n - 2}) for (int s : {0, 1, 2, t / 2, t - 2, t - 1, t}) for (int c : {0, 1, 2}) {
+    for (int t : {n / 2, n - 2}) for (int s : (std::getenv("STAT_EARLY") ? std::vector<int>{0, 1, 2, 3, 4, 5, 6, 8, 12, 16, t / 2} : std::vector<int>{0, 1, 2, t / 2, t - 2, t - 1, t})) for (int c : (std::getenv("STAT_EARLY") ? std::vector<int>{1} : std::vector<int>{0, 1, 2})) {
         if (s > t) continue;
         double g[2];
         for (int k = 0; k < 2; ++k) {

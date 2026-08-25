@@ -427,11 +427,13 @@ static void enforce_predictable(Kernel2D& D1, Kernel2D& D2) { if (!predictable_c
 struct CERowFilter {
     int n = 0, rank = 0, obs = 0; double g = 0.0;
     Eigen::MatrixXd V; Eigen::VectorXd h, v, coeff, Xvec, Dvec, Pd, cH, cD, cX;
+    std::vector<int> rank_after;     // rank after row j (basis of observations up to j)
     void reset(int n_, int obs_, double g_) {
         n = n_; obs = obs_; g = g_; rank = 0;
         const int dim = 3 * n;
         if (V.rows() != dim || V.cols() != n) { V.resize(dim, n); h.resize(dim); v.resize(dim); Xvec.resize(dim); Dvec.resize(dim); Pd.resize(dim); coeff.resize(n); cH.resize(n); cD.resize(n); cX.resize(n); }
         V.setZero(); h.setZero(); v.setZero(); Xvec.setZero(); Dvec.setZero();
+        rank_after.assign(n, 0);
     }
     void row(int j, const Kernel2D& X, const Kernel2D& D, Kernel2D& Xtilde, Kernel2D& calD) {
         if (j == 0) { Xtilde[0][0] = X[0][0]; calD[0][0].setZero(); return; }
@@ -485,14 +487,14 @@ struct CERowFilter {
         }
         for (int z = 0; z <= j; ++z) Xtilde[j][z] = Xvec.segment<3>(3 * z);
         calD[j][0](obs) = 0.0;
+        rank_after[j] = rank;
     }
     static Vec3 Vect3(const Eigen::VectorXd& w, int z) { return w.segment<3>(3 * z); }
 
     // Workshared row for j >= 1 (predictable control): called by all `S` threads of this player's
     // subgroup (sub-thread index `t`) inside one parallel region.  Pass 1 splits the basis columns,
-    // pass 2 splits the rows (Vec3 units); partial sums go through `part`.  Six team-wide barriers
+    // pass 2 splits the rows (Vec3 units).  One team-wide barrier
     // per row; both players' subgroups must call this with the same j so the barriers match.
-    std::vector<double> part, part2;
     void row_ws(int j, const Kernel2D& X, const Kernel2D& D, Kernel2D& Xtilde, Kernel2D& calD, int t, int S) {
         // One barrier per row: after the column (dot) pass every thread has c_h, c_D, c_X, and the
         // two reductions the row pass needs follow algebraically,
@@ -524,7 +526,7 @@ struct CERowFilter {
             if (added) { Flat vc(V.col(r0).data() + i0, L); vc = vv / vnorm; xv -= (vX / vnorm) * vc; }
             for (int z = z0; z < z1; ++z) { calD[j][z] = Pd.segment<3>(3 * z); Xtilde[j][z] = Xvec.segment<3>(3 * z); }
         }
-        if (t == 0) { calD[j][0](obs) = 0.0; if (added) ++rank; }
+        if (t == 0) { calD[j][0](obs) = 0.0; if (added) ++rank; rank_after[j] = rank; }
         #pragma omp barrier            // the next X row needs every thread's calD[j]; `single` has no entry barrier
     }
 };
@@ -624,6 +626,7 @@ void forward_environment(
         static thread_local CERowFilter F1, F2;
         F1.reset(g_n, obs_idx_1, obs_gain1); F2.reset(g_n, obs_idx_2, obs_gain2);
         CERowFilter* pF1 = &F1; CERowFilter* pF2 = &F2;
+        env.basis1 = &F1; env.basis2 = &F2;
         static const bool ws_ce = [] { const char* e = std::getenv("LQG_FORWARD_WS"); return !(e && std::atoi(e) == 0); }();
         const int team = std::min(8, omp_get_max_threads());
         if (ws_ce && predictable_control() && g_n >= 64 && !omp_in_parallel() && team >= 4) {
@@ -965,6 +968,158 @@ void backward_kernels_pair(const Kernel2D& X, BackwardPlayer& P1, BackwardPlayer
                 Hx[j][r] = Hx[tp][r] + g_dt * (X[tp][r] + Wr);
             }
         }
+    }
+}
+
+// Exact discrete adjoint: gradient of player a's fluctuation cost
+//   J_a = sum_j dt ( dt sum_{s<=j} |X[j][s]|^2 + r_a dt sum_{s<=j} |calD_a[j][s]|^2 ) + tw dt sum_s |X[n-1][s]|^2
+// with respect to D_a (the opponent's kernel and the mean frozen), by reverse-mode differentiation of
+// the march: X-row update, h_j = g dt X[j] + e_(j,obs), Gram-Schmidt column u_j, calD_i[j] = V_{j-1} V_{j-1}^T D_i[j].
+// Returned as Hx_a := grad / (2 dt^2) - r_a D_a, so that the fixed-point map G = -Hx / r reads
+// D - grad / (2 r dt^2) and vanishes exactly at a best response.
+static bool exact_adjoint_enabled() { static const bool v = [] { const char* e = std::getenv("LQG_EXACT_ADJOINT"); return !(e && std::atoi(e) == 0); }(); return v; }
+static void exact_adjoint_player_ref(int a, const EnvironmentResult& env, const Kernel2D& D1, const Kernel2D& D2, double r_a, int obs1, int obs2, double g1, double g2, Kernel2D& Hx_out) {
+    const int n = g_n, dim = 3 * n;
+    const CERowFilter* B[2] = {static_cast<const CERowFilter*>(env.basis1), static_cast<const CERowFilter*>(env.basis2)};
+    const Kernel2D* D[2] = {&D1, &D2}; const Kernel2D* C[2] = {&env.calD1, &env.calD2}; const int obs[2] = {obs1, obs2}; const double gg[2] = {g1, g2};
+    const Kernel2D& X = env.X;
+    static thread_local Kernel2D Xbar, cbar0, cbar1, grad; Xbar.resize(); cbar0.resize(); cbar1.resize(); grad.resize();
+    Kernel2D* cbar[2] = {&cbar0, &cbar1};
+    static thread_local Eigen::MatrixXd Vbar[2];
+    for (int q = 0; q < 2; ++q) { if (Vbar[q].rows() != dim || Vbar[q].cols() != n) Vbar[q].resize(dim, n); Vbar[q].setZero(); }
+    // cost adjoints
+    for (int j = 0; j < n; ++j) for (int s = 0; s <= j; ++s) { Xbar[j][s] = 2.0 * g_dt * g_dt * X[j][s]; (*cbar[a])[j][s] = 2.0 * r_a * g_dt * g_dt * (*C[a])[j][s]; (*cbar[1 - a])[j][s].setZero(); }
+    if (g_terminal_weight != 0.0) for (int s = 0; s < n; ++s) Xbar[n - 1][s] += 2.0 * g_terminal_weight * g_dt * X[n - 1][s];   // tw dt sum_s |X[n-1][s]|^2
+    grad.setZero();
+    Eigen::VectorXd cb, dv, Vtc, Vtd, h, c, u, ubar, vbar, hbar, Vtvb;
+    for (int j = n - 1; j >= 1; --j) {
+        const int active = 3 * (j + 1);
+        // (b) calD_i[j] = P_{j-1} D_i[j]
+        for (int q = 0; q < 2; ++q) {
+            const CERowFilter& b = *B[q]; const int r0 = b.rank_after[j - 1];
+            cb.resize(active); dv.resize(active);
+            for (int z = 0; z <= j; ++z) { cb.segment<3>(3 * z) = (*cbar[q])[j][z]; dv.segment<3>(3 * z) = (*D[q])[j][z]; }
+            cb(obs[q]) = 0.0;                                   // calD[j][0](obs) is forced to zero
+            if (r0 > 0) {
+                auto Vact = b.V.topRows(active).leftCols(r0);
+                Vtc.noalias() = Vact.transpose() * cb; Vtd.noalias() = Vact.transpose() * dv;
+                if (q == a) { Eigen::VectorXd pdb = Vact * Vtc; for (int z = 0; z <= j; ++z) grad[j][z] += pdb.segment<3>(3 * z); }
+                Vbar[q].topRows(active).leftCols(r0).noalias() += cb * Vtd.transpose() + dv * Vtc.transpose();
+            }
+        }
+        // (c) Gram-Schmidt adjoint of the column added at row j (both players' filters depend on X)
+        for (int q = 0; q < 2; ++q) {
+            const CERowFilter& b = *B[q]; const int r0 = b.rank_after[j - 1]; if (b.rank_after[j] <= r0) continue;
+            auto Vact = b.V.topRows(active).leftCols(r0);
+            h.resize(active); for (int z = 0; z <= j; ++z) h.segment<3>(3 * z) = gg[q] * g_dt * X[j][z]; h(3 * j + obs[q]) += 1.0;
+            c.noalias() = Vact.transpose() * h; const double vn = std::sqrt(std::max(h.squaredNorm() - c.squaredNorm(), 1e-300));
+            u = b.V.col(r0).head(active); ubar = Vbar[q].col(r0).head(active);
+            vbar = (ubar - u * u.dot(ubar)) / vn;
+            hbar = vbar;
+            if (r0 > 0) { Vtvb.noalias() = Vact.transpose() * vbar; hbar.noalias() -= Vact * Vtvb; Vbar[q].topRows(active).leftCols(r0).noalias() += -vbar * c.transpose() - h * Vtvb.transpose(); }
+            for (int z = 0; z <= j; ++z) Xbar[j][z] += gg[q] * g_dt * hbar.segment<3>(3 * z);
+        }
+        // (d) X[j][s] = X[j-1][s] + dt (calD_1[j-1][s] + calD_2[j-1][s])
+        for (int s = 0; s < j; ++s) { Xbar[j - 1][s] += Xbar[j][s]; (*cbar[0])[j - 1][s] += g_dt * Xbar[j][s]; (*cbar[1])[j - 1][s] += g_dt * Xbar[j][s]; }
+    }
+    const double sc = 1.0 / (2.0 * g_dt * g_dt);
+    Hx_out.resize();
+    for (int j = 0; j < n; ++j) for (int s = 0; s <= j; ++s) Hx_out[j][s] = sc * grad[j][s] - r_a * (*D[a])[j][s];
+}
+static int adjoint_batch() { static const int v = [] { const char* e = std::getenv("LQG_ADJ_BATCH"); return e ? std::max(1, std::atoi(e)) : 8; }(); return v; }
+static void exact_adjoint_player(int a, const EnvironmentResult& env, const Kernel2D& D1, const Kernel2D& D2, double r_a, int obs1, int obs2, double g1, double g2, Kernel2D& Hx_out) {
+    const int n = g_n, dim = 3 * n, m = adjoint_batch();
+    const CERowFilter* B[2] = {static_cast<const CERowFilter*>(env.basis1), static_cast<const CERowFilter*>(env.basis2)};
+    const Kernel2D* D[2] = {&D1, &D2}; const Kernel2D* C[2] = {&env.calD1, &env.calD2}; const int obs[2] = {obs1, obs2}; const double gg[2] = {g1, g2};
+    const Kernel2D& X = env.X;
+    static thread_local Kernel2D Xbar, cbar0, cbar1, grad; Xbar.resize(); cbar0.resize(); cbar1.resize(); grad.resize();
+    Kernel2D* cbar[2] = {&cbar0, &cbar1};
+    // Vbar[q] accumulates the adjoint of the basis columns.  The rank-1 updates of a row are not
+    // applied immediately: the row's four vectors go into W (dim x 4m) and their coefficients into
+    // K (n x 4m), the product W K^T is added to Vbar once every m rows, and the one column a row
+    // needs in between (the column added at that row) is read lazily from Vbar plus the pending W K^T.
+    static thread_local Eigen::MatrixXd Vbar[2], W[2], K[2], R4, M2;
+    int nb[2] = {0, 0}, bA[2] = {0, 0}, bR[2] = {0, 0};
+    for (int q = 0; q < 2; ++q) {
+        if (Vbar[q].rows() != dim || Vbar[q].cols() != n) Vbar[q].resize(dim, n);
+        Vbar[q].setZero();
+        if (W[q].rows() != dim || W[q].cols() != 4 * m) { W[q].resize(dim, 4 * m); K[q].resize(n, 4 * m); }
+    }
+    // cost adjoints
+    for (int j = 0; j < n; ++j) for (int s = 0; s <= j; ++s) { Xbar[j][s] = 2.0 * g_dt * g_dt * X[j][s]; (*cbar[a])[j][s] = 2.0 * r_a * g_dt * g_dt * (*C[a])[j][s]; (*cbar[1 - a])[j][s].setZero(); }
+    if (g_terminal_weight != 0.0) for (int s = 0; s < n; ++s) Xbar[n - 1][s] += 2.0 * g_terminal_weight * g_dt * X[n - 1][s];   // tw dt sum_s |X[n-1][s]|^2
+    grad.setZero();
+    Eigen::VectorXd ubar, vbar, hbar, Vtvb;
+    auto flush = [&](int q) {
+        if (nb[q] == 0) return;
+        Vbar[q].topRows(bA[q]).leftCols(bR[q]).noalias() += W[q].topRows(bA[q]).leftCols(4 * nb[q]) * K[q].topRows(bR[q]).leftCols(4 * nb[q]).transpose();
+        nb[q] = 0;
+    };
+    for (int j = n - 1; j >= 1; --j) {
+        const int active = 3 * (j + 1);
+        for (int q = 0; q < 2; ++q) {
+            const CERowFilter& b = *B[q]; const int r0 = b.rank_after[j - 1]; if (r0 == 0) continue;
+            const bool gs = b.rank_after[j] > r0;
+            auto Vact = b.V.topRows(active).leftCols(r0);
+            if (nb[q] == 0) { bA[q] = active; bR[q] = r0; }
+            const int c0 = 4 * nb[q];
+            auto Wj = W[q].middleCols(c0, 4); auto Kj = K[q].middleCols(c0, 4);
+            Wj.setZero(); Kj.setZero();
+            // R4 = Vact^T [cb, dv, h, ubar]; columns 2,3 only when a basis column was added at row j
+            R4.resize(active, 4);
+            for (int z = 0; z <= j; ++z) { R4.block<3, 1>(3 * z, 0) = (*cbar[q])[j][z]; R4.block<3, 1>(3 * z, 1) = (*D[q])[j][z]; }
+            R4(obs[q], 0) = 0.0;                                // calD[j][0](obs) is forced to zero
+            if (gs) {
+                for (int z = 0; z <= j; ++z) R4.block<3, 1>(3 * z, 2) = gg[q] * g_dt * X[j][z];
+                R4(3 * j + obs[q], 2) += 1.0;
+                ubar = Vbar[q].col(r0).head(active);
+                if (nb[q] > 0) ubar.noalias() += W[q].topRows(active).leftCols(c0) * K[q].row(r0).head(c0).transpose();
+                R4.col(3) = ubar;
+            } else { R4.col(2).setZero(); R4.col(3).setZero(); }
+            Kj.topRows(r0).noalias() = Vact.transpose() * R4;   // columns (Vt cb, Vt dv, Vt h, Vt ubar)
+            // (b) adjoint of calD[j] = Vact Vact^T D[j]:  Vbar += cb (Vt dv)^T + dv (Vt cb)^T,  grad += Vact (Vt cb)
+            Wj.col(0).head(active) = R4.col(0); Wj.col(1).head(active) = R4.col(1);
+            Kj.topRows(r0).col(0).swap(Kj.topRows(r0).col(1));  // K columns now (Vt dv, Vt cb, Vt h, Vt ubar)
+            const int nm = (q == a ? 1 : 0) + (gs ? 1 : 0);
+            if (nm > 0) {
+                M2.resize(r0, nm); int k = 0;
+                if (q == a) M2.col(k++) = Kj.topRows(r0).col(1);
+                double vn = 1.0;
+                if (gs) {
+                    const double hn2 = R4.col(2).squaredNorm(), cn2 = Kj.topRows(r0).col(2).squaredNorm();
+                    vn = std::sqrt(std::max(hn2 - cn2, 1e-300));
+                    // Vt vbar = Vt ubar / vn  (Vt u = 0)
+                    Kj.topRows(r0).col(3) /= vn;
+                    M2.col(k++) = Kj.topRows(r0).col(3);
+                }
+                Eigen::MatrixXd P = Vact * M2; int kk = 0;
+                if (q == a) { for (int z = 0; z <= j; ++z) grad[j][z] += P.block<3, 1>(3 * z, kk); ++kk; }
+                if (gs) {
+                    // (c) Gram-Schmidt adjoint: vbar = (ubar - u (u.ubar)) / vn, hbar = vbar - Vact (Vt vbar),
+                    //     Vbar += -vbar c^T - h (Vt vbar)^T,  Xbar[j] += g dt hbar
+                    auto u = b.V.col(r0).head(active);
+                    vbar = (ubar - u * u.dot(ubar)) / vn;
+                    hbar = vbar - P.col(kk);
+                    Wj.col(2).head(active) = -vbar; Wj.col(3).head(active) = -R4.col(2);
+                    for (int z = 0; z <= j; ++z) Xbar[j][z] += gg[q] * g_dt * hbar.segment<3>(3 * z);
+                }
+            }
+            if (++nb[q] == m) flush(q);
+        }
+        // (d) X[j][s] = X[j-1][s] + dt (calD_1[j-1][s] + calD_2[j-1][s])
+        for (int s = 0; s < j; ++s) { Xbar[j - 1][s] += Xbar[j][s]; (*cbar[0])[j - 1][s] += g_dt * Xbar[j][s]; (*cbar[1])[j - 1][s] += g_dt * Xbar[j][s]; }
+    }
+    const double sc = 1.0 / (2.0 * g_dt * g_dt);
+    Hx_out.resize();
+    for (int j = 0; j < n; ++j) for (int s = 0; s <= j; ++s) Hx_out[j][s] = sc * grad[j][s] - r_a * (*D[a])[j][s];
+}
+static void exact_adjoint_pair(const EnvironmentResult& env, const Kernel2D& D1, const Kernel2D& D2, double r1, double r2, int obs1, int obs2, double g1, double g2, Kernel2D& Hx1, Kernel2D& Hx2) {
+    #pragma omp parallel sections num_threads(2) if (!omp_in_parallel())
+    {
+        #pragma omp section
+        (std::getenv("LQG_ADJ_REF") ? exact_adjoint_player_ref : exact_adjoint_player)(0, env, D1, D2, r1, obs1, obs2, g1, g2, Hx1);
+        #pragma omp section
+        (std::getenv("LQG_ADJ_REF") ? exact_adjoint_player_ref : exact_adjoint_player)(1, env, D1, D2, r2, obs1, obs2, g1, g2, Hx2);
     }
 }
 
@@ -1410,7 +1565,9 @@ static EquilibriumResult solve_equilibrium_core(
         forward_environment(D1, D2, p1_val, p2_val, FORWARD_INNER_ITERS,
                             Pi_1, obs_idx_1, Pi_2, obs_idx_2, env);
 
-        if (lockstep) {
+        if (exact_adjoint_enabled() && env.has_calD && env.basis1) {
+            exact_adjoint_pair(env, D1, D2, g_r1, g_r2, obs_idx_1, obs_idx_2, p1_val, p2_val, Hx1, Hx2);
+        } else if (lockstep) {
             bp1.Xt = &env.Xtilde2; bp1.Dk = &D2; bp1.prec = &prec2; bp1.gain = p2_val; bp1.obs = obs_idx_2; bp1.Hx = &Hx1;
             bp2.Xt = &env.Xtilde1; bp2.Dk = &D1; bp2.prec = &prec1; bp2.gain = p1_val; bp2.obs = obs_idx_1; bp2.Hx = &Hx2;
             backward_kernels_pair(env.X, bp1, bp2, g_terminal_weight);
@@ -1512,10 +1669,14 @@ static EquilibriumResult solve_equilibrium_core(
         auto evalF = [&](const Eigen::VectorXd& xv, Eigen::VectorXd& Fv) -> double {
             unpack_kernels(xv, TRI, Dn1, Dn2);
             forward_environment(Dn1, Dn2, p1_val, p2_val, FORWARD_INNER_ITERS, Pi_1, obs_idx_1, Pi_2, obs_idx_2, env);
+            if (exact_adjoint_enabled() && env.has_calD && env.basis1) {
+                exact_adjoint_pair(env, Dn1, Dn2, g_r1, g_r2, obs_idx_1, obs_idx_2, p1_val, p2_val, Hx1, Hx2);
+            } else {
             bp1.Xt = &env.Xtilde2; bp1.Dk = &Dn2; bp1.prec = &prec2; bp1.gain = p2_val; bp1.obs = obs_idx_2; bp1.Hx = &Hx1;
             bp2.Xt = &env.Xtilde1; bp2.Dk = &Dn1; bp2.prec = &prec1; bp2.gain = p1_val; bp2.obs = obs_idx_1; bp2.Hx = &Hx2;
             backward_kernels_pair(env.X, bp1, bp2, g_terminal_weight);
             if (predictable_control()) for (int t = 0; t < g_n; ++t) { Hx1[t][t].setZero(); Hx2[t][t].setZero(); }
+            }
             return best_response_residual(Dn1, Dn2, Hx1, Hx2, TRI, neg_inv_r1, neg_inv_r2, &Fv);
         };
         double res = evalF(x, F);

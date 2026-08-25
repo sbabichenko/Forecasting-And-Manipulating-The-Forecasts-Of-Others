@@ -200,7 +200,9 @@ The equilibrium is found by a three-level nested iteration:
    closed-form Kalman gain per time index j; `FILTER_INNER_ITERS` and
    `FILTER_RELAX` are no longer used.
 
-4. **Backward adjoints** (`backward_kernels`): Hk-free.  The adjoint block
+4. **Backward adjoints**: by default the exact reverse-mode adjoint of the
+   march (`exact_adjoint_player`, see below).  The recursion
+   `backward_kernels` (`LQG_EXACT_ADJOINT=0`) is Hk-free.  The adjoint block
    kernel Hk[t] is a sum over later times of rank-one (in the two source
    indices) terms, so the two contractions the backward recursion needs are
    formed from 3x3 moment matrices of Hx, X and Xtilde instead of an N^2 array
@@ -274,6 +276,46 @@ zeroing the own-noise entry of calD(j,j) after the projection (changes the
 forward map without its adjoint) and zeroing D(j,j)[own] only (removes a
 legitimate density coordinate; wrong equilibrium).
 
+**Exact discrete adjoint** (2026-08-25, default; `LQG_EXACT_ADJOINT=0` restores
+the recursion).  The stationarity check with the projection filter kept
+showing ratios above one in the first own-noise coordinates (s = 1, 2) and an
+early-time error in the state channel: the coded backward recursion
+(`backward_kernels`) is the adjoint of the continuous-time equations, not of
+the march actually run, and the difference is an O(1) error at the initial
+observations (about -4e-6 at s = 1, gone by s ~ 7, at every t).  A
+decomposition of the marginal value of the first innovation showed its
+elasticity to be ~1 with respect to the player's own early kernel and ~0 with
+respect to the opponent's -- a spurious self-coupling, not a feature of the
+game -- which is what made the cheap-effort paths turn back at an
+initial-time layer.  `exact_adjoint_player` now differentiates the march in
+reverse: the cost seeds Xbar = 2 dt^2 X, cbar = 2 r dt^2 calD (plus the
+terminal term), then per row, descending, the adjoint of the projection
+calD[j] = V V^T D[j] (rank-one updates of the basis adjoint Vbar), the
+adjoint of the Gram--Schmidt column added at row j (through h_j = g dt X[j] +
+e_(j,obs), both players' filters), and the state recursion.  Returned as
+Hx = grad / (2 dt^2) - r D so that the best-response map is unchanged; the
+projection bases are kept from the march (`EnvironmentResult::basis1/2`).
+Verified against finite differences of the discrete cost (<= 5e-4 relative on
+every tested entry) and against the standalone reverse-mode implementation.
+Effects: stationarity ratios <= 0.006 at every entry at N=160 (were
+0.03--0.17); the benchmark J1 is 4.2736 / 4.1789 / 4.1333 at N=40/80/160,
+Richardson limit 4.0909 (4.0967 with the recursion); the equilibrium kernels
+move by up to 4.8% (calD, near the diagonal) and 2.5% (X), mostly at early s;
+the Chapter 3 stationary comparison is unchanged (state kernel within 0.5%,
+own-noise error component -0.832 vs -0.843).  The p = 0.1, T = 3 path, which
+the recursion lost at r = 0.0067, now continues smoothly to r = 0.002
+(max |calD1| growing 3.5 -> 8.9, no initial-time layer).  Note that D itself
+is now determined only up to the components outside the information space
+(the projection annihilates them), so compare calD and X between runs, not D.
+The sweep costs about one forward march: per row and player one 4-column
+transposed product V^T [cbar, D, h, ubar] (V^T vbar = V^T ubar / |v| since
+V^T u = 0), one 1--2 column product, and the four rank-one updates of Vbar
+batched into one rank-4m product every m = 8 rows (`LQG_ADJ_BATCH`), the
+column a row needs in between read lazily from Vbar plus the pending block.
+A solve with the exact adjoint takes about 1.35x the time of one with the
+recursion (measured under load at N=160: 204 vs 150 ms, 15 vs 16 iterations;
+the unbatched sweep was 1.7x).  The figure pipeline at N=157 takes 63 s.
+
 **Stationarity check** (`test_stationarity N p1 p2 r`): finite differences of the
 discrete cost with respect to single entries of player 1's kernel, with player
 2's strategy, both mean controls and player 1's own projection frozen (the
@@ -317,10 +359,11 @@ any relaxation above 2/(1+|lambda|); the solver's job is to keep Newton
 supplied with a good iterate.  Two logic defects (an Anderson blow-up above
 the engagement threshold escaping the rejection logic; GMRES(30) too small
 for the Newton systems) were fixed; the p=0.1, T=3 path now continues to
-r=0.0074.  Result at N=40, full-pipeline criterion, predictable control: 14/512 failures,
-all T=3, r=0.01 with a player at p <= 1; T=1 solves every case and T=3 every
-case with r >= 0.05.  The residual failures are an initial-time layer in the
-own-noise channel (see the diagnosis notes), not a solver defect.
+r=0.0074.  Result at N=40, full-pipeline criterion, predictable control with
+the coded adjoint recursion: 14/512 failures, all T=3, r=0.01 with a player at
+p <= 1 -- an initial-time layer in the own-noise channel that turned out to be
+the recursion's inconsistency with the march (see the exact discrete adjoint
+above).  With the exact adjoint: 0/512 failures (mean 20 iterations, max 43).
 The dissertation's cases (T=1, r >= 0.05) are far inside the usable region.
 
 **Memory**: a single solve peaks at 15 MB (N=160), 60 MB (N=320), 173 MB

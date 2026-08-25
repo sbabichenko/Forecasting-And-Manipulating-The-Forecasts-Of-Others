@@ -188,6 +188,9 @@ struct EnvironmentResult {
     // Observation parameters (needed for F materialization)
     double obs_gain1, obs_gain2;
     int obs_idx1, obs_idx2;
+    // Projection bases of the march that produced this environment (opaque; valid until the
+    // next march on the same thread).  Used by the exact discrete adjoint.
+    const void* basis1 = nullptr; const void* basis2 = nullptr;
 };
 
 // ---------- bar solution ----------
