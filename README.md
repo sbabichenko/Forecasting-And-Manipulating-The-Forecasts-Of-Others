@@ -251,7 +251,7 @@ F-materialization forms it from Xtilde (N=640: 173 -> 163 MB).  The figure
 driver's peak (about 300 MB at N=157) is its cache of every equilibrium, 7
 kernels per parameter point.
 
-Timings for the (3,3) benchmark solve, 8 threads: N=40 3 ms, N=160 55 ms,
+Timings for the (3,3) benchmark solve, 8 threads: N=40 3 ms, N=160 45 ms,
 N=320 0.4 s, N=640 1.9 s (N=160 was 1.4 s before the exact march, Hk-free
 adjoints, Anderson, vectorization and threading; N > 160 was not possible).
 The full figure pipeline at N=40 takes 1.0 s (was 8 s), N=157 about 30 s

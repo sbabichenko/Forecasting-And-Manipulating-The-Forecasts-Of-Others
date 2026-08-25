@@ -5,6 +5,7 @@
 // decomposition F[j][u][s] = border + sum_k Xtilde[k][u] * A[k][s]^T, A[k][s] = dt gain^2 Xtilde[k][s] (s < k).
 
 #include <cstdlib>
+#include <cstring>
 #include <Eigen/Dense>
 #ifdef _OPENMP
 #include <omp.h>
@@ -1018,8 +1019,13 @@ BarSolution solve_bar_equilibrium(
 static double best_response_residual(const Kernel2D& D1, const Kernel2D& D2,
                                      const Kernel2D& Hx1, const Kernel2D& Hx2,
                                      int tri_size,
-                                     double neg_inv_r1, double neg_inv_r2) {
+                                     double neg_inv_r1, double neg_inv_r2,
+                                     Eigen::VectorXd* f_out = nullptr) {
+    // residual |G - D| / max(1, |G|); optionally also writes f = G - D (stacked D1, D2) for Anderson
     double norm_f = 0.0, norm_g = 0.0;
+    if (f_out) f_out->resize(6 * tri_size);
+    double* fo = f_out ? f_out->data() : nullptr;
+    #pragma omp parallel for reduction(+:norm_f,norm_g) schedule(static) if (tri_size > 4000 && !omp_in_parallel())
     for (int i = 0; i < tri_size; ++i) {
         const Vec3 g1 = neg_inv_r1 * Hx1.data[i];
         const Vec3 g2 = neg_inv_r2 * Hx2.data[i];
@@ -1027,6 +1033,7 @@ static double best_response_residual(const Kernel2D& D1, const Kernel2D& D2,
         const Vec3 f2 = g2 - D2.data[i];
         norm_f += f1.squaredNorm() + f2.squaredNorm();
         norm_g += g1.squaredNorm() + g2.squaredNorm();
+        if (fo) { Eigen::Map<Vec3>(fo + 3 * i) = f1; Eigen::Map<Vec3>(fo + 3 * (tri_size + i)) = f2; }
     }
     return std::sqrt(norm_f) / std::max(1.0, std::sqrt(norm_g));
 }
@@ -1090,29 +1097,54 @@ struct AndersonState {
         if (have_prev) {
             // append the newest difference (overwriting the oldest when full) and update the Gram matrix column
             const int c = head; head = (head + 1) % depth; if (m < depth) ++m;
-            dX.col(c) = (x - x_prev).cast<float>(); dF.col(c) = (f - f_prev).cast<float>();
-            for (int i = 0; i < m; ++i) { G(i, c) = dF.col(i).cast<double>().dot(dF.col(c).cast<double>()); G(c, i) = G(i, c); }
+            {
+                float* dxc = dX.col(c).data(); float* dfc = dF.col(c).data();
+                const double* xp = x.data(); const double* xq = x_prev.data(); const double* fp = f.data(); const double* fq = f_prev.data();
+                #pragma omp parallel for schedule(static) if (n > 20000 && !omp_in_parallel())
+                for (int i = 0; i < n; ++i) { dxc[i] = static_cast<float>(xp[i] - xq[i]); dfc[i] = static_cast<float>(fp[i] - fq[i]); }
+            }
+            for (int i = 0; i < m; ++i) {
+                const float* a = dF.col(i).data(); const float* b = dF.col(c).data(); double acc = 0.0;
+                #pragma omp parallel for reduction(+:acc) schedule(static) if (n > 20000 && !omp_in_parallel())
+                for (int k = 0; k < n; ++k) acc += static_cast<double>(a[k]) * b[k];
+                G(i, c) = acc; G(c, i) = acc;
+            }
         }
         x_prev = x; f_prev = f; have_prev = true;
         if (m == 0) { x = x + first_step * f; return true; }   // first move: the safe relaxation, not beta
         // gamma = argmin |f - dF gamma| over the m stored columns (any order: the columns are a set)
         Eigen::MatrixXd Gm = G.topLeftCorner(m, m);
-        Eigen::VectorXd rhs(m); for (int i = 0; i < m; ++i) rhs[i] = dF.col(i).cast<double>().dot(f);
+        Eigen::VectorXd rhs(m);
+        for (int i = 0; i < m; ++i) {
+            const float* a = dF.col(i).data(); const double* fp = f.data(); double acc = 0.0;
+            #pragma omp parallel for reduction(+:acc) schedule(static) if (n > 20000 && !omp_in_parallel())
+            for (int k = 0; k < n; ++k) acc += a[k] * fp[k];
+            rhs[i] = acc;
+        }
         Eigen::LDLT<Eigen::MatrixXd> ldlt(Gm + 1e-12 * Gm.trace() * Eigen::MatrixXd::Identity(m, m));
         const Eigen::VectorXd gamma = ldlt.solve(rhs);
         if (!gamma.allFinite()) { reset(); return false; }
-        const Eigen::VectorXf gf = gamma.cast<float>();
-        x = x + beta * f - (dX.leftCols(m) * gf).cast<double>() - beta * (dF.leftCols(m) * gf).cast<double>();
+        {
+            double* xp = x.data(); const double* fp = f.data();
+            #pragma omp parallel for schedule(static) if (n > 20000 && !omp_in_parallel())
+            for (int k = 0; k < n; ++k) {
+                double cx = 0.0, cf = 0.0;
+                for (int i = 0; i < m; ++i) { cx += dX(k, i) * gamma[i]; cf += dF(k, i) * gamma[i]; }
+                xp[k] = xp[k] + beta * fp[k] - cx - beta * cf;
+            }
+        }
         return true;
     }
 };
 
 static void pack_kernels(const Kernel2D& D1, const Kernel2D& D2, int tri, Eigen::VectorXd& x) {
     x.resize(6 * tri);
-    for (int i = 0; i < tri; ++i) { x.segment<3>(3 * i) = D1.data[i]; x.segment<3>(3 * (tri + i)) = D2.data[i]; }
+    std::memcpy(x.data(), D1.data[0].data(), sizeof(double) * 3 * tri);            // Vec3 rows are contiguous
+    std::memcpy(x.data() + 3 * tri, D2.data[0].data(), sizeof(double) * 3 * tri);
 }
 static void unpack_kernels(const Eigen::VectorXd& x, int tri, Kernel2D& D1, Kernel2D& D2) {
-    for (int i = 0; i < tri; ++i) { D1.data[i] = x.segment<3>(3 * i); D2.data[i] = x.segment<3>(3 * (tri + i)); }
+    std::memcpy(D1.data[0].data(), x.data(), sizeof(double) * 3 * tri);
+    std::memcpy(D2.data[0].data(), x.data() + 3 * tri, sizeof(double) * 3 * tri);
 }
 
 // Core solver: takes initial D1, D2 (may be zero or warm-started)
@@ -1176,7 +1208,7 @@ static EquilibriumResult solve_equilibrium_core(
         const double neg_inv_r1 = -(1.0 / g_r1);
         const double neg_inv_r2 = -(1.0 / g_r2);
         double err = best_response_residual(D1, D2, Hx1, Hx2, TRI,
-                                            neg_inv_r1, neg_inv_r2);
+                                            neg_inv_r1, neg_inv_r2, anderson.depth > 0 ? &fa : nullptr);
         residuals.push_back(err);
         if (!std::isfinite(err)) break;
 
@@ -1207,8 +1239,6 @@ static EquilibriumResult solve_equilibrium_core(
                 // which only affects the size of this one relaxation step
             } else {
                 pack_kernels(D1, D2, TRI, xa);
-                fa.resize(6 * TRI);
-                for (int i = 0; i < TRI; ++i) { fa.segment<3>(3 * i) = neg_inv_r1 * Hx1.data[i] - D1.data[i]; fa.segment<3>(3 * (TRI + i)) = neg_inv_r2 * Hx2.data[i] - D2.data[i]; }
                 prev_err = err; have_prev = true; anderson.first_step = relax;
                 if (anderson.step(xa, fa)) { unpack_kernels(xa, TRI, D1, D2); anderson_active = true; continue; }
             }
