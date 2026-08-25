@@ -1108,6 +1108,95 @@ StationarySolution solve_stationary(const StationaryParams& params, bool verbose
             break;
         }
 
+        if (p.newton_krylov) {
+            // Jacobian-free Newton--Krylov on the fixed point r(z) = g(z) - z,
+            // g = best-response policies.  J v is a finite difference of r,
+            // each costing one forward + backward evaluation; GMRES solves
+            // J s = -r inexactly, then a backtracking step on |r|.
+            const Eigen::VectorXd z = stack_z(d1, d2);
+            const Eigen::VectorXd r0 = stack_z(bwd1.policy, bwd2.policy) - z;
+            const double r0n = r0.norm();
+            auto residual_at = [&](const Eigen::VectorXd& zz) {
+                std::vector<Vec3> a(grid.n), b(grid.n);
+                unstack_z(zz, a, b);
+                ForwardBlock f = solve_forward_block(grid, p, a, b, &x_warm, nullptr, nullptr);
+                BackwardBlock b1, b2;
+#pragma omp parallel sections if (grid.n >= 64)
+                {
+#pragma omp section
+                    b1 = solve_response_adjoint(grid, p, f.x, f.xtilde2, b, p.p2, 2, p.r1, nullptr);
+#pragma omp section
+                    b2 = solve_response_adjoint(grid, p, f.x, f.xtilde1, a, p.p1, 1, p.r2, nullptr);
+                }
+                Eigen::VectorXd out = stack_z(b1.policy, b2.policy) - zz;
+                if (!finite_forward(f) || !finite_backward(b1) || !finite_backward(b2))
+                    out.setConstant(std::numeric_limits<double>::quiet_NaN());
+                return out;
+            };
+            auto jv = [&](const Eigen::VectorXd& v) {
+                const double eps = 1e-5 * std::max(1.0, z.norm()) / std::max(v.norm(), 1e-300);
+                return ((residual_at(z + eps * v) - r0) / eps).eval();
+            };
+            // GMRES on J s = -r0
+            const int m = std::max(1, p.newton_gmres);
+            const double eta = std::min(0.1, std::sqrt(sol.relative_residual));   // forcing term
+            std::vector<Eigen::VectorXd> V;
+            Eigen::MatrixXd H = Eigen::MatrixXd::Zero(m + 1, m);
+            Eigen::VectorXd cs = Eigen::VectorXd::Zero(m), sn = Eigen::VectorXd::Zero(m);
+            Eigen::VectorXd gvec = Eigen::VectorXd::Zero(m + 1);
+            V.push_back((-r0 / r0n).eval());
+            gvec[0] = r0n;
+            int k = 0;
+            for (; k < m; ++k) {
+                Eigen::VectorXd w = jv(V[k]);
+                if (!w.allFinite()) break;
+                for (int j = 0; j <= k; ++j) {
+                    H(j, k) = w.dot(V[j]);
+                    w -= H(j, k) * V[j];
+                }
+                H(k + 1, k) = w.norm();
+                const double hnext = H(k + 1, k);
+                for (int j = 0; j < k; ++j) {
+                    const double t = cs[j] * H(j, k) + sn[j] * H(j + 1, k);
+                    H(j + 1, k) = -sn[j] * H(j, k) + cs[j] * H(j + 1, k);
+                    H(j, k) = t;
+                }
+                const double denom = std::hypot(H(k, k), H(k + 1, k));
+                cs[k] = H(k, k) / denom; sn[k] = H(k + 1, k) / denom;
+                H(k, k) = denom; H(k + 1, k) = 0.0;
+                gvec[k + 1] = -sn[k] * gvec[k];
+                gvec[k] = cs[k] * gvec[k];
+                if (hnext < 1e-14 * r0n || std::abs(gvec[k + 1]) < eta * r0n) { ++k; break; }
+                V.push_back((w / hnext).eval());
+            }
+            Eigen::VectorXd step = Eigen::VectorXd::Zero(zdim);
+            if (k > 0) {
+                const Eigen::VectorXd y = H.topLeftCorner(k, k).triangularView<Eigen::Upper>().solve(gvec.head(k));
+                for (int j = 0; j < k; ++j) step += y[j] * V[j];
+            }
+            // backtracking on the residual norm
+            double lam = 1.0;
+            bool accepted = false;
+            for (int ls = 0; ls < 6 && step.allFinite(); ++ls) {
+                const Eigen::VectorXd zt = z + lam * step;
+                const Eigen::VectorXd rt = residual_at(zt);
+                if (rt.allFinite() && rt.norm() < (1.0 - 1e-4 * lam) * r0n) {
+                    unstack_z(zt, d1, d2);
+                    accepted = true;
+                    break;
+                }
+                lam *= 0.5;
+            }
+            if (verbose)
+                std::cout << "  newton: gmres " << k << " its, step " << lam
+                          << (accepted ? "" : " (rejected; relaxed step)") << "\n";
+            if (!accepted) {
+                relax_into(d1, bwd1.policy, p.relax);
+                relax_into(d2, bwd2.policy, p.relax);
+            }
+            continue;
+        }
+
         const bool use_aa = adepth > 0 && sol.relative_residual < 0.5;
         if (use_aa) {
             const Eigen::VectorXd z = stack_z(d1, d2);

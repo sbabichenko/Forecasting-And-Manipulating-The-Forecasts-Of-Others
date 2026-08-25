@@ -24,7 +24,9 @@ struct StationaryParams {
     int forward_iters = 500;
     double forward_relax = 0.05;
     double forward_tol = 1e-8;
-    bool inexact_forward = false;   // loosen forward_tol while the outer residual is large
+    bool inexact_forward = false;
+    bool newton_krylov = false;     // JFNK outer iteration instead of Anderson/relaxation
+    int newton_gmres = 25;          // max GMRES iterations per Newton step   // loosen forward_tol while the outer residual is large
 
     int backward_iters = 500;
     double backward_relax = 0.05;
