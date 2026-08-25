@@ -221,9 +221,16 @@ Timings for the (3,3) benchmark solve (one core pair): N=40 4 ms, N=160
 0.19 s (was 27 ms and 1.4 s before the exact march, Hk-free adjoints and
 Anderson).  The full figure pipeline at N=40 takes 2 s (was 8 s).
 
-After the kernel equilibrium converges, a separate scalar fixed-point
-(`solve_bar_equilibrium`) finds the mean-field trajectory, and backward
-adjoints compute cost sensitivities.
+After the kernel equilibrium converges, the mean-field trajectory
+(`solve_bar_equilibrium`) is obtained by solving the affine system for the
+mean controls with matrix-free GMRES (one pair of backward bar adjoints per
+application; residual ~1e-16).  The relaxed iteration used before is only
+stable when its spectral radius is below one, which fails at some N (the
+figure-9 call with relaxation 0.35 diverged to 1e124 at N=79); with
+bit-exactly symmetric Picard kernels the symmetric benchmark never left
+barX = 0, so this was invisible until the accelerated kernels broke the
+symmetry at 1e-5.  The relaxed iteration remains as a fallback.  Backward
+adjoints then compute cost sensitivities.
 
 ### F-free decomposition
 

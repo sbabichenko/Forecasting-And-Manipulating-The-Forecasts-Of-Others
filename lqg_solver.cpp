@@ -776,62 +776,94 @@ BarSolution solve_bar_equilibrium(
     double prec1, double prec2,
     int max_iters, double relax, double tol, bool /*verbose*/) {
 
-    std::array<double, N_MAX> barD1{}, barD2{};
+    // The mean-field system is affine in d = (barD1, barD2): barX is a cumulative
+    // sum of d, the bar adjoints are affine in barX, and the best response is
+    // -(1/r) barHx.  Write the map as F(d) = A d + c and solve (I - A) d = c by
+    // GMRES with F applied matrix-free (one pair of backward bar adjoints per
+    // application).  The relaxed iteration d <- d + relax (F(d) - d) used before is
+    // only stable when the spectral radius of I - relax (I - A) is below one,
+    // which fails at some N; it is kept as a fallback if GMRES does not reach tol.
+    const int n = g_n, dim = 2 * n;
     auto prec1_arr = make_constant_prec(prec1);
     auto prec2_arr = make_constant_prec(prec2);
-    double last_err = 1e30;
 
-    for (int it = 1; it <= max_iters; ++it) {
+    auto apply_F = [&](const Eigen::VectorXd& d, Eigen::VectorXd& out, std::array<double, N_MAX>* barX_out) {
         std::array<double, N_MAX> barX;
         barX[0] = g_x0;
-        for (int j = 0; j < g_n - 1; ++j)
-            barX[j + 1] = barX[j] + g_dt * (barD1[j] + barD2[j]);
-
+        for (int j = 0; j < n - 1; ++j) barX[j + 1] = barX[j] + g_dt * (d[j] + d[n + j]);
         BackwardBarResult bba1, bba2;
-        #pragma omp parallel sections
+        #pragma omp parallel sections num_threads(2) if (!omp_in_parallel())
         {
             #pragma omp section
-            bba1 = backward_bar_adjoints(env.X, env.Xtilde2, D2,
-                                          barX, g_b1, prec2_arr,
-                                          env.obs_gain2, env.obs_idx2, g_terminal_weight);
+            bba1 = backward_bar_adjoints(env.X, env.Xtilde2, D2, barX, g_b1, prec2_arr, env.obs_gain2, env.obs_idx2, g_terminal_weight);
             #pragma omp section
-            bba2 = backward_bar_adjoints(env.X, env.Xtilde1, D1,
-                                          barX, g_b2, prec1_arr,
-                                          env.obs_gain1, env.obs_idx1, g_terminal_weight);
+            bba2 = backward_bar_adjoints(env.X, env.Xtilde1, D1, barX, g_b2, prec1_arr, env.obs_gain1, env.obs_idx1, g_terminal_weight);
         }
+        out.resize(dim);
+        for (int j = 0; j < n; ++j) { out[j] = -(1.0 / g_r1) * bba1.barHx[j]; out[n + j] = -(1.0 / g_r2) * bba2.barHx[j]; }
+        if (barX_out) *barX_out = barX;
+    };
 
-        std::array<double, N_MAX> barD1_new, barD2_new;
-        for (int j = 0; j < g_n; ++j) {
-            barD1_new[j] = -(1.0 / g_r1) * bba1.barHx[j];
-            barD2_new[j] = -(1.0 / g_r2) * bba2.barHx[j];
+    // affine part c = F(0); linear operator L d = F(d) - c; solve (I - L) d = c
+    Eigen::VectorXd c; apply_F(Eigen::VectorXd::Zero(dim), c, nullptr);
+    auto apply_M = [&](const Eigen::VectorXd& d, Eigen::VectorXd& out) { apply_F(d, out, nullptr); out = d - (out - c); };
+
+    // GMRES(m) with modified Gram-Schmidt; the system is small (dim <= 2 N_MAX)
+    Eigen::VectorXd d = Eigen::VectorXd::Zero(dim);
+    const int m = std::min(dim, 60);
+    double last_err = 1e30;
+    const double bnorm = std::max(1e-300, c.norm());
+    for (int restart = 0; restart < 20; ++restart) {
+        Eigen::VectorXd r; apply_M(d, r); r = c - r;
+        double beta = r.norm();
+        if (beta / bnorm < 1e-14) break;
+        Eigen::MatrixXd V(dim, m + 1), H = Eigen::MatrixXd::Zero(m + 1, m);
+        Eigen::VectorXd g = Eigen::VectorXd::Zero(m + 1); g[0] = beta;
+        std::vector<double> cs(m), sn(m);
+        V.col(0) = r / beta;
+        int k = 0;
+        for (; k < m; ++k) {
+            Eigen::VectorXd w; apply_M(V.col(k), w);
+            for (int i = 0; i <= k; ++i) { H(i, k) = V.col(i).dot(w); w -= H(i, k) * V.col(i); }
+            H(k + 1, k) = w.norm();
+            if (H(k + 1, k) > 1e-300) V.col(k + 1) = w / H(k + 1, k);
+            for (int i = 0; i < k; ++i) { const double t = cs[i] * H(i, k) + sn[i] * H(i + 1, k); H(i + 1, k) = -sn[i] * H(i, k) + cs[i] * H(i + 1, k); H(i, k) = t; }
+            const double den = std::hypot(H(k, k), H(k + 1, k));
+            cs[k] = H(k, k) / den; sn[k] = H(k + 1, k) / den;
+            H(k, k) = den; H(k + 1, k) = 0.0;
+            g[k + 1] = -sn[k] * g[k]; g[k] = cs[k] * g[k];
+            if (std::fabs(g[k + 1]) / bnorm < 1e-13 || H(k + 1, k) <= 1e-300) { ++k; break; }
         }
+        const Eigen::VectorXd y = H.topLeftCorner(k, k).triangularView<Eigen::Upper>().solve(g.head(k));
+        d += V.leftCols(k) * y;
+        if (std::fabs(g[k]) / bnorm < 1e-13) break;
+    }
 
-        double n1 = 0, d1 = 0, n2 = 0, d2 = 0;
-        for (int j = 0; j < g_n; ++j) {
-            double diff1 = barD1_new[j] - barD1[j];
-            double diff2 = barD2_new[j] - barD2[j];
-            d1 += diff1 * diff1;  n1 += barD1_new[j] * barD1_new[j];
-            d2 += diff2 * diff2;  n2 += barD2_new[j] * barD2_new[j];
+    // residual in the fixed-point sense, as before: |F(d) - d| / max(1, |F(d)|), per player
+    Eigen::VectorXd Fd; std::array<double, N_MAX> barX; apply_F(d, Fd, &barX);
+    {
+        const double e1 = (Fd.head(n) - d.head(n)).norm() / std::max(1.0, Fd.head(n).norm());
+        const double e2 = (Fd.tail(n) - d.tail(n)).norm() / std::max(1.0, Fd.tail(n).norm());
+        last_err = std::max(e1, e2);
+    }
+    if (!(last_err < std::max(tol, 1e-9))) {
+        // fallback: the relaxed iteration from the GMRES iterate
+        for (int it = 1; it <= max_iters; ++it) {
+            apply_F(d, Fd, &barX);
+            const double e1 = (Fd.head(n) - d.head(n)).norm() / std::max(1.0, Fd.head(n).norm());
+            const double e2 = (Fd.tail(n) - d.tail(n)).norm() / std::max(1.0, Fd.tail(n).norm());
+            last_err = std::max(e1, e2);
+            if (!std::isfinite(last_err)) break;
+            d += relax * (Fd - d);
+            if (last_err < tol) break;
         }
-        last_err = std::max(std::sqrt(d1) / std::max(1.0, std::sqrt(n1)),
-                            std::sqrt(d2) / std::max(1.0, std::sqrt(n2)));
-
-        if (!std::isfinite(last_err))
-            break;
-
-        for (int j = 0; j < g_n; ++j) {
-            barD1[j] += relax * (barD1_new[j] - barD1[j]);
-            barD2[j] += relax * (barD2_new[j] - barD2[j]);
-        }
-        if (last_err < tol) break;
+        apply_F(d, Fd, &barX);
     }
 
     BarSolution sol;
     sol.barX[0] = g_x0;
-    for (int j = 0; j < g_n - 1; ++j)
-        sol.barX[j + 1] = sol.barX[j] + g_dt * (barD1[j] + barD2[j]);
-    sol.barD1 = barD1;
-    sol.barD2 = barD2;
+    for (int j = 0; j < n - 1; ++j) sol.barX[j + 1] = sol.barX[j] + g_dt * (d[j] + d[n + j]);
+    for (int j = 0; j < n; ++j) { sol.barD1[j] = d[j]; sol.barD2[j] = d[n + j]; }
     sol.bar_residual = last_err;
     return sol;
 }
