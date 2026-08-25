@@ -426,45 +426,109 @@ static bool predictable_control() { static const bool v = [] { const char* e = s
 static void enforce_predictable(Kernel2D& D1, Kernel2D& D2) { if (!predictable_control()) return; for (int t = 0; t < g_n; ++t) { D1[t][t].setZero(); D2[t][t].setZero(); } }
 struct CERowFilter {
     int n = 0, rank = 0, obs = 0; double g = 0.0;
-    Eigen::MatrixXd V; Eigen::VectorXd h, v, coeff, Xvec, Dvec;
+    Eigen::MatrixXd V; Eigen::VectorXd h, v, coeff, Xvec, Dvec, Pd, cH, cD, cX;
     void reset(int n_, int obs_, double g_) {
         n = n_; obs = obs_; g = g_; rank = 0;
         const int dim = 3 * n;
-        if (V.rows() != dim || V.cols() != n) { V.resize(dim, n); h.resize(dim); v.resize(dim); Xvec.resize(dim); Dvec.resize(dim); coeff.resize(n); }
+        if (V.rows() != dim || V.cols() != n) { V.resize(dim, n); h.resize(dim); v.resize(dim); Xvec.resize(dim); Dvec.resize(dim); Pd.resize(dim); coeff.resize(n); cH.resize(n); cD.resize(n); cX.resize(n); }
         V.setZero(); h.setZero(); v.setZero(); Xvec.setZero(); Dvec.setZero();
     }
     void row(int j, const Kernel2D& X, const Kernel2D& D, Kernel2D& Xtilde, Kernel2D& calD) {
         if (j == 0) { Xtilde[0][0] = X[0][0]; calD[0][0].setZero(); return; }
         const int active = 3 * (j + 1);
-        auto Vact = V.topRows(active).leftCols(rank);
-        if (predictable_control()) {
-            // Predictable control: the control over step j is decided before the step-j observation,
-            // so it is the projection of D[j] onto the observations up to j-1 (basis V before h_j is
-            // added).  Row j of D at u = j is then inert (E[dW_j | F_{j-1}] = 0).
-            for (int z = 0; z <= j; ++z) Dvec.segment<3>(3 * z) = D[j][z];
-            if (rank > 0) { auto c = coeff.head(rank); c.noalias() = Vact.transpose() * Dvec.head(active); Dvec.head(active).noalias() = Vact * c; } else Dvec.head(active).setZero();
-            for (int z = 0; z <= j; ++z) calD[j][z] = Dvec.segment<3>(3 * z);
-            calD[j][0](obs) = 0.0;
+        auto Vact = V.topRows(active).leftCols(rank);          // basis of the observations up to j-1
+        // Two passes over the basis instead of six: (1) V^T [X_j, D_j] in one product; V^T h_j
+        // follows from it since h_j = g dt X_j + e_(j,obs); (2) V [c_h, c_D, c_X] in one product.
+        for (int z = 0; z <= j; ++z) { Xvec.segment<3>(3 * z) = X[j][z]; Dvec.segment<3>(3 * z) = D[j][z]; }
+        h.head(active) = g * g_dt * Xvec.head(active); h(3 * j + obs) += 1.0;
+        if (rank > 0) {
+            // pass 1: per basis column, two dots (X_j and D_j); c_h from c_X and the (j,obs) row
+            if (static_cast<int>(cH.size()) < n) { cH.resize(n); cD.resize(n); cX.resize(n); }
+            const double* xp = Xvec.data(); const double* dp = Dvec.data(); const int row_obs = 3 * j + obs;
+            using FlatC = Eigen::Map<const Eigen::VectorXd>;
+            const FlatC xm(xp, active), dm(dp, active);
+            for (int k = 0; k < rank; ++k) {            // vectorized reductions (a plain loop does not vectorize without -ffast-math)
+                const double* vk = V.col(k).data(); const FlatC vm(vk, active);
+                const double sx = vm.dot(xm), sd = vm.dot(dm);
+                cX[k] = sx; cD[k] = sd; cH[k] = g * g_dt * sx + vk[row_obs];
+            }
+            // pass 2: per basis column, three axpy's into v (= h - V c_h), the control (V c_D) and Xtilde (X - V c_X)
+            v.head(active) = h.head(active); Pd.head(active).setZero();
+            double* vp = v.data(); double* pd = Pd.data(); double* xw = Xvec.data();
+            using Flat = Eigen::Map<Eigen::VectorXd>;
+            Flat vv(vp, active), pv(pd, active), xv(xw, active);
+            for (int k = 0; k < rank; ++k) {
+                const double* vk = V.col(k).data(); const FlatC vm(vk, active); const double a = cH[k], b = cD[k], c = cX[k];
+                vv -= a * vm; pv += b * vm; xv -= c * vm;
+            }
+            if (predictable_control()) { for (int z = 0; z <= j; ++z) calD[j][z] = Pd.segment<3>(3 * z); }
+        } else {
+            v.head(active) = h.head(active);
+            if (predictable_control()) for (int z = 0; z <= j; ++z) calD[j][z].setZero();
         }
-        h.head(active).setZero();
-        for (int z = 0; z <= j; ++z) h.segment<3>(3 * z) = g * g_dt * X[j][z];
-        h(3 * j + obs) += 1.0;
-        v.head(active) = h.head(active);
-        if (rank > 0) { auto c = coeff.head(rank); c.noalias() = Vact.transpose() * h.head(active); v.head(active).noalias() -= Vact * c; }
+        // new basis column from the step-j observation
         const double vnorm = v.head(active).norm();
-        if (vnorm > 1e-15) { V.col(rank).head(active) = v.head(active) / vnorm; ++rank; }
-        auto Vr = V.topRows(active).leftCols(rank); auto c = coeff.head(rank);
-        for (int z = 0; z <= j; ++z) Xvec.segment<3>(3 * z) = X[j][z];
-        if (rank > 0) { c.noalias() = Vr.transpose() * Xvec.head(active); Xvec.head(active).noalias() -= Vr * c; }
-        for (int z = 0; z <= j; ++z) Xtilde[j][z] = Xvec.segment<3>(3 * z);
-        if (!predictable_control()) {
-            for (int z = 0; z <= j; ++z) Dvec.segment<3>(3 * z) = D[j][z];
-            if (rank > 0) { c.noalias() = Vr.transpose() * Dvec.head(active); Dvec.head(active).noalias() = Vr * c; } else Dvec.head(active).setZero();
-            for (int z = 0; z <= j; ++z) calD[j][z] = Dvec.segment<3>(3 * z);
-            calD[j][0](obs) = 0.0;
+        bool added = false;
+        if (vnorm > 1e-15) { V.col(rank).head(active) = v.head(active) / vnorm; ++rank; added = true; }
+        if (added) {   // rank-1 corrections with the new column
+            auto vn = V.col(rank - 1).head(active);
+            Xvec.head(active) -= vn * vn.dot(Xvec.head(active));
+            if (!predictable_control()) {
+                // adapted (former) game: control projected with the step-j observation included
+                for (int z = 0; z <= j; ++z) Dvec.segment<3>(3 * z) = D[j][z];
+                Eigen::VectorXd cD = V.topRows(active).leftCols(rank).transpose() * Dvec.head(active);
+                Dvec.head(active) = V.topRows(active).leftCols(rank) * cD;
+                for (int z = 0; z <= j; ++z) calD[j][z] = Dvec.segment<3>(3 * z);
+            }
+        } else if (!predictable_control()) {
+            for (int z = 0; z <= j; ++z) calD[j][z] = (rank > 0) ? Vect3(Dvec, z) : Vec3::Zero();
         }
+        for (int z = 0; z <= j; ++z) Xtilde[j][z] = Xvec.segment<3>(3 * z);
+        calD[j][0](obs) = 0.0;
+    }
+    static Vec3 Vect3(const Eigen::VectorXd& w, int z) { return w.segment<3>(3 * z); }
+
+    // Workshared row for j >= 1 (predictable control): called by all `S` threads of this player's
+    // subgroup (sub-thread index `t`) inside one parallel region.  Pass 1 splits the basis columns,
+    // pass 2 splits the rows (Vec3 units); partial sums go through `part`.  Six team-wide barriers
+    // per row; both players' subgroups must call this with the same j so the barriers match.
+    std::vector<double> part, part2;
+    void row_ws(int j, const Kernel2D& X, const Kernel2D& D, Kernel2D& Xtilde, Kernel2D& calD, int t, int S) {
+        const int active = 3 * (j + 1); const int r0 = rank;            // basis of observations up to j-1 (rank is
+        using FlatC = Eigen::Map<const Eigen::VectorXd>; using Flat = Eigen::Map<Eigen::VectorXd>;   // updated after the last barrier of the row)
+        // private copies of the row vectors: no barrier needed before the dot pass
+        static thread_local Eigen::VectorXd xl, dl, hl;
+        if (xl.size() < active) { xl.resize(3 * n); dl.resize(3 * n); hl.resize(3 * n); }
+        for (int z = 0; z <= j; ++z) { xl.segment<3>(3 * z) = X[j][z]; dl.segment<3>(3 * z) = D[j][z]; }
+        hl.head(active) = g * g_dt * xl.head(active); hl(3 * j + obs) += 1.0;
+        if (t == 0 && static_cast<int>(part.size()) < S) { part.resize(S); part2.resize(S); }
+        {   // pass 1: columns [k0, k1)
+            const int k0 = static_cast<int>(static_cast<long>(r0) * t / S), k1 = static_cast<int>(static_cast<long>(r0) * (t + 1) / S);
+            const FlatC xm(xl.data(), active), dm(dl.data(), active); const int row_obs = 3 * j + obs;
+            for (int k = k0; k < k1; ++k) { const double* vk = V.col(k).data(); const FlatC vm(vk, active); const double sx = vm.dot(xm), sd = vm.dot(dm); cX[k] = sx; cD[k] = sd; cH[k] = g * g_dt * sx + vk[row_obs]; }
+        }
+        #pragma omp barrier
+        const int z0 = static_cast<int>(static_cast<long>(j + 1) * t / S), z1 = static_cast<int>(static_cast<long>(j + 1) * (t + 1) / S);
+        const int i0 = 3 * z0, L = 3 * (z1 - z0);
+        {   // pass 2: rows [i0, i0+L)
+            Flat vv(v.data() + i0, L), pv(Pd.data() + i0, L), xv(Xvec.data() + i0, L);
+            vv = FlatC(hl.data() + i0, L); pv.setZero(); xv = FlatC(xl.data() + i0, L);
+            for (int k = 0; k < r0; ++k) { const FlatC vm(V.col(k).data() + i0, L); vv -= cH[k] * vm; pv += cD[k] * vm; xv -= cX[k] * vm; }
+            part[t] = vv.squaredNorm();
+            for (int z = z0; z < z1; ++z) calD[j][z] = Pd.segment<3>(3 * z);
+        }
+        #pragma omp barrier
+        double vn2 = 0.0; for (int q = 0; q < S; ++q) vn2 += part[q];
+        const double vnorm = std::sqrt(vn2); const bool added = vnorm > 1e-15;
+        if (added) { Flat vc(V.col(r0).data() + i0, L); vc = FlatC(v.data() + i0, L) / vnorm; part2[t] = vc.dot(FlatC(Xvec.data() + i0, L)); }
+        else part2[t] = 0.0;
+        #pragma omp barrier
+        if (added) { double dx = 0.0; for (int q = 0; q < S; ++q) dx += part2[q]; Flat xv(Xvec.data() + i0, L); xv -= dx * FlatC(V.col(r0).data() + i0, L); }
+        for (int z = z0; z < z1; ++z) Xtilde[j][z] = Xvec.segment<3>(3 * z);
+        if (t == 0) { calD[j][0](obs) = 0.0; if (added) ++rank; }   // visible to all after the next row's barrier
     }
 };
+
 static bool ce_filter_enabled() { static const bool v = [] { const char* e = std::getenv("LQG_FILTER"); return !(e && std::strcmp(e, "pi") == 0); }(); return v; }
 
 // Forward environment using discrete CE projection.
@@ -560,6 +624,30 @@ void forward_environment(
         static thread_local CERowFilter F1, F2;
         F1.reset(g_n, obs_idx_1, obs_gain1); F2.reset(g_n, obs_idx_2, obs_gain2);
         CERowFilter* pF1 = &F1; CERowFilter* pF2 = &F2;
+        static const bool ws_ce = [] { const char* e = std::getenv("LQG_FORWARD_WS"); return !(e && std::atoi(e) == 0); }();
+        const int team = std::min(8, omp_get_max_threads());
+        if (ws_ce && predictable_control() && g_n >= 64 && !omp_in_parallel() && team >= 4) {
+            // Split-pass march: half the team per player, the basis passes shared within each half.
+            const int half = team / 2;
+            #pragma omp parallel num_threads(2 * half)
+            {
+                const int tid = omp_get_thread_num(); const int player = tid < half ? 0 : 1; const int st = tid - player * half;
+                for (int j = 0; j < g_n; ++j) {
+                    #pragma omp single
+                    {
+                        X[j][j] = sigE0;
+                        for (int s = 0; s < j; ++s) X[j][s] = X[j - 1][s] + g_dt * (calD1[j - 1][s] + calD2[j - 1][s]);
+                        if (j == 0) { pF1->row(0, X, D1, env.Xtilde1, calD1); pF2->row(0, X, D2, env.Xtilde2, calD2); }
+                    }   // implicit barrier
+                    if (j == 0) continue;
+                    if (player == 0) pF1->row_ws(j, X, D1, env.Xtilde1, calD1, st, half);
+                    else             pF2->row_ws(j, X, D2, env.Xtilde2, calD2, st, half);
+                }
+            }
+            env.obs_gain1 = obs_gain1; env.obs_gain2 = obs_gain2;
+            env.obs_idx1 = obs_idx_1; env.obs_idx2 = obs_idx_2;
+            return;
+        }
         #pragma omp parallel num_threads(2) if (g_n >= 64 && !omp_in_parallel())
         {
             const int tid = omp_get_thread_num(), nth = omp_get_num_threads();

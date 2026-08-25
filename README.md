@@ -335,7 +335,15 @@ F-materialization forms it from Xtilde (N=640: 173 -> 163 MB).  The figure
 driver's peak (about 300 MB at N=157) is its cache of every equilibrium, 7
 kernels per parameter point.
 
-Timings for the (3,3) benchmark solve, 8 threads: N=40 3 ms, N=160 45 ms,
+8. **Split-pass projection march** (predictable control): the exact-projection
+   row is two passes over the basis (per column two dots, then three axpy's);
+   with a team of >= 4 threads the players take half the team each and split
+   the column pass and the row pass, three barriers per row.  Bandwidth-bound
+   on the basis, so the gain shows above N ~ 200 (N=320 forward 193 -> 106 ms,
+   N=640 solve 3.3 -> 2.0 s); at N=160 the march is latency-bound (~10 us per
+   row).  `LQG_FORWARD_WS=0` selects the two-thread pair march.
+
+Timings for the (3,3) benchmark solve, 8 threads: N=40 3 ms, N=160 45-55 ms,
 N=320 0.4 s, N=640 1.9 s (N=160 was 1.4 s before the exact march, Hk-free
 adjoints, Anderson, vectorization and threading; N > 160 was not possible).
 The full figure pipeline at N=40 takes 1.0 s (was 8 s), N=157 about 30 s
