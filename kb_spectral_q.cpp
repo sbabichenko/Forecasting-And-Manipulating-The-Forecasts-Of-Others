@@ -174,22 +174,40 @@ struct Model {
     MatrixXd kmat(const std::vector<MatrixXd>& C) const { MatrixXd M(NC * N, q); for (int a = 0; a < N; ++a) for (int ch = 0; ch < NC; ++ch) M.row(ch * N + a) = C[a].row(ch); return M; }
     std::vector<MatrixXd> kvec(const MatrixXd& M) const { std::vector<MatrixXd> C(N, MatrixXd::Zero(NC, q)); for (int a = 0; a < N; ++a) for (int ch = 0; ch < NC; ++ch) C[a].row(ch) = M.row(ch * N + a); return C; }
 
-    struct Diag { MatrixXd beta, p, g, lam; std::vector<MatrixXd> K, G, a_lin; std::vector<std::vector<MatrixXd>> dP; std::vector<double> margin; };
+    struct Diag { MatrixXd beta, p, g, lam; std::vector<MatrixXd> K, G, a_lin; std::vector<std::vector<MatrixXd>> dP; std::vector<double> margin; std::vector<Eigen::PartialPivLU<MatrixXd>> Klu, Glu; Eigen::PartialPivLU<MatrixXd> Gflu; };
 
     // one joint best-response pass; cs[i] is kmat layout (NC N x q)
-    std::vector<MatrixXd> phi(const std::vector<MatrixXd>& cs, Diag* dg = nullptr) const {
+    // Richardson iteration on A X = B with a nearby factorization as preconditioner (A given as a dense matrix here)
+    static MatrixXd pre_solve(const MatrixXd& A, const MatrixXd& B, const Eigen::PartialPivLU<MatrixXd>& lu) {
+        MatrixXd X = lu.solve(B);
+        for (int it = 0; it < 6; ++it) {
+            const MatrixXd res = B - A * X;
+            if (res.cwiseAbs().maxCoeff() < 1e-14 * std::max(1.0, B.cwiseAbs().maxCoeff())) break;
+            X += lu.solve(res);
+        }
+        return X;
+    }
+    // pre: a Diag from a nearby point whose FOC factorizations precondition a matrix-free solve (used for Jacobian columns)
+    std::vector<MatrixXd> phi(const std::vector<MatrixXd>& cs, Diag* dg = nullptr, const Diag* pre = nullptr) const {
         MatrixXd ctot = MatrixXd::Zero(NC * N, q);
         for (const auto& c : cs) ctot += c;
         const std::vector<MatrixXd> Ctot = kvec(ctot);
         const MatrixXd Htf = obs_Ht(flow_kw(Ctot), q);
         const MatrixXd Hf = Htmass(Htf);
         const MatrixXd vmat = [&] { MatrixXd V = MatrixXd::Zero(NC * N, q); for (int a = 0; a < N; ++a) for (int ch = 0; ch < NC; ++ch) V.row(ch * N + a) = v.row(ch); return V; }();
-        const MatrixXd beta = (Hf * Htf).partialPivLu().solve(Hf * vmat);     // (q N) x q: obs (o, age) -> price comp
+        MatrixXd beta;                                                          // (q N) x q: obs (o, age) -> price comp
+        {
+            const MatrixXd Gf = Hf * Htf;
+            if (pre && !dg) beta = pre_solve(Gf, Hf * vmat, pre->Gflu);
+            else { Eigen::PartialPivLU<MatrixXd> lu(Gf); beta = lu.solve(Hf * vmat); if (dg) dg->Gflu = lu; }
+        }
         const MatrixXd p = Htf * beta;
         const MatrixXd gmat = vmat - p;
         const std::vector<MatrixXd> g = kvec(gmat);
         MatrixXd lam(q, q);                                                    // instantaneous impact: lam(nu, k) = sum_o beta(o, age 0; nu) SZhi(o, k)
         for (int nu = 0; nu < q; ++nu) for (int k = 0; k < q; ++k) { double s = 0; for (int o = 0; o < q; ++o) s += beta(o * N + 0, nu) * SZhi(o, k); lam(nu, k) = s; }
+        if (dg) { dg->beta = beta; dg->p = p; dg->g = gmat; dg->lam = lam; dg->K.resize(NT); dg->G.resize(NT); dg->a_lin.resize(NT); dg->dP.resize(NT); dg->margin.resize(NT); dg->Klu.resize(NT); dg->Glu.resize(NT); }
+        const bool use_pre = pre && static_cast<int>(pre->Klu.size()) == NT && !dg;
         // each trader's observation operator (residual flow + own signal) and policy rows y_j = G_j^{-1} H_j c^j
         std::vector<MatrixXd> Htj(NT), Hj(NT), yj(NT);
         for (int j = 0; j < NT; ++j) {
@@ -197,10 +215,11 @@ struct Model {
             const MatrixXd Hts = obs_Ht(signal_kw(g, j), (2 + j) * q);
             Htj[j].resize(NC * N, 2 * q * N); Htj[j] << Htfo, Hts;
             Hj[j] = Htmass(Htj[j]);
-            yj[j] = (Hj[j] * Htj[j]).partialPivLu().solve(Hj[j] * cs[j]);     // (2 q N) x q
+            const MatrixXd Gj = Hj[j] * Htj[j];
+            if (pre && !dg) yj[j] = pre_solve(Gj, Hj[j] * cs[j], pre->Glu[j]);
+            else { Eigen::PartialPivLU<MatrixXd> lu(Gj); yj[j] = lu.solve(Hj[j] * cs[j]); if (dg) dg->Glu[j] = lu; }
         }
         std::vector<MatrixXd> out(NT);
-        if (dg) { dg->beta = beta; dg->p = p; dg->g = gmat; dg->lam = lam; dg->K.resize(NT); dg->G.resize(NT); dg->a_lin.resize(NT); dg->dP.resize(NT); dg->margin.resize(NT); }
         const MatrixXd I = MatrixXd::Identity(N, N);
         for (int i = 0; i < NT; ++i) {
             // ---- cascade: dP[nu][k] (vector over ages), X[u][k]: unknown blocks per spike direction k
@@ -249,18 +268,43 @@ struct Model {
             // FOC in observation coordinates: unknown Y (2 q N x q), flattened (o-block row, comp): index (r, nu) -> r*? use blocks
             const int R = 2 * q * N;                                           // observation rows (o-blocks x N)
             const MatrixXd& Ht = Htj[i];
-            MatrixXd Kmat = MatrixXd::Zero(R * q, R * q), Gm = MatrixXd::Zero(R * q, R * q);
             VectorXd rhs = VectorXd::Zero(R * q);
-            // K[(nu, r),(k, r')] = sum_ch Ht(ch-block, r)^T Mq_{nu k} Ht(ch-block, r')
-            for (int ch = 0; ch < NC; ++ch) {
-                const MatrixXd Hc = Ht.block(ch * N, 0, N, R);                 // N x R
-                for (int nu = 0; nu < q; ++nu) {
-                    for (int k = 0; k < q; ++k) Kmat.block(nu * R, k * R, R, R).noalias() += Hc.transpose() * Mq[nu][k] * Hc;
-                    Gm.block(nu * R, nu * R, R, R).noalias() += Hc.transpose() * Mass * Hc;
-                    rhs.segment(nu * R, R).noalias() += Hc.transpose() * (Mass * a_lin.block(ch * N, nu, N, 1));
+            for (int ch = 0; ch < NC; ++ch)
+                for (int nu = 0; nu < q; ++nu)
+                    rhs.segment(nu * R, R).noalias() += Ht.block(ch * N, 0, N, R).transpose() * (Mass * a_lin.block(ch * N, nu, N, 1));
+            VectorXd yv;
+            MatrixXd Kmat, Gm;
+            if (use_pre) {
+                // matrix-free K apply: y -> sum_ch Hc^T Mq (Hc y), preconditioned Richardson with the base LU
+                auto applyK = [&](const VectorXd& y) {
+                    VectorXd out = VectorXd::Zero(R * q);
+                    for (int ch = 0; ch < NC; ++ch) {
+                        const auto Hc = Ht.block(ch * N, 0, N, R);
+                        MatrixXd C(N, q); for (int k = 0; k < q; ++k) C.col(k).noalias() = Hc * y.segment(k * R, R);
+                        for (int nu = 0; nu < q; ++nu) { VectorXd w = VectorXd::Zero(N); for (int k = 0; k < q; ++k) w.noalias() += Mq[nu][k] * C.col(k); out.segment(nu * R, R).noalias() += Hc.transpose() * w; }
+                    }
+                    return out;
+                };
+                yv = pre->Klu[i].solve(rhs);
+                for (int it = 0; it < 6; ++it) {
+                    const VectorXd res = rhs - applyK(yv);
+                    if (res.cwiseAbs().maxCoeff() < 1e-14 * std::max(1.0, rhs.cwiseAbs().maxCoeff())) break;
+                    yv += pre->Klu[i].solve(res);
                 }
+            } else {
+                Kmat = MatrixXd::Zero(R * q, R * q); Gm = MatrixXd::Zero(R * q, R * q);
+                // K[(nu, r),(k, r')] = sum_ch Ht(ch-block, r)^T Mq_{nu k} Ht(ch-block, r')
+                for (int ch = 0; ch < NC; ++ch) {
+                    const MatrixXd Hc = Ht.block(ch * N, 0, N, R);                 // N x R
+                    for (int nu = 0; nu < q; ++nu) {
+                        for (int k = 0; k < q; ++k) Kmat.block(nu * R, k * R, R, R).noalias() += Hc.transpose() * Mq[nu][k] * Hc;
+                        if (dg) Gm.block(nu * R, nu * R, R, R).noalias() += Hc.transpose() * Mass * Hc;
+                    }
+                }
+                Eigen::PartialPivLU<MatrixXd> lu(Kmat);
+                yv = lu.solve(rhs);
+                if (dg) dg->Klu[i] = lu;
             }
-            const VectorXd yv = Kmat.partialPivLu().solve(rhs);
             MatrixXd Y(R, q); for (int nu = 0; nu < q; ++nu) Y.col(nu) = yv.segment(nu * R, R);
             out[i] = Ht * Y;
             if (dg) {
@@ -279,7 +323,7 @@ struct Model {
 
     VectorXd pack(const std::vector<MatrixXd>& cs) const { VectorXd z(NT * NC * N * q); for (int i = 0; i < NT; ++i) for (int k = 0; k < q; ++k) z.segment((i * q + k) * NC * N, NC * N) = cs[i].col(k); return z; }
     std::vector<MatrixXd> unpack(const VectorXd& z) const { std::vector<MatrixXd> cs(NT, MatrixXd(NC * N, q)); for (int i = 0; i < NT; ++i) for (int k = 0; k < q; ++k) cs[i].col(k) = z.segment((i * q + k) * NC * N, NC * N); return cs; }
-    VectorXd residual(const VectorXd& z, Diag* dg = nullptr) const { return pack(phi(unpack(z), dg)) - z; }
+    VectorXd residual(const VectorXd& z, Diag* dg = nullptr, const Diag* pre = nullptr) const { return pack(phi(unpack(z), dg, pre)) - z; }
 
     // profit flow per trader, by channel block (V, Z, trader noises) and by stock (demand component)
     MatrixXd profit(const std::vector<MatrixXd>& cs, const Diag& dg, int i) const {
@@ -312,8 +356,9 @@ struct Solver {
         for (; step < maxsteps && rn > tol; ++step) {
             if (!have_J || (last_ratio > refresh_ratio && o.jacobians < max_jacobians)) {
                 MatrixXd Jm(n, n); const double eps_fd = 1e-7 * std::max(1.0, z.cwiseAbs().maxCoeff());
+                Model::Diag base; const VectorXd rb = M.residual(z, &base); ++evals;   // base factorizations precondition the columns
 #pragma omp parallel for schedule(dynamic, 4)
-                for (int i = 0; i < n; ++i) { VectorXd zp = z; zp[i] += eps_fd; Jm.col(i) = (M.residual(zp) - r) / eps_fd; }
+                for (int i = 0; i < n; ++i) { VectorXd zp = z; zp[i] += eps_fd; Jm.col(i) = (M.residual(zp, nullptr, &base) - rb) / eps_fd; }
                 evals += n; Jinv = Jm.partialPivLu().inverse(); have_J = true; ++o.jacobians; last_ratio = 0.0; fresh = true;
             } else fresh = false;
             const VectorXd dz = -(Jinv * r); double lam = 1.0; bool acc = false;

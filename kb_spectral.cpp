@@ -173,6 +173,7 @@ struct Model {
     MatrixXd volterra_adj(const VectorXd& k) const { MatrixXd A(N, N); for (int j = 0; j < N; ++j) A.row(j) = k.transpose() * ADJ[j]; return A; }
 
     struct Diag {
+        std::vector<Eigen::PartialPivLU<MatrixXd>> Klu, Glu; Eigen::PartialPivLU<MatrixXd> Gflu;
         VectorXd beta; MatrixXd p, g; double lam;
         std::vector<VectorXd> dP;
         std::vector<MatrixXd> A, K, G;              // per trader: impact operator (N square, per channel), FOC form and L2 metric (2N square)
@@ -180,18 +181,24 @@ struct Model {
     };
 
     // one joint best-response pass
-    std::vector<MatrixXd> phi(const std::vector<MatrixXd>& cs, Diag* dg = nullptr) const {
+    static VectorXd pre_solve(const MatrixXd& A, const VectorXd& b, const Eigen::PartialPivLU<MatrixXd>& lu) {
+        VectorXd x = lu.solve(b);
+        for (int it = 0; it < 6; ++it) { const VectorXd res = b - A * x; if (res.cwiseAbs().maxCoeff() < 1e-14 * std::max(1.0, b.cwiseAbs().maxCoeff())) break; x += lu.solve(res); }
+        return x;
+    }
+    std::vector<MatrixXd> phi(const std::vector<MatrixXd>& cs, Diag* dg = nullptr, const Diag* pre = nullptr) const {
         MatrixXd c_tot = MatrixXd::Zero(N, NC);
         for (const auto& c : cs) c_tot += c;
         MatrixXd Hf, Htf; obs_ops(c_tot, 1.0 / sZ, 1, Hf, Htf);
-        const Eigen::PartialPivLU<MatrixXd> Gf(Hf * Htf);
-        const VectorXd beta = Gf.solve(Hf * flat(v));
+        const bool use_pre = pre && static_cast<int>(pre->Klu.size()) == NT && !dg;
+        VectorXd beta;
+        { const MatrixXd G = Hf * Htf; if (use_pre) beta = pre_solve(G, Hf * flat(v), pre->Gflu); else { Eigen::PartialPivLU<MatrixXd> lu(G); beta = lu.solve(Hf * flat(v)); if (dg) dg->Gflu = lu; } }
         const MatrixXd p = unflat(Htf * beta);
         const MatrixXd g = v - p;
         const double lam = beta[0] / sZ;
         const MatrixXd Vb = volterra(beta);
         std::vector<MatrixXd> out(NT);
-        if (dg) { dg->beta = beta; dg->p = p; dg->g = g; dg->lam = lam; dg->dP.resize(NT); dg->A.resize(NT); dg->K.resize(NT); dg->G.resize(NT); dg->a_lin.resize(NT); }
+        if (dg) { dg->beta = beta; dg->p = p; dg->g = g; dg->lam = lam; dg->dP.resize(NT); dg->A.resize(NT); dg->K.resize(NT); dg->G.resize(NT); dg->a_lin.resize(NT); dg->Klu.resize(NT); dg->Glu.resize(NT); }
         // opponents' policy rows in their own observation coordinates (flow excluding own trades + signal)
         std::vector<VectorXd> yf(NT), ys(NT);
         std::vector<MatrixXd> Hs(NT), Hts(NT), Hfo(NT), Htfo(NT);
@@ -200,7 +207,8 @@ struct Model {
             obs_ops(c_tot - cs[j], 1.0 / sZ, 1, Hfo[j], Htfo[j]);
             MatrixXd Hj(2 * N, NC * N); Hj << Hfo[j], Hs[j];
             MatrixXd Htj(NC * N, 2 * N); Htj << Htfo[j], Hts[j];
-            const VectorXd y = (Hj * Htj).partialPivLu().solve(Hj * flat(cs[j]));
+            VectorXd y;
+            { const MatrixXd G = Hj * Htj; if (use_pre) y = pre_solve(G, Hj * flat(cs[j]), pre->Glu[j]); else { Eigen::PartialPivLU<MatrixXd> lu(G); y = lu.solve(Hj * flat(cs[j])); if (dg) dg->Glu[j] = lu; } }
             yf[j] = y.head(N); ys[j] = y.tail(N);
         }
         const MatrixXd I = MatrixXd::Identity(N, N);
@@ -228,11 +236,18 @@ struct Model {
             for (int ch = 0; ch < NC; ++ch) {
                 const auto Hc = Ht.block(ch * N, 0, N, 2 * N);
                 a_lin.segment(ch * N, N) = (v.col(ch) - p.col(ch)) + A1 * cs[i].col(ch);
-                Kmat.noalias() += Hc.transpose() * Q1 * Hc;
+                if (!use_pre) Kmat.noalias() += Hc.transpose() * Q1 * Hc;
                 if (dg) Gm.noalias() += Hc.transpose() * Mass * Hc;
                 rhs.noalias() += Hc.transpose() * (Mass * a_lin.segment(ch * N, N));
             }
-            const VectorXd y = Kmat.partialPivLu().solve(rhs);
+            VectorXd y;
+            if (use_pre) {
+                auto applyK = [&](const VectorXd& yy) { VectorXd out = VectorXd::Zero(2 * N); for (int ch = 0; ch < NC; ++ch) { const auto Hc = Ht.block(ch * N, 0, N, 2 * N); out.noalias() += Hc.transpose() * (Q1 * (Hc * yy)); } return out; };
+                y = pre->Klu[i].solve(rhs);
+                for (int it = 0; it < 6; ++it) { const VectorXd res = rhs - applyK(y); if (res.cwiseAbs().maxCoeff() < 1e-14 * std::max(1.0, rhs.cwiseAbs().maxCoeff())) break; y += pre->Klu[i].solve(res); }
+            } else {
+                Eigen::PartialPivLU<MatrixXd> lu(Kmat); y = lu.solve(rhs); if (dg) dg->Klu[i] = lu;
+            }
             out[i] = unflat(Ht * y);
             if (dg) { dg->dP[i] = dP; dg->A[i] = A1; dg->K[i] = Kmat; dg->G[i] = Gm; dg->a_lin[i] = a_lin; }
         }
@@ -241,7 +256,7 @@ struct Model {
 
     VectorXd pack(const std::vector<MatrixXd>& cs) const { VectorXd z(NT * NC * N); for (int i = 0; i < NT; ++i) z.segment(i * NC * N, NC * N) = flat(cs[i]); return z; }
     std::vector<MatrixXd> unpack(const VectorXd& z) const { std::vector<MatrixXd> cs(NT); for (int i = 0; i < NT; ++i) cs[i] = unflat(z.segment(i * NC * N, NC * N)); return cs; }
-    VectorXd residual(const VectorXd& z, Diag* dg = nullptr) const { return pack(phi(unpack(z), dg)) - z; }
+    VectorXd residual(const VectorXd& z, Diag* dg = nullptr, const Diag* pre = nullptr) const { return pack(phi(unpack(z), dg, pre)) - z; }
 
     // per-trader profit flow and its channel decomposition: <c, a_lin> - <c, A c> - eps <c, c>
     std::vector<VectorXd> profit_by_channel(const std::vector<MatrixXd>& cs, const Diag& dg) const {
@@ -324,8 +339,9 @@ struct Solver {
             if (!have_J || last_ratio > refresh_ratio) {
                 MatrixXd Jm(n, n);
                 const double eps_fd = 1e-7 * std::max(1.0, z.cwiseAbs().maxCoeff());
+                Model::Diag base; const VectorXd rb = M.residual(z, &base); ++evals;
 #pragma omp parallel for schedule(dynamic, 4)
-                for (int i = 0; i < n; ++i) { VectorXd zp = z; zp[i] += eps_fd; Jm.col(i) = (M.residual(zp) - r) / eps_fd; }
+                for (int i = 0; i < n; ++i) { VectorXd zp = z; zp[i] += eps_fd; Jm.col(i) = (M.residual(zp, nullptr, &base) - rb) / eps_fd; }
                 evals += n;
                 Jinv = Jm.partialPivLu().inverse(); have_J = true; ++o.jacobians; last_ratio = 0.0;
             }
