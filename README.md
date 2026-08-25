@@ -319,9 +319,14 @@ The full figure pipeline at N=40 takes 1.0 s (was 8 s), N=157 about 30 s
 (was 6 min).
 
 After the kernel equilibrium converges, the mean-field trajectory
-(`solve_bar_equilibrium`) is obtained by solving the affine system for the
-mean controls with matrix-free GMRES (one pair of backward bar adjoints per
-application; residual ~1e-16).  The relaxed iteration used before is only
+(`solve_bar_equilibrium`) is obtained by solving the affine 2N x 2N system for
+the mean controls directly: the matrix is built by 2N applications of the map
+(one pair of backward bar adjoints each) and factored (bar residual ~1e-14);
+matrix-free GMRES is used only above 2N = 1600.  Restarted GMRES stagnated in
+the cheap-effort regime and its relaxed fallback then diverged, producing
+mean-field costs of 1e303 in cases whose kernel equilibrium had converged --
+the stress test now requires the whole pipeline (kernels, mean-field solve,
+costs) to be finite, and reports 0 mean-field failures over the grid.  The relaxed iteration used before is only
 stable when its spectral radius is below one, which fails at some N (the
 figure-9 call with relaxation 0.35 diverged to 1e124 at N=79); with
 bit-exactly symmetric Picard kernels the symmetric benchmark never left
