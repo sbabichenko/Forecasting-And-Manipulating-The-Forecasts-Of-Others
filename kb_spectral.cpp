@@ -37,6 +37,7 @@
 #include <limits>
 #include <string>
 #include <vector>
+#include <malloc.h>
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -174,7 +175,7 @@ struct Model {
     struct Diag {
         VectorXd beta; MatrixXd p, g; double lam;
         std::vector<VectorXd> dP;
-        std::vector<MatrixXd> A, K, G;              // per trader: impact operator (NC N square), FOC form and L2 metric (2N square)
+        std::vector<MatrixXd> A, K, G;              // per trader: impact operator (N square, per channel), FOC form and L2 metric (2N square)
         std::vector<VectorXd> a_lin;
     };
 
@@ -219,18 +220,21 @@ struct Model {
             }
             const MatrixXd A1 = volterra(dP);
             const MatrixXd Q1 = galerkin_A(dP) + galerkin_At(dP) + 2.0 * eps * Mass;
-            MatrixXd A = MatrixXd::Zero(NC * N, NC * N), Mq = MatrixXd::Zero(NC * N, NC * N), MassB = MatrixXd::Zero(NC * N, NC * N);
-            for (int ch = 0; ch < NC; ++ch) {
-                A.block(ch * N, ch * N, N, N) = A1;
-                Mq.block(ch * N, ch * N, N, N) = Q1;
-                MassB.block(ch * N, ch * N, N, N) = Mass;
-            }
             MatrixXd Ht(NC * N, 2 * N); Ht << Htfo[i], Hts[i];
-            const VectorXd a_lin = flat(v - p) + A * flat(cs[i]);
-            const MatrixXd Kmat = Ht.transpose() * Mq * Ht;                 // quadratic form in observation coordinates
-            const VectorXd y = Kmat.partialPivLu().solve(Ht.transpose() * (MassB * a_lin));
+            // a_lin = v - p + A c_own, channel by channel; FOC form and metric by channel blocks
+            VectorXd a_lin(NC * N);
+            MatrixXd Kmat = MatrixXd::Zero(2 * N, 2 * N), Gm = MatrixXd::Zero(2 * N, 2 * N);
+            VectorXd rhs = VectorXd::Zero(2 * N);
+            for (int ch = 0; ch < NC; ++ch) {
+                const auto Hc = Ht.block(ch * N, 0, N, 2 * N);
+                a_lin.segment(ch * N, N) = (v.col(ch) - p.col(ch)) + A1 * cs[i].col(ch);
+                Kmat.noalias() += Hc.transpose() * Q1 * Hc;
+                if (dg) Gm.noalias() += Hc.transpose() * Mass * Hc;
+                rhs.noalias() += Hc.transpose() * (Mass * a_lin.segment(ch * N, N));
+            }
+            const VectorXd y = Kmat.partialPivLu().solve(rhs);
             out[i] = unflat(Ht * y);
-            if (dg) { dg->dP[i] = dP; dg->A[i] = A; dg->K[i] = Kmat; dg->G[i] = Ht.transpose() * MassB * Ht; dg->a_lin[i] = a_lin; }
+            if (dg) { dg->dP[i] = dP; dg->A[i] = A1; dg->K[i] = Kmat; dg->G[i] = Gm; dg->a_lin[i] = a_lin; }
         }
         return out;
     }
@@ -243,20 +247,23 @@ struct Model {
     std::vector<VectorXd> profit_by_channel(const std::vector<MatrixXd>& cs, const Diag& dg) const {
         std::vector<VectorXd> res(NT);
         for (int i = 0; i < NT; ++i) {
-            const VectorXd c = flat(cs[i]);
-            const VectorXd integrand = c.array() * (dg.a_lin[i] - dg.A[i] * c - eps * c).array();
             VectorXd by(NC);
-            for (int ch = 0; ch < NC; ++ch) by[ch] = wq.dot(integrand.segment(ch * N, N));
+            for (int ch = 0; ch < NC; ++ch) {
+                const VectorXd c = cs[i].col(ch);
+                const VectorXd integrand = c.array() * (dg.a_lin[i].segment(ch * N, N) - dg.A[i] * c - eps * c).array();
+                by[ch] = wq.dot(integrand);
+            }
             res[i] = by;
         }
         return res;
     }
     // lag by which half of trader i's profit has accrued (cumulative integrand over age)
     double half_profit_lag(const std::vector<MatrixXd>& cs, const Diag& dg, int i) const {
-        const VectorXd c = flat(cs[i]);
-        const VectorXd integrand = c.array() * (dg.a_lin[i] - dg.A[i] * c - eps * c).array();
         VectorXd tot = VectorXd::Zero(N);
-        for (int ch = 0; ch < NC; ++ch) tot += integrand.segment(ch * N, N);
+        for (int ch = 0; ch < NC; ++ch) {
+            const VectorXd c = cs[i].col(ch);
+            tot += (c.array() * (dg.a_lin[i].segment(ch * N, N) - dg.A[i] * c - eps * c).array()).matrix();
+        }
         const double total = wq.dot(tot);
         // cumulative integral via fine quadrature on [0, a]
         VectorXd u, w;
@@ -287,6 +294,7 @@ struct Solver {
     MatrixXd Jinv; bool have_J = false;
     long evals = 0;
     bool verbose = false;
+    double refresh_ratio = 0.8;   // recompute the Jacobian when a step contracts by less than this
     explicit Solver(Model& m) : M(m) {}
 
     struct Out { VectorXd z; double resid; int steps, jacobians; bool ok; };
@@ -313,7 +321,7 @@ struct Solver {
         double last_ratio = 0.0;
         int step = 0;
         for (; step < maxsteps && rn > tol; ++step) {
-            if (!have_J || last_ratio > 0.5) {
+            if (!have_J || last_ratio > refresh_ratio) {
                 MatrixXd Jm(n, n);
                 const double eps_fd = 1e-7 * std::max(1.0, z.cwiseAbs().maxCoeff());
 #pragma omp parallel for schedule(dynamic, 4)
@@ -336,7 +344,7 @@ struct Solver {
                 lam *= 0.5;
             }
             if (verbose) std::fprintf(stderr, "  newton %d: |r| %.3e step %.3g%s\n", step, rn, lam, acc ? "" : " (rejected)");
-            if (!acc) { if (last_ratio <= 0.5) { last_ratio = 1.0; continue; } break; }
+            if (!acc) { if (last_ratio <= refresh_ratio) { last_ratio = 1.0; continue; } break; }
             if (!std::isfinite(rn) || rn > 1e6 * std::max(rn0, 1.0)) break;
         }
         o.z = z; o.resid = rn; o.steps = step; o.ok = rn <= tol;
@@ -366,19 +374,23 @@ void print_kernel(const char* name, const MatrixXd& k, bool last = false) {
 }  // namespace
 
 int main(int argc, char* argv[]) {
+    // Large Eigen temporaries would otherwise be mmap'ed and freed on every
+    // evaluation, which serializes the parallel Jacobian in the kernel.
+    mallopt(M_MMAP_THRESHOLD, 1 << 30); mallopt(M_TRIM_THRESHOLD, 1 << 30); mallopt(M_TOP_PAD, 256 << 20);
     if (argc < 6) {
         std::fprintf(stderr, "usage: %s N L eps rho gamma1[,gamma2,...] [--sigma-z s] [--eps-path e1,e2,...] [--tol 1e-10] [--uniform n] [--threads t] [--verbose]\n", argv[0]);
         return 1;
     }
     const int N = std::atoi(argv[1]); const double L = std::atof(argv[2]), eps = std::atof(argv[3]), rho = std::atof(argv[4]);
     std::vector<double> gam; { std::string s = argv[5]; size_t p = 0; while (p <= s.size()) { size_t q = s.find(',', p); if (q == std::string::npos) q = s.size(); gam.push_back(std::atof(s.substr(p, q - p).c_str())); p = q + 1; } }
-    double sZ = 1.0, tol = 1e-10; int uniform = 0; bool verbose = false;
+    double sZ = 1.0, tol = 1e-10, refresh_ratio = 0.8; int uniform = 0; bool verbose = false;
     std::vector<double> path;
     for (int i = 6; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--sigma-z") && i + 1 < argc) sZ = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "--tol") && i + 1 < argc) tol = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "--uniform") && i + 1 < argc) uniform = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--verbose")) verbose = true;
+        else if (!std::strcmp(argv[i], "--refresh-ratio") && i + 1 < argc) refresh_ratio = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "--eps-path") && i + 1 < argc) { std::string s = argv[++i]; size_t p = 0; while (p <= s.size()) { size_t q = s.find(',', p); if (q == std::string::npos) q = s.size(); path.push_back(std::atof(s.substr(p, q - p).c_str())); p = q + 1; } }
         else if (!std::strcmp(argv[i], "--threads") && i + 1 < argc) {
 #ifdef _OPENMP
@@ -392,11 +404,11 @@ int main(int argc, char* argv[]) {
     if (!std::getenv("OMP_NUM_THREADS")) omp_set_num_threads(std::min(8, omp_get_num_procs()));
 #endif
     // default continuation path: from a well-posed cost down to the target
-    if (path.empty()) { for (double e : {0.5, 0.3, 0.2, 0.1, 0.05, 0.02, 0.01, 0.005, 0.002, 0.001, 0.0}) if (e > eps) path.push_back(e); path.push_back(eps); }
+    if (path.empty()) { for (double e : {0.3, 0.05, 0.01, 0.002}) if (e > eps) path.push_back(e); path.push_back(eps); }
 
     const auto t0 = std::chrono::steady_clock::now();
     Model M(N, L, path.front(), rho, gam, sZ);
-    Solver S(M); S.verbose = verbose;
+    Solver S(M); S.verbose = verbose; S.refresh_ratio = refresh_ratio;
     VectorXd z = VectorXd::Zero(M.NT * M.NC * N);
     Solver::Out o;
     VectorXd zprev; double eprev = 0; bool have_prev = false;
