@@ -121,7 +121,7 @@ struct Forward {
     VectorXd e0;
     // tensors: HS[j] (m x N), TY[j] (m x N); HW, TW (N x m); HX, TX ((N m) x N)
     std::vector<MatrixXd> HS, TY;
-    MatrixXd HW, TW, HX, TX, cumint;
+    MatrixXd HW, TW, HX, TX, cumint, AH, AT;
     VectorXd wfull;
 
     Forward(int N_, double L_) : N(N_), m(N_ + 8), L(L_), K(N_, 0.0, L_), e0(3) {
@@ -147,6 +147,15 @@ struct Forward {
         }
         HX = K.interp(hu_all);
         TX = K.interp(tu_all);
+        // H and Ht are linear in x: precompute AH, AT (N x N^2) with
+        //   H(j, ch*N + i)  = gain * sum_k x(k, ch) AH(k, j*N + i),
+        //   Ht(ch*N + j, i) = gain * sum_k x(k, ch) AT(k, j*N + i).
+        AH = MatrixXd::Zero(N, N * N); AT = MatrixXd::Zero(N, N * N);
+        for (int j = 0; j < N; ++j)
+            for (int q = 0; q < m; ++q) {
+                AH.block(0, j * N, N, N).noalias() += HW(j, q) * HX.row(j * m + q).transpose() * HS[j].row(q);
+                AT.block(0, j * N, N, N).noalias() += TW(j, q) * TX.row(j * m + q).transpose() * TY[j].row(q);
+            }
         // cumulative integral (C f)(a_j) = int_0^{a_j} f
         cumint = MatrixXd::Zero(N, N);
         for (int j = 0; j < N; ++j) {
@@ -161,20 +170,18 @@ struct Forward {
 
     // H (N x 3N) and Ht (3N x N); flat vectors are channel-major.
     void observation_ops(const MatrixXd& x, double gain, int chan, MatrixXd& H, MatrixXd& Ht) const {
-        H = MatrixXd::Zero(N, 3 * N);
-        Ht = MatrixXd::Zero(3 * N, N);
-        const MatrixXd xh = HX * x;   // (N m) x 3
-        const MatrixXd xt = TX * x;
-        for (int j = 0; j < N; ++j) {
-            for (int ch = 0; ch < 3; ++ch) {
-                const VectorXd wx = HW.row(j).transpose().cwiseProduct(xh.block(j * m, ch, m, 1));
-                H.block(j, ch * N, 1, N) += gain * (wx.transpose() * HS[j]);
-                const VectorXd wt = TW.row(j).transpose().cwiseProduct(xt.block(j * m, ch, m, 1));
-                Ht.block(ch * N + j, 0, 1, N) += gain * (wt.transpose() * TY[j]);
+        H.resize(N, 3 * N);
+        Ht.resize(3 * N, N);
+        Eigen::RowVectorXd hrow(N * N), trow(N * N);
+        for (int ch = 0; ch < 3; ++ch) {
+            hrow.noalias() = gain * (x.col(ch).transpose() * AH);
+            trow.noalias() = gain * (x.col(ch).transpose() * AT);
+            for (int j = 0; j < N; ++j) {
+                H.block(j, ch * N, 1, N) = hrow.segment(j * N, N);
+                Ht.block(ch * N + j, 0, 1, N) = trow.segment(j * N, N);
             }
-            H(j, chan * N + j) += 1.0;
-            Ht(chan * N + j, j) += 1.0;
         }
+        for (int j = 0; j < N; ++j) { H(j, chan * N + j) += 1.0; Ht(chan * N + j, j) += 1.0; }
     }
 
     static VectorXd flat(const MatrixXd& v) {   // (N,3) -> channel-major
@@ -258,6 +265,8 @@ struct Backward {
     std::vector<MatrixXd> SPf, SPg;              // (m x N)
     // two-sided shifted-product layout: up to two pieces per node
     std::vector<std::vector<std::tuple<VectorXd, MatrixXd, MatrixXd>>> lay;   // (w, PB (m x N), PV (m x 2N))
+    MatrixXd QT;                 // (N x 4N^2): shifted product is linear in the coefficient, T_flat = coef^T QT
+    std::vector<MatrixXd> R;     // R[j] (N x N): shifted inner product is bilinear, A_j = sum_ch f_ch^T R[j] g_ch
 
     Backward(int N_, double L_) : N(N_), m(N_ + 8), L(L_), K(N_, 0.0, L_), T(N_, L_) {
         VectorXd u, w;
@@ -300,21 +309,28 @@ struct Backward {
                 lay[j].emplace_back(w, K.interp(u), T.interp((u.array() + lj).matrix()));
             }
         }
+        // linear map coef -> shifted product matrix (row-major flattening, j*2N + i)
+        QT = MatrixXd::Zero(N, 4 * N * N);
+        for (int j = 0; j < 2 * N; ++j)
+            for (const auto& [w, PB, PV] : lay[j])
+                for (int q = 0; q < w.size(); ++q)
+                    QT.block(0, j * 2 * N, N, 2 * N).noalias() += w[q] * PB.row(q).transpose() * PV.row(q);
+        // bilinear form for the shifted inner product
+        R.assign(N, MatrixXd::Zero(N, N));
+        for (int j = 0; j < N; ++j)
+            for (int q = 0; q < m; ++q)
+                if (SW(j, q) != 0.0) R[j].noalias() += SW(j, q) * SPf[j].row(q).transpose() * SPg[j].row(q);
     }
 
     VectorXd shifted_inner(const MatrixXd& f, const MatrixXd& g) const {
-        VectorXd out = VectorXd::Zero(N);
-        for (int j = 0; j < N; ++j)
-            out[j] = (SW.row(j).transpose().array() * ((SPf[j] * f).array() * (SPg[j] * g).array()).rowwise().sum()).sum();
+        VectorXd out(N);
+        for (int j = 0; j < N; ++j) out[j] = (f.transpose() * R[j] * g).trace();
         return out;
     }
 
     MatrixXd shifted_product(const VectorXd& coef) const {
-        MatrixXd Tm = MatrixXd::Zero(2 * N, 2 * N);
-        for (int j = 0; j < 2 * N; ++j)
-            for (const auto& [w, PB, PV] : lay[j])
-                Tm.row(j) += ((w.array() * (PB * coef).array()).matrix().transpose() * PV);
-        return Tm;
+        const Eigen::RowVectorXd flatT = coef.transpose() * QT;
+        return Eigen::Map<const Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>>(flatT.data(), 2 * N, 2 * N);
     }
 
     struct Result { MatrixXd hx, wedge, policy; };
@@ -422,8 +438,10 @@ struct Model {
             double lam = 1.0; bool acc = false;
             for (int ls = 0; ls < 8; ++ls) {
                 const VectorXd zt = z + lam * dz;
-                const VectorXd rt = residual(zt, true);
-                const double rtn = rt.cwiseAbs().maxCoeff();
+                const double ftol_ls = std::max(1e-13, std::min(1e-6, 1e-4 * rn));
+                VectorXd rt = residual(zt, true, ftol_ls);
+                double rtn = rt.cwiseAbs().maxCoeff();
+                if (rtn <= tol && ftol_ls > 1e-13) { rt = residual(zt, true); rtn = rt.cwiseAbs().maxCoeff(); }   // confirm at full accuracy
                 if (std::isfinite(rtn) && rtn < (1.0 - 1e-4 * lam) * rn) { last_ratio = rtn / rn; z = zt; r = rt; rn = rtn; acc = true; break; }
                 lam *= 0.5;
             }
