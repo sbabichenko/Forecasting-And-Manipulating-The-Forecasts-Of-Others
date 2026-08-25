@@ -200,7 +200,7 @@ struct Model {
 #pragma omp parallel for schedule(dynamic) if (!omp_in_parallel())
         for (int b = 0; b < nb; ++b) {
             const int o = b / NC, ch = b % NC;
-            if (kw[o][ch].size()) Ht.block(ch * N, o * N, N, N) = volterra(kw[o][ch]);
+            if (kw[o][ch].size() && kw[o][ch].cwiseAbs().maxCoeff() != 0.0) Ht.block(ch * N, o * N, N, N) = volterra(kw[o][ch]);
         }
         for (int o = 0; o < q; ++o) Ht.block((id_ch0 + o) * N, o * N, N, N) += MatrixXd::Identity(N, N);
         return Ht;
@@ -413,21 +413,23 @@ struct Model {
         auto Ht_of = [&](const MatrixXd& kmat_, bool flow, int j) {
             std::vector<std::vector<VectorXd>> kw = flow ? flow_kw(kvec(kmat_)) : signal_kw(kvec(kmat_), j);
             MatrixXd Ht = MatrixXd::Zero(NC * N, q * N);
-            for (int o = 0; o < q; ++o) for (int ch = 0; ch < NC; ++ch) if (kw[o][ch].size()) Ht.block(ch * N, o * N, N, N) = volterra(kw[o][ch]);
+            for (int o = 0; o < q; ++o) for (int ch = 0; ch < NC; ++ch)
+                if (kw[o][ch].size() && kw[o][ch].cwiseAbs().maxCoeff() != 0.0) Ht.block(ch * N, o * N, N, N) = volterra(kw[o][ch]);
             return Ht;
         };
+        auto massB = [&](const MatrixXd& X) { MatrixXd Y(X.rows(), X.cols()); for (int ch = 0; ch < NC; ++ch) Y.block(ch * N, 0, N, X.cols()).noalias() = Mass * X.block(ch * N, 0, N, X.cols()); return Y; };
         const MatrixXd dHtf = Ht_of(dctot, true, 0);
-        const MatrixXd dHf = Htmass(dHtf);
+        // dHf X = dHtf^T (Mass X): apply, never form
         const MatrixXd Htfb = B.Htf * B.beta, dHtfb = dHtf * B.beta;
-        const MatrixXd dbeta = B.Gflu.solve(dHf * B.vmat - (dHf * Htfb + B.Hf * dHtfb));
+        const MatrixXd dbeta = B.Gflu.solve(dHtf.transpose() * massB(B.vmat - Htfb) - B.Hf * dHtfb);
         const MatrixXd dp = dHtfb + B.Htf * dbeta;
         const MatrixXd dg = -dp;
         std::vector<MatrixXd> dHtj(NT), dyj(NT);
         for (int j = 0; j < NT; ++j) {
             dHtj[j].resize(NC * N, 2 * q * N);
             dHtj[j] << Ht_of(dctot - dcs[j], true, 0), Ht_of(dg, false, j);
-            const MatrixXd dHj = Htmass(dHtj[j]);
-            dyj[j] = B.Glu[j].solve(dHj * B.cs[j] + B.Hj[j] * dcs[j] - (dHj * (B.Htj[j] * B.yj[j]) + B.Hj[j] * (dHtj[j] * B.yj[j])));
+            // dHj X = dHtj^T (Mass X)
+            dyj[j] = B.Glu[j].solve(dHtj[j].transpose() * massB(B.cs[j] - B.Htj[j] * B.yj[j]) + B.Hj[j] * (dcs[j] - dHtj[j] * B.yj[j]));
         }
         std::vector<MatrixXd> out(NT);
         for (int i = 0; i < NT; ++i) {
@@ -480,6 +482,159 @@ struct Model {
         return out;
     }
 
+    // ---- fast linearization: base tensors so that every product with a perturbed kernel is N^2
+    //   T_x (N x N): (A_k x)     = T_x k    with T_x(a, :) = (VOL[a] x)^T
+    //   P_w (N x N): (A_k^T w)   = P_w^T k  with P_w = sum_a w_a VOL[a]
+    //   S_x, S'_x  : (Q_A(dP) x) = S_x dP,  (Q_A*(dP) x) = S'_x dP  with columns QA[m] x, QAT[m] x
+    MatrixXd Tmat(const VectorXd& x) const { MatrixXd T(N, N); for (int a = 0; a < N; ++a) T.row(a) = (VOL[a] * x).transpose(); return T; }
+    MatrixXd Pmat(const VectorXd& w) const { MatrixXd P = MatrixXd::Zero(N, N); for (int a = 0; a < N; ++a) if (w[a] != 0.0) P += w[a] * VOL[a]; return P; }
+    MatrixXd Smat(const VectorXd& x, bool adj) const { MatrixXd S(N, N); for (int m = 0; m < N; ++m) S.col(m) = (adj ? QAT[m] : QA[m]) * x; return S; }
+    struct LinBase {
+        // market maker
+        std::vector<MatrixXd> Tbeta;                 // [o*q+nu]: T of beta block (o, nu)
+        std::vector<MatrixXd> Pw1;                   // [ch*q+nu]: P of (Mass (v - Htf beta))[ch-block, nu]
+        MatrixXd W1;                                 // Mass (vmat - Htf beta)
+        // per trader j: policy rows
+        std::vector<std::vector<MatrixXd>> Ty;       // [j][r*q+comp]: T of yj block r (r < 2q), comp
+        std::vector<std::vector<MatrixXd>> Pw2;      // [j][ch*q+comp]: P of (Mass (c_j - Htj yj))[ch, comp]
+        std::vector<MatrixXd> W2;
+        // per trader i: cascade, impact, FOC
+        std::vector<std::vector<MatrixXd>> TF, TdP;  // [i][o*q+k]: T of F_{o,k} = sum_u SZhi(o,u) X_{u,k}; T of dP_{o,k}
+        std::vector<std::vector<MatrixXd>> Tc;       // [i][ch*q+k]: T of c_i[ch-block, k]
+        std::vector<std::vector<MatrixXd>> SC, SCa;  // [i][ch*q+k]: S, S' of C_{ch,k} = Hc Y_k
+        std::vector<std::vector<MatrixXd>> TY;       // [i][r*q+k]: T of Y block r, comp k
+        std::vector<std::vector<MatrixXd>> Pma, Pwq; // [i][ch*q+nu]: P of Mass a_lin[ch,nu]; P of w_{ch,nu} = sum_k Mq_{nu k} C_{ch,k}
+        std::vector<std::vector<VectorXd>> Cvec;     // [i][ch*q+k]: C_{ch,k}
+    };
+    LinBase linbase(const Diag& B) const {
+        LinBase L;
+        L.Tbeta.resize(q * q); for (int o = 0; o < q; ++o) for (int nu = 0; nu < q; ++nu) L.Tbeta[o * q + nu] = Tmat(B.beta.block(o * N, nu, N, 1));
+        L.W1.resize(NC * N, q); { const MatrixXd D = B.vmat - B.Htf * B.beta; for (int ch = 0; ch < NC; ++ch) L.W1.block(ch * N, 0, N, q).noalias() = Mass * D.block(ch * N, 0, N, q); }
+        L.Pw1.resize(NC * q); for (int ch = 0; ch < NC; ++ch) for (int nu = 0; nu < q; ++nu) L.Pw1[ch * q + nu] = Pmat(L.W1.block(ch * N, nu, N, 1));
+        L.Ty.resize(NT); L.Pw2.resize(NT); L.W2.resize(NT);
+        for (int j = 0; j < NT; ++j) {
+            L.Ty[j].resize(2 * q * q); for (int r = 0; r < 2 * q; ++r) for (int c = 0; c < q; ++c) L.Ty[j][r * q + c] = Tmat(B.yj[j].block(r * N, c, N, 1));
+            L.W2[j].resize(NC * N, q); { const MatrixXd D = B.cs[j] - B.Htj[j] * B.yj[j]; for (int ch = 0; ch < NC; ++ch) L.W2[j].block(ch * N, 0, N, q).noalias() = Mass * D.block(ch * N, 0, N, q); }
+            L.Pw2[j].resize(NC * q); for (int ch = 0; ch < NC; ++ch) for (int c = 0; c < q; ++c) L.Pw2[j][ch * q + c] = Pmat(L.W2[j].block(ch * N, c, N, 1));
+        }
+        L.TF.resize(NT); L.TdP.resize(NT); L.Tc.resize(NT); L.SC.resize(NT); L.SCa.resize(NT); L.TY.resize(NT); L.Pma.resize(NT); L.Pwq.resize(NT); L.Cvec.resize(NT);
+        const int R = 2 * q * N;
+        for (int i = 0; i < NT; ++i) {
+            if (NT > 1) {
+                L.TF[i].resize(q * q); L.TdP[i].resize(q * q);
+                for (int o = 0; o < q; ++o) for (int k = 0; k < q; ++k) {
+                    VectorXd F = VectorXd::Zero(N); for (int u = 0; u < q; ++u) F += SZhi(o, u) * B.Msol[i].block((q + u) * N, k, N, 1);
+                    L.TF[i][o * q + k] = Tmat(F);
+                    L.TdP[i][o * q + k] = Tmat(B.Msol[i].block(o * N, k, N, 1));
+                }
+            }
+            L.Tc[i].resize(NC * q); for (int ch = 0; ch < NC; ++ch) for (int k = 0; k < q; ++k) L.Tc[i][ch * q + k] = Tmat(B.cs[i].block(ch * N, k, N, 1));
+            L.TY[i].resize(2 * q * q); for (int r = 0; r < 2 * q; ++r) for (int k = 0; k < q; ++k) L.TY[i][r * q + k] = Tmat(B.Ymat[i].block(r * N, k, N, 1));
+            L.SC[i].resize(NC * q); L.SCa[i].resize(NC * q); L.Cvec[i].resize(NC * q); L.Pma[i].resize(NC * q); L.Pwq[i].resize(NC * q);
+            for (int ch = 0; ch < NC; ++ch) {
+                const auto Hc = B.Htj[i].block(ch * N, 0, N, R);
+                std::vector<VectorXd> C(q); for (int k = 0; k < q; ++k) C[k] = Hc * B.Ymat[i].col(k);
+                for (int k = 0; k < q; ++k) { L.Cvec[i][ch * q + k] = C[k]; L.SC[i][ch * q + k] = Smat(C[k], false); L.SCa[i][ch * q + k] = Smat(C[k], true); }
+                for (int nu = 0; nu < q; ++nu) {
+                    L.Pma[i][ch * q + nu] = Pmat(Mass * B.alin_raw[i].block(ch * N, nu, N, 1));
+                    VectorXd w = VectorXd::Zero(N); for (int k = 0; k < q; ++k) w += B.Mqq[i][nu][k] * C[k];
+                    L.Pwq[i][ch * q + nu] = Pmat(w);
+                }
+            }
+        }
+        return L;
+    }
+    // drift kernels of a perturbation, as vectors: flow kw[o][ch] = sum_u SZhi(o,u) dc[ch,u]; signal kw[o][ch] = gam_j[o] dg[ch,o]
+    std::vector<MatrixXd> dphi_fast(const Diag& B, const LinBase& L, const std::vector<MatrixXd>& dcs) const {
+        const int R = 2 * q * N;
+        MatrixXd dctot = MatrixXd::Zero(NC * N, q); for (const auto& d : dcs) dctot += d;
+        auto flowk = [&](const MatrixXd& dc, int o, int ch) { VectorXd k = VectorXd::Zero(N); for (int u = 0; u < q; ++u) if (SZhi(o, u) != 0.0) k += SZhi(o, u) * dc.block(ch * N, u, N, 1); return k; };
+        // ---- market maker: dbeta = G^{-1} (dHtf^T W1 - Hf (dHtf beta))
+        MatrixXd rhsb = MatrixXd::Zero(q * N, q), dHtfb = MatrixXd::Zero(NC * N, q);
+        for (int o = 0; o < q; ++o) for (int ch = 0; ch < NC; ++ch) {
+            const VectorXd k = flowk(dctot, o, ch); if (k.cwiseAbs().maxCoeff() == 0.0) continue;
+            for (int nu = 0; nu < q; ++nu) { rhsb.block(o * N, nu, N, 1) += L.Pw1[ch * q + nu].transpose() * k; dHtfb.block(ch * N, nu, N, 1) += L.Tbeta[o * q + nu] * k; }
+        }
+        const MatrixXd dbeta = B.Gflu.solve(rhsb - B.Hf * dHtfb);
+        const MatrixXd dp = dHtfb + B.Htf * dbeta;
+        const MatrixXd dg = -dp;
+        // ---- policy rows: dyj = G_j^{-1} (dHtj^T W2 + Hj (dc_j - dHtj yj))
+        std::vector<MatrixXd> dyj(NT);
+        // perturbed drift kernels of trader j's observation operator, kept for the FOC stage
+        std::vector<std::vector<std::vector<VectorXd>>> kwj(NT, std::vector<std::vector<VectorXd>>(2 * q, std::vector<VectorXd>(NC)));
+        for (int j = 0; j < NT; ++j) {
+            MatrixXd rhs = MatrixXd::Zero(R, q), dHty = MatrixXd::Zero(NC * N, q);
+            for (int r = 0; r < 2 * q; ++r) for (int ch = 0; ch < NC; ++ch) {
+                VectorXd k;
+                if (r < q) k = flowk(dctot - dcs[j], r, ch);
+                else { if (gam[j][r - q] == 0.0) continue; k = gam[j][r - q] * dg.block(ch * N, r - q, N, 1); }
+                if (k.cwiseAbs().maxCoeff() == 0.0) continue;
+                kwj[j][r][ch] = k;
+                for (int c = 0; c < q; ++c) { rhs.block(r * N, c, N, 1) += L.Pw2[j][ch * q + c].transpose() * k; dHty.block(ch * N, c, N, 1) += L.Ty[j][r * q + c] * k; }
+            }
+            dyj[j] = B.Glu[j].solve(rhs + B.Hj[j] * (dcs[j] - dHty));
+        }
+        std::vector<MatrixXd> out(NT);
+        for (int i = 0; i < NT; ++i) {
+            // ---- cascade
+            std::vector<std::vector<VectorXd>> ddP(q, std::vector<VectorXd>(q, VectorXd::Zero(N)));
+            if (NT == 1) {
+                for (int nu = 0; nu < q; ++nu) for (int k = 0; k < q; ++k) for (int o = 0; o < q; ++o) ddP[nu][k] += SZhi(o, k) * dbeta.block(o * N, nu, N, 1);
+            } else {
+                MatrixXd drhs = MatrixXd::Zero(2 * q * N, q);   // d rhs - dM sol
+                for (int nu = 0; nu < q; ++nu) for (int k = 0; k < q; ++k) {
+                    VectorXd v = VectorXd::Zero(N);
+                    for (int o = 0; o < q; ++o) { v += SZhi(o, k) * dbeta.block(o * N, nu, N, 1); v += L.TF[i][o * q + k] * dbeta.block(o * N, nu, N, 1); }   // -(-V_dbeta F)
+                    drhs.block(nu * N, k, N, 1) = v;
+                }
+                for (int u = 0; u < q; ++u) for (int k = 0; k < q; ++k) {
+                    VectorXd v = VectorXd::Zero(N);
+                    for (int j = 0; j < NT; ++j) if (j != i) for (int o = 0; o < q; ++o) {
+                        const VectorXd drf = dyj[j].block(o * N, u, N, 1), drs = dyj[j].block((q + o) * N, u, N, 1);
+                        v += SZhi(o, k) * drf;                               // d rhs
+                        v += L.TF[i][o * q + k] * drf;                       // -(-V_drf F)
+                        v -= gam[j][o] * (L.TdP[i][o * q + k] * drs);        // -(+gam V_drs dP)
+                    }
+                    drhs.block((q + u) * N, k, N, 1) = v;
+                }
+                const MatrixXd dsol = B.Mlu[i].solve(drhs);
+                for (int nu = 0; nu < q; ++nu) for (int k = 0; k < q; ++k) ddP[nu][k] = dsol.block(nu * N, k, N, 1);
+            }
+            // ---- a_lin: dalin = -dp + dA c + A dc
+            MatrixXd dalin = -dp;
+            for (int ch = 0; ch < NC; ++ch) for (int nu = 0; nu < q; ++nu) for (int k = 0; k < q; ++k)
+                dalin.block(ch * N, nu, N, 1) += L.Tc[i][ch * q + k] * ddP[nu][k] + B.Aq[i][nu][k] * dcs[i].block(ch * N, k, N, 1);
+            // ---- FOC: dY = K^{-1} (d rhs - dK Y)
+            const MatrixXd& Ht = B.Htj[i]; const MatrixXd& Y = B.Ymat[i];
+            VectorXd drhs_v = VectorXd::Zero(R * q), dKY = VectorXd::Zero(R * q);
+            MatrixXd dHtY = MatrixXd::Zero(NC * N, q);
+            for (int ch = 0; ch < NC; ++ch) {
+                const auto Hc = Ht.block(ch * N, 0, N, R);
+                // dC_{ch,k} = (dHc Y)_k = sum_r T_{Y_{r,k}} kw_r,ch
+                MatrixXd dC = MatrixXd::Zero(N, q);
+                for (int r = 0; r < 2 * q; ++r) if (kwj[i][r][ch].size()) for (int k = 0; k < q; ++k) dC.col(k) += L.TY[i][r * q + k] * kwj[i][r][ch];
+                dHtY.block(ch * N, 0, N, q) = dC;
+                for (int nu = 0; nu < q; ++nu) {
+                    // d rhs: dHc^T (M a) + Hc^T (M dalin)
+                    for (int r = 0; r < 2 * q; ++r) if (kwj[i][r][ch].size()) drhs_v.segment(nu * R + r * N, N) += L.Pma[i][ch * q + nu].transpose() * kwj[i][r][ch];
+                    drhs_v.segment(nu * R, R) += Hc.transpose() * (Mass * dalin.block(ch * N, nu, N, 1));
+                    // dK Y: dHc^T w + Hc^T (dMq C + Mq dC)
+                    for (int r = 0; r < 2 * q; ++r) if (kwj[i][r][ch].size()) dKY.segment(nu * R + r * N, N) += L.Pwq[i][ch * q + nu].transpose() * kwj[i][r][ch];
+                    VectorXd wd = VectorXd::Zero(N);
+                    for (int k = 0; k < q; ++k) {
+                        wd += L.SC[i][ch * q + k] * ddP[nu][k] + L.SCa[i][ch * q + k] * ddP[k][nu];   // dMq_{nu k} C_k
+                        wd += B.Mqq[i][nu][k] * dC.col(k);
+                    }
+                    dKY.segment(nu * R, R) += Hc.transpose() * wd;
+                }
+            }
+            const VectorXd dyv = B.Klu[i].solve(drhs_v - dKY);
+            MatrixXd dY(R, q); for (int nu = 0; nu < q; ++nu) dY.col(nu) = dyv.segment(nu * R, R);
+            out[i] = dHtY + Ht * dY;
+        }
+        return out;
+    }
+
     VectorXd pack(const std::vector<MatrixXd>& cs) const { VectorXd z(NT * NC * N * q); for (int i = 0; i < NT; ++i) for (int k = 0; k < q; ++k) z.segment((i * q + k) * NC * N, NC * N) = cs[i].col(k); return z; }
     std::vector<MatrixXd> unpack(const VectorXd& z) const { std::vector<MatrixXd> cs(NT, MatrixXd(NC * N, q)); for (int i = 0; i < NT; ++i) for (int k = 0; k < q; ++k) cs[i].col(k) = z.segment((i * q + k) * NC * N, NC * N); return cs; }
     VectorXd residual(const VectorXd& z, Diag* dg = nullptr, const Diag* pre = nullptr) const { const double t0 = now_s(); VectorXd r = pack(phi(unpack(z), dg, pre)) - z; (dg || !pre ? g_t_full : g_t_pre) += now_s() - t0; return r; }
@@ -505,7 +660,7 @@ struct Solver {
     VectorXd apply_Jinv(const VectorXd& r) const { VectorXd x = Jlu.solve(r); for (size_t k = 0; k < bu.size(); ++k) x += bu[k] * bv[k].dot(r); return x; }
     struct JinvOp { const Solver* S; VectorXd operator*(const VectorXd& r) const { return S->apply_Jinv(r); } };
     JinvOp Jinv{this};
-    bool jfnk = true; int gmres_max = 12; double gmres_tol = 1e-3; bool analytic = true; bool krylov_stalled = false;
+    bool jfnk = true; int gmres_max = 12; double gmres_tol = 1e-3; bool analytic = true; bool krylov_stalled = false; bool exact_newton = false;
     Model::Diag cur; bool have_cur = false;   // factorizations at the current iterate, preconditioning nearby evaluations
     long gmres_its = 0;
     explicit Solver(Model& m) : M(m) {}
@@ -521,16 +676,17 @@ struct Solver {
         VectorXd r = M.residual(z, &cur); have_cur = true; ++evals; double rn = r.cwiseAbs().maxCoeff(); const double rn0 = rn;
         const int n = static_cast<int>(z.size()); double last_ratio = 0.0; int step = 0; int fails = 0; bool fresh = false;
         double rn_at10 = std::numeric_limits<double>::infinity();
-        bool use_krylov = jfnk;     // hybrid: Newton-Krylov until GMRES stalls in this solve, then chord + Broyden for the rest of it
+        bool use_krylov = jfnk && !exact_newton;     // hybrid: Newton-Krylov until GMRES stalls in this solve, then chord + Broyden for the rest of it
         for (; step < maxsteps && rn > tol; ++step) {
             if (step == 10) rn_at10 = rn;
             if (step == 20 && rn > 0.3 * rn_at10) break;      // not making progress: hand back for eps bisection
-            if (!have_J || (last_ratio > refresh_ratio && o.jacobians < (use_krylov ? 1 : max_jacobians))) {   // under JFNK the Broyden-updated inverse is only a preconditioner: refresh at most once per solve
+            if (exact_newton || !have_J || (last_ratio > refresh_ratio && o.jacobians < (use_krylov ? 1 : max_jacobians))) {   // under JFNK the Broyden-updated inverse is only a preconditioner: refresh at most once per solve
                 MatrixXd Jm(n, n); const double eps_fd = 1e-7 * std::max(1.0, z.cwiseAbs().maxCoeff());
                 Model::Diag& base = cur; const VectorXd rb = r;   // factorizations at z precondition the columns
                 if (analytic) {
+                    const Model::LinBase LB = M.linbase(base);
 #pragma omp parallel for schedule(dynamic, 8)
-                    for (int i = 0; i < n; ++i) { VectorXd e = VectorXd::Zero(n); e[i] = 1.0; Jm.col(i) = M.pack(M.dphi(base, M.unpack(e))) - e; }
+                    for (int i = 0; i < n; ++i) { VectorXd e = VectorXd::Zero(n); e[i] = 1.0; Jm.col(i) = M.pack(M.dphi_fast(base, LB, M.unpack(e))) - e; }
                 } else {
 #pragma omp parallel for schedule(dynamic, 4)
                     for (int i = 0; i < n; ++i) { VectorXd zp = z; zp[i] += eps_fd; Jm.col(i) = (M.residual(zp, nullptr, &base) - rb) / eps_fd; }
@@ -570,7 +726,7 @@ struct Solver {
                 const VectorXd zt = z + lam * dz; const VectorXd rt = M.residual(zt, nullptr, &cur); ++evals; const double rtn = rt.cwiseAbs().maxCoeff();
                 if (std::isfinite(rtn) && rtn < (1.0 - 1e-4 * lam) * rn) {
                     const VectorXd sz = zt - z, yr = rt - r, Jy = apply_Jinv(yr); const double den = sz.dot(Jy);
-                    if (std::abs(den) > 1e-14 * sz.norm() * Jy.norm()) {
+                    if (!exact_newton && std::abs(den) > 1e-14 * sz.norm() * Jy.norm()) {
                         // good Broyden update of the inverse: Jinv += (sz - Jy) (sz^T Jinv) / den  ->  u = (sz - Jy)/den, v = Jinv^T sz
                         VectorXd vT = Jlu.transpose().solve(sz); for (size_t k = 0; k < bu.size(); ++k) vT += bv[k] * bu[k].dot(sz);
                         bu.push_back((sz - Jy) / den); bv.push_back(vT);
@@ -609,7 +765,7 @@ int main(int argc, char* argv[]) {
     std::vector<VectorXd> gam;
     { std::string s = argv[6]; size_t p = 0; while (p <= s.size()) { size_t e = s.find(';', p); if (e == std::string::npos) e = s.size(); auto v = parse_list(s.substr(p, e - p)); VectorXd g(q); for (int k = 0; k < q; ++k) g[k] = v.size() == 1 ? v[0] : v[k]; gam.push_back(g); p = e + 1; } }
     MatrixXd SV = MatrixXd::Identity(q, q), SZ = MatrixXd::Identity(q, q);
-    double tol = 1e-10, split_b = 0.0, map_alpha = 0.0; int uniform = 0, coarse = 0, n1 = 0; bool verbose = false, eval_only = false, adaptive = true, tangent = true, use_jfnk = true, use_analytic = true, check_jac = false; int gm_max = 12; double gm_tol = 1e-3; std::vector<double> path; std::string init_file;
+    double tol = 1e-10, split_b = 0.0, map_alpha = 0.0; int uniform = 0, coarse = 0, n1 = 0; bool verbose = false, eval_only = false, adaptive = true, tangent = true, use_jfnk = true, use_analytic = true, check_jac = false, exact_nt = true; int gm_max = 12; double gm_tol = 1e-3; std::vector<double> path; std::string init_file;
     for (int i = 7; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--sigma-v") && i + 1 < argc) { auto v = parse_list(argv[++i]); for (int r = 0; r < q; ++r) for (int c = 0; c < q; ++c) SV(r, c) = v[r * q + c]; }
         else if (!std::strcmp(argv[i], "--sigma-z") && i + 1 < argc) { auto v = parse_list(argv[++i]); for (int r = 0; r < q; ++r) for (int c = 0; c < q; ++c) SZ(r, c) = v[r * q + c]; }
@@ -620,6 +776,8 @@ int main(int argc, char* argv[]) {
         else if (!std::strcmp(argv[i], "--eval-only")) eval_only = true;
         else if (!std::strcmp(argv[i], "--jfnk")) use_jfnk = true;
         else if (!std::strcmp(argv[i], "--chord")) use_jfnk = false;
+        else if (!std::strcmp(argv[i], "--newton")) exact_nt = true;
+        else if (!std::strcmp(argv[i], "--hybrid")) exact_nt = false;
         else if (!std::strcmp(argv[i], "--gmres") && i + 2 < argc) { gm_max = std::atoi(argv[++i]); gm_tol = std::atof(argv[++i]); }
         else if (!std::strcmp(argv[i], "--fd-jacobian")) use_analytic = false;
         else if (!std::strcmp(argv[i], "--check-jacobian")) check_jac = true;
@@ -648,7 +806,7 @@ int main(int argc, char* argv[]) {
     auto continuation = [&](Model& M, Solver& S, VectorXd z, std::vector<double> path, int pre0, bool& ok_out) {
         VectorXd zprev; double eprev = 0; bool have_prev = false;
         Solver::Out o; o.ok = false;
-        int bisections = 0; double factor = 0.4;                   // adaptive: next eps = factor * current
+        int bisections = 0; double factor = 0.5;                   // adaptive: next eps = factor * current
         for (size_t k = 0; k < path.size(); ++k) {
             M.eps = path[k];
             VectorXd zstart = z;
@@ -680,9 +838,10 @@ int main(int argc, char* argv[]) {
             if (k > 0) { zprev = z; eprev = path[k - 1]; have_prev = true; }
             z = o.z;
             if (adaptive && k + 1 < path.size()) {
-                // replace the rest of the path by one geometric step, sized by how easy this step was
-                if (o.steps <= 8) factor *= 0.6; else if (o.steps >= 20) factor = std::sqrt(factor);
-                factor = std::max(0.05, std::min(0.7, factor));
+                // replace the rest of the path by one geometric step, sized by how easy this step was:
+                // quick solve -> allow a somewhat larger ratio, slow solve -> smaller; never below 0.25 per step
+                if (o.steps <= 5) factor *= 0.8; else if (o.steps >= 12) factor = std::sqrt(factor);
+                factor = std::max(0.25, std::min(0.7, factor));
                 const double target = path.back();
                 double next = path[k] * factor; if (next < target) next = target;
                 path.erase(path.begin() + k + 1, path.end()); path.push_back(next); if (next > target) path.push_back(target);
@@ -693,7 +852,7 @@ int main(int argc, char* argv[]) {
     };
 
     Model M(N, L, path.front(), rho, q, gam, SV, SZ, n1, split_b, map_alpha);
-    Solver S(M); S.verbose = verbose; S.jfnk = use_jfnk; S.gmres_max = gm_max; S.gmres_tol = gm_tol; S.analytic = use_analytic;
+    Solver S(M); S.verbose = verbose; S.jfnk = use_jfnk; S.gmres_max = gm_max; S.gmres_tol = gm_tol; S.analytic = use_analytic; S.exact_newton = exact_nt;
     VectorXd z = VectorXd::Zero(M.dim() * M.NT);
     Solver::Out o; o.ok = false;
     if (!init_file.empty()) {
@@ -711,15 +870,17 @@ int main(int argc, char* argv[]) {
         VectorXd zc = VectorXd::Random(z.size()) * 0.3;
         Model::Diag base; const VectorXd rb = M.residual(zc, &base);
         const double h = 1e-7 * std::max(1.0, zc.cwiseAbs().maxCoeff());
-        double maxrel = 0; int worst = -1;
+        double maxrel = 0, maxfast = 0; int worst = -1;
+        const Model::LinBase LB = M.linbase(base);
         for (int i = 0; i < static_cast<int>(zc.size()); i += std::max(1, static_cast<int>(zc.size()) / 40)) {
             VectorXd e = VectorXd::Zero(zc.size()); e[i] = 1.0;
-            const VectorXd ca = M.pack(M.dphi(base, M.unpack(e))) - e;
+            const VectorXd ca = M.pack(M.dphi_fast(base, LB, M.unpack(e))) - e;
+            { const VectorXd cr = M.pack(M.dphi(base, M.unpack(e))) - e; maxfast = std::max(maxfast, (ca - cr).norm() / std::max(1e-12, cr.norm())); }
             VectorXd zp = zc; zp[i] += h; const VectorXd cf = (M.residual(zp, nullptr, &base) - rb) / h;
             const double rel = (ca - cf).norm() / std::max(1e-12, cf.norm());
             if (rel > maxrel) { maxrel = rel; worst = i; }
         }
-        std::fprintf(stderr, "check-jacobian: max relative column error %.2e (column %d) over sampled columns\n", maxrel, worst);
+        std::fprintf(stderr, "check-jacobian: fast vs FD %.2e (column %d), fast vs reference linearization %.2e\n", maxrel, worst, maxfast);
         return maxrel < 1e-5 ? 0 : 3;
     }
     if (eval_only) {
@@ -730,7 +891,7 @@ int main(int argc, char* argv[]) {
     } else if (coarse > 0 && coarse < N && init_file.empty() && n1 == 0) {
         // coarse-to-fine: full continuation at N0 = coarse, interpolate, then solve the target directly at N
         Model Mc(coarse, L, path.front(), rho, q, gam, SV, SZ);
-        Solver Sc(Mc); Sc.verbose = verbose; Sc.jfnk = use_jfnk; Sc.analytic = use_analytic;
+        Solver Sc(Mc); Sc.verbose = verbose; Sc.jfnk = use_jfnk; Sc.analytic = use_analytic; Sc.exact_newton = exact_nt;
         VectorXd zc = VectorXd::Zero(Mc.dim() * Mc.NT);
         bool okc = false;
         const Solver::Out oc = continuation(Mc, Sc, zc, path, 60, okc);
