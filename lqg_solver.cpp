@@ -1295,6 +1295,7 @@ static EquilibriumResult solve_equilibrium_core(
     BackwardPlayer bp1, bp2;
     double best_err = std::numeric_limits<double>::infinity(); int since_best = 0;   // stagnation guard
     int nonfinite_recoveries = 0;
+    static const bool newton_enabled_flag = [] { const char* e = std::getenv("LQG_NEWTON"); return !(e && std::atoi(e) == 0); }();
     static const int newton_after = [] { const char* e = std::getenv("LQG_NEWTON_AFTER"); return e ? std::atoi(e) : 40; }();   // switch to the Newton-Krylov engine after this many outer iterations (0 = never)
     constexpr int ANDERSON_STALL = 8;
 
@@ -1350,7 +1351,7 @@ static EquilibriumResult solve_equilibrium_core(
         if (newton_after > 0 && it >= newton_after) break;   // hand over to the Newton-Krylov engine
 
         if (err < 0.98 * best_err) { best_err = err; since_best = 0; } else ++since_best;
-        if (anderson.depth > 0 && err < ANDERSON_START) {
+        if (anderson.depth > 0 && (err < ANDERSON_START || anderson_active)) {   // once active, the rejection logic applies whatever the residual
             const bool stalled = anderson_active && since_best >= ANDERSON_STALL;
             const bool blew_up = anderson_active && have_prev && err > prev_err * ANDERSON_GROWTH;
             if (stalled || blew_up) {
@@ -1361,8 +1362,11 @@ static EquilibriumResult solve_equilibrium_core(
                 anderson.reset(); anderson.depth = 0; anderson_active = false; have_prev = false;
                 relax = PICARD_RELAX; ++g_anderson_fallbacks;
                 if (verbose || std::getenv("LQG_ANDERSON_TRACE")) std::fprintf(stderr, "  [anderson %s at it=%d err=%.2e prev=%.2e] p=(%.3g,%.3g) r=(%g,%g) sigma=%g b=(%g,%g)\n", stalled ? "stalled" : "diverging", it, err, prev_err, p1_val, p2_val, g_r1, g_r2, g_sigma, g_b1, g_b2);
-                // the Picard update below acts on the restored iterate with a stale Hx,
-                // which only affects the size of this one relaxation step
+                // Hand over to the Newton-Krylov engine from the restored iterate.  The relaxed
+                // Picard iteration is useless here: dG/dD has eigenvalues of order -1/r (-200 at
+                // r = 0.015 on the low-precision path), so any relaxation above 2/(1 + |lambda|)
+                // diverges and would wreck the iterate before Newton starts.
+                if (newton_enabled_flag) break;
             } else {
                 pack_kernels(D1, D2, TRI, xa);
                 prev_err = err; have_prev = true; anderson.first_step = relax;
@@ -1406,7 +1410,8 @@ static EquilibriumResult solve_equilibrium_core(
         };
         double res = evalF(x, F);
         if (verbose) std::cout << "  Newton-Krylov fallback from resid " << res << std::endl;
-        const int NEWTON_MAX = 40, GM = 30;
+        static const int GM = [] { const char* e = std::getenv("LQG_NEWTON_GMRES"); return e ? std::atoi(e) : 120; }();   // Krylov size per cycle
+        const int NEWTON_MAX = 40, GM_RESTARTS = 3;
         Eigen::VectorXd xt(dim), Ft(dim), v(dim), w(dim);
         for (int nit = 0; nit < NEWTON_MAX && std::isfinite(res) && res >= PICARD_TOL; ++nit) {
             // GMRES on J d = -F, J v ~ (F(x + eps v) - F(x)) / eps
@@ -1416,24 +1421,30 @@ static EquilibriumResult solve_equilibrium_core(
                 const double eps = 1e-7 * std::max(1.0, xnorm) / vn;
                 xt = x + eps * vv; evalF(xt, Ft); out = (Ft - F) / eps;
             };
-            Eigen::VectorXd d = Eigen::VectorXd::Zero(dim), r0 = -F;
-            const double beta = r0.norm(), gm_tol = 1e-3 * beta;
-            Eigen::MatrixXd V(dim, GM + 1), H = Eigen::MatrixXd::Zero(GM + 1, GM);
-            Eigen::VectorXd g = Eigen::VectorXd::Zero(GM + 1); g[0] = beta; V.col(0) = r0 / beta;
-            std::vector<double> cs(GM), sn(GM); int k = 0;
-            for (; k < GM; ++k) {
-                applyJ(V.col(k), w);
-                if (!w.allFinite()) break;
-                for (int i2 = 0; i2 <= k; ++i2) { H(i2, k) = V.col(i2).dot(w); w -= H(i2, k) * V.col(i2); }
-                H(k + 1, k) = w.norm(); if (H(k + 1, k) > 1e-300) V.col(k + 1) = w / H(k + 1, k);
-                for (int i2 = 0; i2 < k; ++i2) { const double t = cs[i2] * H(i2, k) + sn[i2] * H(i2 + 1, k); H(i2 + 1, k) = -sn[i2] * H(i2, k) + cs[i2] * H(i2 + 1, k); H(i2, k) = t; }
-                const double den = std::hypot(H(k, k), H(k + 1, k)); cs[k] = H(k, k) / den; sn[k] = H(k + 1, k) / den; H(k, k) = den; H(k + 1, k) = 0.0;
-                g[k + 1] = -sn[k] * g[k]; g[k] = cs[k] * g[k];
-                if (std::fabs(g[k + 1]) < gm_tol) { ++k; break; }
+            // restarted GMRES(GM) on J d = -F, inexact tolerance 1e-4 relative
+            Eigen::VectorXd d = Eigen::VectorXd::Zero(dim); const double gm_tol = 1e-4 * F.norm(); int k = 0; bool gm_ok = false;
+            const int m = std::min(dim, GM);
+            for (int cycle = 0; cycle < GM_RESTARTS && !gm_ok; ++cycle) {
+                Eigen::VectorXd r0; if (cycle == 0) r0 = -F; else { applyJ(d, w); r0 = -F - w; }
+                const double beta = r0.norm(); if (beta < gm_tol) { gm_ok = true; break; }
+                Eigen::MatrixXd V(dim, m + 1), H = Eigen::MatrixXd::Zero(m + 1, m);
+                Eigen::VectorXd g = Eigen::VectorXd::Zero(m + 1); g[0] = beta; V.col(0) = r0 / beta;
+                std::vector<double> cs(m), sn(m); k = 0;
+                for (; k < m; ++k) {
+                    applyJ(V.col(k), w);
+                    if (!w.allFinite()) break;
+                    for (int i2 = 0; i2 <= k; ++i2) { H(i2, k) = V.col(i2).dot(w); w -= H(i2, k) * V.col(i2); }
+                    H(k + 1, k) = w.norm(); if (H(k + 1, k) > 1e-300) V.col(k + 1) = w / H(k + 1, k);
+                    for (int i2 = 0; i2 < k; ++i2) { const double t = cs[i2] * H(i2, k) + sn[i2] * H(i2 + 1, k); H(i2 + 1, k) = -sn[i2] * H(i2, k) + cs[i2] * H(i2 + 1, k); H(i2, k) = t; }
+                    const double den = std::hypot(H(k, k), H(k + 1, k)); cs[k] = H(k, k) / den; sn[k] = H(k + 1, k) / den; H(k, k) = den; H(k + 1, k) = 0.0;
+                    g[k + 1] = -sn[k] * g[k]; g[k] = cs[k] * g[k];
+                    if (std::fabs(g[k + 1]) < gm_tol) { ++k; gm_ok = true; break; }
+                }
+                if (k == 0) break;
+                const Eigen::VectorXd y = H.topLeftCorner(k, k).triangularView<Eigen::Upper>().solve(g.head(k));
+                d += V.leftCols(k) * y;
             }
-            if (k == 0) break;
-            const Eigen::VectorXd y = H.topLeftCorner(k, k).triangularView<Eigen::Upper>().solve(g.head(k));
-            d = V.leftCols(k) * y;
+            if (k == 0 && d.norm() == 0.0) break;
             // backtracking line search on the residual (finite evaluations only)
             double step = 1.0, res_new = std::numeric_limits<double>::quiet_NaN();
             for (int ls = 0; ls < 12; ++ls) {
@@ -1443,7 +1454,8 @@ static EquilibriumResult solve_equilibrium_core(
             }
             if (!(std::isfinite(res_new) && res_new < res)) { if (verbose) std::cout << "  Newton: no descent; stopping" << std::endl; break; }
             x = xt; F = Ft; res = res_new; residuals.push_back(res);
-            if (verbose) std::cout << "  Newton it=" << nit + 1 << " gmres " << k << " step " << step << " resid " << res << std::endl;
+            if (verbose) std::cout << "  Newton it=" << nit + 1 << " gmres " << k << (gm_ok ? "" : " (not converged)") << " step " << step << " resid " << res << std::endl;
+            if (step < 1e-3) { if (verbose) std::cout << "  Newton: line search collapsed; stopping" << std::endl; break; }
         }
         unpack_kernels(x, TRI, D1, D2);
     }
