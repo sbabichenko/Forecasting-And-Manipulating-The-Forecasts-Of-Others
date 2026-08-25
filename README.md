@@ -239,6 +239,17 @@ array-of-structs lockstep pass (N=160 54 vs 55 ms, N=640 1.83 vs 1.86 s):
 the pass is bound by streaming the later levels' rows, not by the 3x3
 arithmetic, and the moment sums cost the same as nine separate dots.
 
+**Memory**: a single solve peaks at 15 MB (N=160), 60 MB (N=320), 173 MB
+(N=640), after storing Anderson's difference columns in single precision
+(they only feed the least-squares coefficients; sweep results move by <1e-10),
+dropping the duplicate previous-iterate kernels under Anderson, triangular W
+histories and the march writing straight into the environment (was 23 / 78 /
+298 MB).  What remains is ~14 triangular kernels of 24 N(N+1)/2 bytes plus the
+Anderson buffers (6 vectors of 6 x tri doubles); `A_store` (a scaled copy of
+Xtilde, kept for the F-materialization and exact-CE code) is the next 2
+kernels.  The figure driver's peak (330 MB at N=157) is its cache of every
+equilibrium, 9 kernels per parameter point.
+
 Timings for the (3,3) benchmark solve, 8 threads: N=40 3 ms, N=160 55 ms,
 N=320 0.4 s, N=640 1.9 s (N=160 was 1.4 s before the exact march, Hk-free
 adjoints, Anderson, vectorization and threading; N > 160 was not possible).

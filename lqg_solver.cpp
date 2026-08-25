@@ -497,8 +497,8 @@ void forward_environment(
         // and earlier filter rows, and row j of the controls on filter rows <= j.
         // Marching j = 0..n-1 therefore produces the exact state--filter--control
         // fixed point in one sweep, with no relaxation.
-        Kernel2D X, calD1, calD2;
-        X.setZero(); calD1.setZero(); calD2.setZero();
+        Kernel2D& X = env.X; Kernel2D calD1, calD2;
+        X.resize(); X.setZero(); calD1.setZero(); calD2.setZero();
         const Vec3 sigE0 = g_sigma * E0();
         static const bool ws_march = [] { const char* e = std::getenv("LQG_FORWARD_PAIR"); return !(e && std::atoi(e)); }();
         if (ws_march && g_n >= 400 && !omp_in_parallel() && omp_get_max_threads() > 2) {   // per-row barriers only pay off for large N
@@ -519,7 +519,6 @@ void forward_environment(
                     control_row_ws(j, D2, env.Xtilde2, obs_gain2, obs_idx_2, Pi_2, calD2, sc2);
                 }
             }
-            env.X = X;
             env.obs_gain1 = obs_gain1; env.obs_gain2 = obs_gain2;
             env.obs_idx1 = obs_idx_1; env.obs_idx2 = obs_idx_2;
             return;
@@ -661,7 +660,7 @@ void backward_kernels(const Kernel2D& X, const Kernel2D& Xtildek,
     // Cost O(N^3) flops with O(N^2) vectors of memory, no block array.
     const int n = g_n;
     static thread_local std::vector<Vec3> Whist;      // W[t][r], r <= t-1, row-major t * n + r
-    if (static_cast<int>(Whist.size()) < n * n) Whist.resize(n * n);
+    if (static_cast<int>(Whist.size()) < n * (n + 1) / 2) Whist.resize(n * (n + 1) / 2);   // triangular
     static thread_local std::vector<Mat3> Mbuf;       // M_{t'} for the current level
     static thread_local std::vector<double> pbuf;     // p_{t'}
     if (static_cast<int>(Mbuf.size()) < n) { Mbuf.resize(n); pbuf.resize(n); }
@@ -690,7 +689,7 @@ void backward_kernels(const Kernel2D& X, const Kernel2D& Xtildek,
         for (int t2 = tp + 1; t2 < n; ++t2) {
             const Mat3& M = Mbuf[t2]; const double pv = pbuf[t2];
             const Vec3& hxd = Hx[t2][tp]; const double xo = X[t2][tp](obs_idx_k);
-            const Vec3* drow = &Dk[t2][0]; const Vec3* wrow = &Whist[t2 * n];
+            const Vec3* drow = &Dk[t2][0]; const Vec3* wrow = &Whist[t2 * (t2 + 1) / 2];
             for (int r = 0; r <= j; ++r) {
                 acc[r].noalias() += M * drow[r]; acc[r] -= pv * wrow[r];
                 diag[r] += hxd * drow[r](obs_idx_k) - wrow[r] * xo;
@@ -700,7 +699,7 @@ void backward_kernels(const Kernel2D& X, const Kernel2D& Xtildek,
         // Diagonal innovation-birth term: Gamma^T E H^k_t(t, .), from delta w^k_t(t) = E^{k,T} Gamma^k(t) e^k_t.
         for (int r = 0; r <= j; ++r) {
             W[r] = obs_gain_k * g_dt * diag[r] + g_dt * Pk * g_dt * acc[r];
-            Whist[tp * n + r] = W[r];
+            Whist[tp * (tp + 1) / 2 + r] = W[r];
         }
         for (int r = 0; r <= j; ++r)
             Hx[j][r] = Hx[tp][r] + g_dt * (X[tp][r] + W[r]);
@@ -724,7 +723,7 @@ void backward_kernels_pair(const Kernel2D& X, BackwardPlayer& P1, BackwardPlayer
         BackwardPlayer& p = *P[q];
         p.Hx->setZero();
         for (int s = 0; s < n; ++s) (*p.Hx)[n - 1][s] = terminal_state_weight * X[n - 1][s];
-        if (static_cast<int>(p.W.size()) < n * n) p.W.resize(n * n);
+        if (static_cast<int>(p.W.size()) < n * (n + 1) / 2) p.W.resize(n * (n + 1) / 2);   // W[t][r], r <= t: triangular
         if (static_cast<int>(p.M.size()) < n) { p.M.resize(n); p.pv.resize(n); }
     }
     using FlatC = Eigen::Map<const Eigen::VectorXd>;
@@ -750,13 +749,13 @@ void backward_kernels_pair(const Kernel2D& X, BackwardPlayer& P1, BackwardPlayer
                 Kernel2D& Hx = *p.Hx; const Kernel2D& Dk = *p.Dk;
                 Vec3 acc = Vec3::Zero(), diag = Vec3::Zero();
                 for (int t2 = tp + 1; t2 < n; ++t2) {
-                    const Vec3& d = Dk[t2][r]; const Vec3& w = p.W[t2 * n + r];
+                    const Vec3& d = Dk[t2][r]; const Vec3& w = p.W[t2 * (t2 + 1) / 2 + r];
                     acc.noalias() += p.M[t2] * d; acc -= p.pv[t2] * w;
                     diag += Hx[t2][tp] * d(p.obs) - w * X[t2][tp](p.obs);
                 }
                 const double Pk = (*p.prec)[tp];
                 const Vec3 Wr = p.gain * g_dt * diag + g_dt * Pk * g_dt * acc;
-                p.W[tp * n + r] = Wr;
+                p.W[tp * (tp + 1) / 2 + r] = Wr;
                 Hx[j][r] = Hx[tp][r] + g_dt * (X[tp][r] + Wr);
             }
         }
@@ -1085,7 +1084,9 @@ struct AndersonState {
     int depth = 5; double beta = 0.6; double first_step = 0.15; double growth = 3.0;   // growth: residual increase tolerated in one accelerated step
     // ring of the last `depth` differences dX_i = x_{i+1} - x_i, dF_i = f_{i+1} - f_i (columns), their Gram matrix,
     // and the previous pair (x, f)
-    Eigen::MatrixXd dX, dF, G; int m = 0, head = 0; bool have_prev = false; Eigen::VectorXd x_prev, f_prev;
+    // differences stored in single precision: they only feed the least-squares coefficients and the
+    // extrapolation correction, whose error is at the 1e-7 level against a 1e-5 stopping tolerance
+    Eigen::MatrixXf dX, dF; Eigen::MatrixXd G; int m = 0, head = 0; bool have_prev = false; Eigen::VectorXd x_prev, f_prev;
     void reset() { m = 0; head = 0; have_prev = false; }
     // x, f (= g - x) of the current iterate; on return x holds the next iterate
     bool step(Eigen::VectorXd& x, const Eigen::VectorXd& f) {
@@ -1094,18 +1095,19 @@ struct AndersonState {
         if (have_prev) {
             // append the newest difference (overwriting the oldest when full) and update the Gram matrix column
             const int c = head; head = (head + 1) % depth; if (m < depth) ++m;
-            dX.col(c) = x - x_prev; dF.col(c) = f - f_prev;
-            for (int i = 0; i < m; ++i) { G(i, c) = dF.col(i).dot(dF.col(c)); G(c, i) = G(i, c); }
+            dX.col(c) = (x - x_prev).cast<float>(); dF.col(c) = (f - f_prev).cast<float>();
+            for (int i = 0; i < m; ++i) { G(i, c) = dF.col(i).cast<double>().dot(dF.col(c).cast<double>()); G(c, i) = G(i, c); }
         }
         x_prev = x; f_prev = f; have_prev = true;
         if (m == 0) { x = x + first_step * f; return true; }   // first move: the safe relaxation, not beta
         // gamma = argmin |f - dF gamma| over the m stored columns (any order: the columns are a set)
         Eigen::MatrixXd Gm = G.topLeftCorner(m, m);
-        Eigen::VectorXd rhs(m); for (int i = 0; i < m; ++i) rhs[i] = dF.col(i).dot(f);
+        Eigen::VectorXd rhs(m); for (int i = 0; i < m; ++i) rhs[i] = dF.col(i).cast<double>().dot(f);
         Eigen::LDLT<Eigen::MatrixXd> ldlt(Gm + 1e-12 * Gm.trace() * Eigen::MatrixXd::Identity(m, m));
         const Eigen::VectorXd gamma = ldlt.solve(rhs);
         if (!gamma.allFinite()) { reset(); return false; }
-        x = x + beta * f - dX.leftCols(m) * gamma - beta * (dF.leftCols(m) * gamma);
+        const Eigen::VectorXf gf = gamma.cast<float>();
+        x = x + beta * f - (dX.leftCols(m) * gf).cast<double>() - beta * (dF.leftCols(m) * gf).cast<double>();
         return true;
     }
 };
@@ -1202,8 +1204,8 @@ static EquilibriumResult solve_equilibrium_core(
                 // Give up on acceleration for this solve: restore the best Picard-safe
                 // iterate seen and continue with the relaxed Picard iteration, which is
                 // known to converge (44 iterations on the benchmark).
-                anderson.reset(); anderson.depth = 0; anderson_active = false;
-                D1 = prev_D1; D2 = prev_D2; have_prev = false;
+                unpack_kernels(anderson.x_prev, TRI, D1, D2);      // the previous iterate lives in the history
+                anderson.reset(); anderson.depth = 0; anderson_active = false; have_prev = false;
                 relax = PICARD_RELAX; ++g_anderson_fallbacks;
                 if (verbose || std::getenv("LQG_ANDERSON_TRACE")) std::fprintf(stderr, "  [anderson %s at it=%d err=%.2e prev=%.2e] p=(%.3g,%.3g) r=(%g,%g) sigma=%g b=(%g,%g)\n", stalled ? "stalled" : "diverging", it, err, prev_err, p1_val, p2_val, g_r1, g_r2, g_sigma, g_b1, g_b2);
                 // the Picard update below acts on the restored iterate with a stale Hx,
@@ -1212,7 +1214,7 @@ static EquilibriumResult solve_equilibrium_core(
                 pack_kernels(D1, D2, TRI, xa);
                 fa.resize(6 * TRI);
                 for (int i = 0; i < TRI; ++i) { fa.segment<3>(3 * i) = neg_inv_r1 * Hx1.data[i] - D1.data[i]; fa.segment<3>(3 * (TRI + i)) = neg_inv_r2 * Hx2.data[i] - D2.data[i]; }
-                prev_D1 = D1; prev_D2 = D2; prev_err = err; have_prev = true; anderson.first_step = relax;
+                prev_err = err; have_prev = true; anderson.first_step = relax;
                 if (anderson.step(xa, fa)) { unpack_kernels(xa, TRI, D1, D2); anderson_active = true; continue; }
             }
         }
