@@ -239,6 +239,33 @@ array-of-structs lockstep pass (N=160 54 vs 55 ms, N=640 1.83 vs 1.86 s):
 the pass is bound by streaming the later levels' rows, not by the 3x3
 arithmetic, and the moment sums cost the same as nine separate dots.
 
+**Robustness** (stress grid: T in {1, 3}, r in {0.01, 0.05, 0.1, 0.5}, p in
+{0.1, 1, 10, 50}^2, sigma in {0.5, 1}, terminal weight in {0, 1}; 512 cases).
+For small effort cost r the best-response map -(1/r) Hx is far from a
+contraction at D = 0: a relaxed step overshoots, the closed loop grows like
+(1 + dt D)^N through the forward march, and the residual is non-finite within a
+few iterations -- the fixed point exists but is repelling under Picard, and its
+basin shrinks with r and with the horizon T (the sensitivity of the map grows
+like exp(gain T)).  Three layers now handle this:
+
+* non-finite residuals restore the last finite iterate and cut the relaxation
+  instead of aborting;
+* after 40 outer iterations without convergence the solve hands over to a
+  Jacobian-free Newton-Krylov engine (GMRES on finite-difference Jacobian
+  actions, one forward march + one backward pass each, backtracking line
+  search on |F|); from inside the basin it converges in a handful of steps
+  where Picard needed 1400 (`LQG_NEWTON=0` disables, `LQG_NEWTON_AFTER=k`);
+* a cold start that fails triggers continuation in r from 0.5 with warm
+  starts, ratio 0.7 per stage, bisecting a failed stage in log r
+  (`LQG_R_CONTINUATION=0` disables).
+
+Result at N=40: T=1 with r >= 0.05 solves all 64 cases each (r=0.05 failed 9
+before); r=0.01 at T=1 still fails 21/64, and T=3 with r <= 0.1 mostly fails
+-- those are outside the usable region (a diagnostic line is printed when a
+cold start fails and continuation is tried), and the dissertation's cases
+(T=1, r >= 0.05) are well inside it.  The benchmark and the whole figure sweep are
+unchanged by these layers (they converge before any of them engages).
+
 **Memory**: a single solve peaks at 15 MB (N=160), 60 MB (N=320), 173 MB
 (N=640), after storing Anderson's difference columns in single precision
 (they only feed the least-squares coefficients; sweep results move by <1e-10),

@@ -5,6 +5,7 @@
 // decomposition F[j][u][s] = border + sum_k Xtilde[k][u] * A[k][s]^T, A[k][s] = dt gain^2 Xtilde[k][s] (s < k).
 
 #include <cstdlib>
+#include <cstdio>
 #include <cstring>
 #include <Eigen/Dense>
 #ifdef _OPENMP
@@ -1182,6 +1183,8 @@ static EquilibriumResult solve_equilibrium_core(
     static const bool lockstep = [] { const char* e = std::getenv("LQG_BACKWARD_SECTIONS"); return !(e && std::atoi(e)); }();   // default: lockstep pair
     BackwardPlayer bp1, bp2;
     double best_err = std::numeric_limits<double>::infinity(); int since_best = 0;   // stagnation guard
+    int nonfinite_recoveries = 0;
+    static const int newton_after = [] { const char* e = std::getenv("LQG_NEWTON_AFTER"); return e ? std::atoi(e) : 40; }();   // switch to the Newton-Krylov engine after this many outer iterations (0 = never)
     constexpr int ANDERSON_STALL = 8;
 
     for (int it = 1; it <= MAX_PICARD_ITERS; ++it) {
@@ -1210,7 +1213,18 @@ static EquilibriumResult solve_equilibrium_core(
         double err = best_response_residual(D1, D2, Hx1, Hx2, TRI,
                                             neg_inv_r1, neg_inv_r2, anderson.depth > 0 ? &fa : nullptr);
         residuals.push_back(err);
-        if (!std::isfinite(err)) break;
+        if (!std::isfinite(err)) {
+            // the relaxed step overshot into overflow (small effort cost makes the best-response
+            // map -(1/r) Hx large): restore the last finite iterate and cut the relaxation
+            if (!have_prev && !anderson_active) { if (verbose) std::cout << "  non-finite residual at the start; giving up" << std::endl; break; }
+            if (anderson_active) unpack_kernels(anderson.x_prev, TRI, D1, D2); else { D1 = prev_D1; D2 = prev_D2; }
+            anderson.reset(); anderson.depth = 0; anderson_active = false; have_prev = false;
+            relax = std::max(PICARD_RELAX_MIN, 0.25 * relax); ++nonfinite_recoveries;
+            if (verbose) std::cout << "  non-finite residual; restored previous iterate, relax=" << relax << std::endl;
+            if (nonfinite_recoveries > 12) break;
+            // re-evaluate at the restored iterate on the next pass (its Hx is recomputed)
+            continue;
+        }
 
         if (verbose && (it <= 5 || it % 50 == 0))
             std::cout << "  it=" << it << "  resid=" << err
@@ -1222,6 +1236,7 @@ static EquilibriumResult solve_equilibrium_core(
         }
         if (it == MAX_PICARD_ITERS)
             break;
+        if (newton_after > 0 && it >= newton_after) break;   // hand over to the Newton-Krylov engine
 
         if (err < 0.98 * best_err) { best_err = err; since_best = 0; } else ++since_best;
         if (anderson.depth > 0 && err < ANDERSON_START) {
@@ -1253,6 +1268,75 @@ static EquilibriumResult solve_equilibrium_core(
                             neg_inv_r1, neg_inv_r2, relax);
     }
 
+    // ---- Newton-Krylov fallback ----
+    // The relaxed iteration (and Anderson on top of it) needs the best-response map
+    // to be a contraction; for small effort cost r the map -(1/r) Hx is large and the
+    // fixed point, though it exists, is unstable under Picard.  Solve F(x) = G(x) - x = 0
+    // by inexact Newton: GMRES on finite-difference Jacobian actions (one forward march
+    // plus one backward pass each), with a backtracking line search on |F|.
+    static const bool newton_enabled = [] { const char* e = std::getenv("LQG_NEWTON"); return !(e && std::atoi(e) == 0); }();
+    const bool converged_picard = !residuals.empty() && std::isfinite(residuals.back()) && residuals.back() < PICARD_TOL;
+    if (newton_enabled && !converged_picard) {
+        // start from the last finite iterate
+        if (!residuals.empty() && !std::isfinite(residuals.back())) { if (anderson_active) unpack_kernels(anderson.x_prev, TRI, D1, D2); else if (have_prev) { D1 = prev_D1; D2 = prev_D2; } }
+        const int dim = 6 * TRI;
+        const double neg_inv_r1 = -(1.0 / g_r1), neg_inv_r2 = -(1.0 / g_r2);
+        Eigen::VectorXd x(dim), F(dim), Fx(dim);
+        pack_kernels(D1, D2, TRI, x);
+        Kernel2D Dn1, Dn2;
+        // F(x) = G(x) - x with G = -(1/r) Hx(x); returns the relative residual, or NaN if the march overflows
+        auto evalF = [&](const Eigen::VectorXd& xv, Eigen::VectorXd& Fv) -> double {
+            unpack_kernels(xv, TRI, Dn1, Dn2);
+            forward_environment(Dn1, Dn2, p1_val, p2_val, FORWARD_INNER_ITERS, Pi_1, obs_idx_1, Pi_2, obs_idx_2, env);
+            bp1.Xt = &env.Xtilde2; bp1.Dk = &Dn2; bp1.prec = &prec2; bp1.gain = p2_val; bp1.obs = obs_idx_2; bp1.Hx = &Hx1;
+            bp2.Xt = &env.Xtilde1; bp2.Dk = &Dn1; bp2.prec = &prec1; bp2.gain = p1_val; bp2.obs = obs_idx_1; bp2.Hx = &Hx2;
+            backward_kernels_pair(env.X, bp1, bp2, g_terminal_weight);
+            return best_response_residual(Dn1, Dn2, Hx1, Hx2, TRI, neg_inv_r1, neg_inv_r2, &Fv);
+        };
+        double res = evalF(x, F);
+        if (verbose) std::cout << "  Newton-Krylov fallback from resid " << res << std::endl;
+        const int NEWTON_MAX = 40, GM = 30;
+        Eigen::VectorXd xt(dim), Ft(dim), v(dim), w(dim);
+        for (int nit = 0; nit < NEWTON_MAX && std::isfinite(res) && res >= PICARD_TOL; ++nit) {
+            // GMRES on J d = -F, J v ~ (F(x + eps v) - F(x)) / eps
+            const double xnorm = x.norm();
+            auto applyJ = [&](const Eigen::VectorXd& vv, Eigen::VectorXd& out) {
+                const double vn = vv.norm(); if (vn == 0.0) { out.setZero(); return; }
+                const double eps = 1e-7 * std::max(1.0, xnorm) / vn;
+                xt = x + eps * vv; evalF(xt, Ft); out = (Ft - F) / eps;
+            };
+            Eigen::VectorXd d = Eigen::VectorXd::Zero(dim), r0 = -F;
+            const double beta = r0.norm(), gm_tol = 1e-3 * beta;
+            Eigen::MatrixXd V(dim, GM + 1), H = Eigen::MatrixXd::Zero(GM + 1, GM);
+            Eigen::VectorXd g = Eigen::VectorXd::Zero(GM + 1); g[0] = beta; V.col(0) = r0 / beta;
+            std::vector<double> cs(GM), sn(GM); int k = 0;
+            for (; k < GM; ++k) {
+                applyJ(V.col(k), w);
+                if (!w.allFinite()) break;
+                for (int i2 = 0; i2 <= k; ++i2) { H(i2, k) = V.col(i2).dot(w); w -= H(i2, k) * V.col(i2); }
+                H(k + 1, k) = w.norm(); if (H(k + 1, k) > 1e-300) V.col(k + 1) = w / H(k + 1, k);
+                for (int i2 = 0; i2 < k; ++i2) { const double t = cs[i2] * H(i2, k) + sn[i2] * H(i2 + 1, k); H(i2 + 1, k) = -sn[i2] * H(i2, k) + cs[i2] * H(i2 + 1, k); H(i2, k) = t; }
+                const double den = std::hypot(H(k, k), H(k + 1, k)); cs[k] = H(k, k) / den; sn[k] = H(k + 1, k) / den; H(k, k) = den; H(k + 1, k) = 0.0;
+                g[k + 1] = -sn[k] * g[k]; g[k] = cs[k] * g[k];
+                if (std::fabs(g[k + 1]) < gm_tol) { ++k; break; }
+            }
+            if (k == 0) break;
+            const Eigen::VectorXd y = H.topLeftCorner(k, k).triangularView<Eigen::Upper>().solve(g.head(k));
+            d = V.leftCols(k) * y;
+            // backtracking line search on the residual (finite evaluations only)
+            double step = 1.0, res_new = std::numeric_limits<double>::quiet_NaN();
+            for (int ls = 0; ls < 12; ++ls) {
+                xt = x + step * d; res_new = evalF(xt, Ft);
+                if (std::isfinite(res_new) && res_new < (1.0 - 1e-4 * step) * res) break;
+                step *= 0.5;
+            }
+            if (!(std::isfinite(res_new) && res_new < res)) { if (verbose) std::cout << "  Newton: no descent; stopping" << std::endl; break; }
+            x = xt; F = Ft; res = res_new; residuals.push_back(res);
+            if (verbose) std::cout << "  Newton it=" << nit + 1 << " gmres " << k << " step " << step << " resid " << res << std::endl;
+        }
+        unpack_kernels(x, TRI, D1, D2);
+    }
+
     // Ensure the returned environment matches the final Picard iterate, including
     // the non-converged case where the loop exits immediately after an update.
     forward_environment(D1, D2, p1_val, p2_val, FORWARD_INNER_ITERS,
@@ -1272,6 +1356,10 @@ static EquilibriumResult solve_equilibrium_core(
     return {D1, D2, std::move(env), std::move(calD1), std::move(calD2), residuals};
 }
 
+static bool eq_converged(const EquilibriumResult& eq) {
+    return !eq.residuals.empty() && std::isfinite(eq.residuals.back()) && eq.residuals.back() < PICARD_TOL;
+}
+
 EquilibriumResult solve_equilibrium(
     double p1_val, double p2_val, bool verbose,
     const Mat3& Pi_1, int obs_idx_1,
@@ -1279,8 +1367,39 @@ EquilibriumResult solve_equilibrium(
     Kernel2D D1, D2;
     D1.setZero();
     D2.setZero();
-    return solve_equilibrium_core(p1_val, p2_val, std::move(D1), std::move(D2),
-                                  verbose, Pi_1, obs_idx_1, Pi_2, obs_idx_2);
+    EquilibriumResult eq = solve_equilibrium_core(p1_val, p2_val, D1, D2, verbose, Pi_1, obs_idx_1, Pi_2, obs_idx_2);
+    if (eq_converged(eq)) return eq;
+    // Diagnostic: the stiff regime is small effort cost over a long horizon (the map's
+    // sensitivity grows like exp(gain T)); dt/r summarises the grid side of it.
+    std::fprintf(stderr, "lqg_solver: cold start did not converge (N = %d, T = %g, r = (%g, %g), dt/r = %.2f); trying continuation in r\n",
+                 g_n, g_T, g_r1, g_r2, g_dt / std::min(g_r1, g_r2));
+    // Cold start failed (small effort cost: the best-response map is far from a contraction
+    // at D = 0).  Continuation in r from an easy problem, warm-starting each step.
+    static const bool cont_enabled = [] { const char* e = std::getenv("LQG_R_CONTINUATION"); return !(e && std::atoi(e) == 0); }();
+    const double r1 = g_r1, r2 = g_r2, rmin = std::min(r1, r2);
+    if (!cont_enabled || rmin >= 0.5) return eq;
+    if (verbose) std::cout << "  cold start did not converge; continuation in r from 0.5" << std::endl;
+    // Adaptive path: multiply r by `ratio` per stage; a failed stage is bisected in log r
+    // (up to 10 bisections), since the basin of the stiff fixed point shrinks with r and T.
+    double ratio = 0.7, f = 0.5 / rmin; int bisections = 0, stages = 0;
+    Kernel2D W1, W2; W1.setZero(); W2.setZero(); bool have = false;
+    double f_ok = std::numeric_limits<double>::infinity();     // last factor that converged
+    EquilibriumResult last = eq;
+    while (stages < 200) {
+        SolverContext ctx = SolverContext::capture_current(); ctx.r1 = r1 * f; ctx.r2 = r2 * f;
+        EquilibriumResult step;
+        { ScopedSolverContext guard(ctx); step = solve_equilibrium_core(p1_val, p2_val, W1, W2, verbose, Pi_1, obs_idx_1, Pi_2, obs_idx_2); }
+        ++stages;
+        if (verbose) std::cout << "  continuation r x " << f << ": " << (eq_converged(step) ? "ok" : "FAIL") << " in " << step.residuals.size() << std::endl;
+        if (!eq_converged(step)) {
+            if (!have || bisections >= 10) return step;          // even the easy problem failed, or the path is lost
+            ++bisections; f = std::sqrt(f * f_ok); continue;   // bisect in log r between the last success and this failure
+        }
+        W1 = step.D1; W2 = step.D2; have = true; f_ok = f; last = std::move(step);
+        if (f <= 1.0 + 1e-12) return last;
+        f = std::max(1.0, f * ratio);
+    }
+    return last;
 }
 
 EquilibriumResult solve_equilibrium_warm(
