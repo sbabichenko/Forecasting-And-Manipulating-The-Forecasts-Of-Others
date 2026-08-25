@@ -1058,12 +1058,20 @@ BarSolution solve_bar_equilibrium(
     Eigen::VectorXd c; apply_F(Eigen::VectorXd::Zero(dim), c, nullptr);
     auto apply_M = [&](const Eigen::VectorXd& d, Eigen::VectorXd& out) { apply_F(d, out, nullptr); out = d - (out - c); };
 
-    // GMRES(m) with modified Gram-Schmidt; the system is small (dim <= 2 N_MAX)
     Eigen::VectorXd d = Eigen::VectorXd::Zero(dim);
-    const int m = std::min(dim, 60);
     double last_err = 1e30;
     const double bnorm = std::max(1e-300, c.norm());
-    for (int restart = 0; restart < 20; ++restart) {
+    static const int dense_max = [] { const char* e = std::getenv("LQG_BAR_DENSE_MAX"); return e ? std::atoi(e) : 1600; }();
+    if (dim <= dense_max) {
+        // Direct solve: build I - L column by column (2N applications of the affine map, each a
+        // pair of backward bar adjoints) and factor.  Robust when the effort cost is small and
+        // the map is far from a contraction, where restarted GMRES can stagnate.
+        Eigen::MatrixXd Mtx(dim, dim); Eigen::VectorXd col;
+        for (int k = 0; k < dim; ++k) { Eigen::VectorXd e = Eigen::VectorXd::Unit(dim, k); apply_M(e, col); Mtx.col(k) = col; }
+        d = Mtx.partialPivLu().solve(c);
+    } else
+    // GMRES(m) with modified Gram-Schmidt for large N
+    for (int restart = 0, m = std::min(dim, 60); restart < 20; ++restart) {
         Eigen::VectorXd r; apply_M(d, r); r = c - r;
         double beta = r.norm();
         if (beta / bnorm < 1e-14) break;
