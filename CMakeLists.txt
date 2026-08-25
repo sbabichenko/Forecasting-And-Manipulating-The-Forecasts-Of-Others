@@ -59,6 +59,9 @@ add_executable(benchmark
 )
 target_link_libraries(benchmark PRIVATE Eigen3::Eigen)
 target_compile_options(benchmark PRIVATE -O3 -march=native -Wall -Wextra)
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(benchmark PRIVATE OpenMP::OpenMP_CXX)
+endif()
 
 add_executable(test_exact_ce
     test_exact_ce.cpp

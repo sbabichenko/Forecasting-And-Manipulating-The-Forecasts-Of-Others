@@ -307,14 +307,26 @@ the recursion lost at r = 0.0067, now continues smoothly to r = 0.002
 (max |calD1| growing 3.5 -> 8.9, no initial-time layer).  Note that D itself
 is now determined only up to the components outside the information space
 (the projection annihilates them), so compare calD and X between runs, not D.
-The sweep costs about one forward march: per row and player one 4-column
-transposed product V^T [cbar, D, h, ubar] (V^T vbar = V^T ubar / |v| since
-V^T u = 0), one 1--2 column product, and the four rank-one updates of Vbar
-batched into one rank-4m product every m = 8 rows (`LQG_ADJ_BATCH`), the
+The sweep is organized as four roles (player a's adjoint through player q's
+basis), each with its own basis adjoint Vbar, run on a team of up to four
+threads in lockstep with one barrier per row (the two roles of a player merge
+their Gram--Schmidt contributions to Xbar[j] there).  Per row and role: the
+transposed product V^T [cbar, ubar] (V^T D[j], V^T h and |v| are stored by the
+march; V^T vbar = V^T ubar / |v| since V^T u = 0), the product V [V^T cbar,
+V^T vbar] for the gradient and hbar, both hand-coded as per-column dots /
+axpy's (Eigen's narrow GEMM is 2-3x slower), and the four rank-one updates of
+Vbar batched into one rank-4m product every m = 8 rows (`LQG_ADJ_BATCH`), the
 column a row needs in between read lazily from Vbar plus the pending block.
-A solve with the exact adjoint takes about 1.35x the time of one with the
-recursion (measured under load at N=160: 204 vs 150 ms, 15 vs 16 iterations;
-the unbatched sweep was 1.7x).  The figure pipeline at N=157 takes 63 s.
+Each product is one pass over the 600 KB basis (N=160) and is bound by that
+traffic, not by arithmetic, which is why the parallel roles pay off:
+per sweep and thread 0.5 ms (V^T), 0.3-0.65 ms (V), 0.6 ms (flush).
+Solve times, 8 threads (`benchmark`): N=160 65-70 ms exact vs 48 ms with the
+recursion, N=320 0.51 vs 0.39 s, N=40 unchanged (was 107 ms at N=160 before the
+roles and the stored coefficients; the unbatched sweep 129 ms).
+`LQG_ADJ_REF=1` selects the plain per-player sweep kept for verification
+(results agree to 1e-12).  The figure pipeline at N=157 takes 63 s.
+Note: the cmake `benchmark` target had not been linked against OpenMP, so its
+earlier printed timings were single-threaded; fixed.
 
 **Stationarity check** (`test_stationarity N p1 p2 r`): finite differences of the
 discrete cost with respect to single entries of player 1's kernel, with player
