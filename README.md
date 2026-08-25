@@ -223,10 +223,20 @@ The equilibrium is found by a three-level nested iteration:
    strided column access; Anderson keeps its difference columns and Gram
    matrix incrementally.  Bit-identical results.
 
-Timings for the (3,3) benchmark solve (two threads): N=40 3 ms, N=160 60 ms
-(was 27 ms and 1.4 s before the exact march, Hk-free adjoints, Anderson and
-vectorization).  The full figure pipeline at N=40 takes 1.1 s (was 8 s),
-N=157 about 30 s (was 6 min).
+7. **Threads**: the two players' backward passes run in lockstep inside one
+   parallel region (two worksharing loops per level, so every thread has
+   work); above N = 400 the forward march is workshared the same way (below
+   that, per-row barriers cost more than they save and the two-thread pair
+   march is used).  `N_MAX` is 640.  Inside the figure driver's parallel
+   pre-solve these regions collapse to one thread per solve, as before.
+   `LQG_BACKWARD_SECTIONS=1` / `LQG_FORWARD_PAIR=1` select the two-thread
+   variants.
+
+Timings for the (3,3) benchmark solve, 8 threads: N=40 3 ms, N=160 55 ms,
+N=320 0.4 s, N=640 1.9 s (N=160 was 1.4 s before the exact march, Hk-free
+adjoints, Anderson, vectorization and threading; N > 160 was not possible).
+The full figure pipeline at N=40 takes 1.0 s (was 8 s), N=157 about 30 s
+(was 6 min).
 
 After the kernel equilibrium converges, the mean-field trajectory
 (`solve_bar_equilibrium`) is obtained by solving the affine system for the

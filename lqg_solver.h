@@ -14,7 +14,7 @@
 #include <vector>
 
 // ---------- compile-time maximum ----------
-constexpr int N_MAX = 160;
+constexpr int N_MAX = 640;
 constexpr int D_W = 3;
 
 // Legacy 3D kernel max — kept small to avoid 160^3 * 72 B memory usage.

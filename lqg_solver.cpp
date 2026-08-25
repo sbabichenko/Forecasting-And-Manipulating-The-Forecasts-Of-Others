@@ -12,6 +12,7 @@
 static inline int omp_get_thread_num() { return 0; }
 static inline int omp_get_num_threads() { return 1; }
 static inline int omp_in_parallel() { return 0; }
+static inline int omp_get_max_threads() { return 1; }
 #endif
 #include "lqg_solver.h"
 #include <algorithm>
@@ -139,6 +140,96 @@ static void filter_row(int j,
 
     const double dt_prec = g_dt * prec;
     Flat(A_store[j][0].data(), 3 * j) = dt_prec * FlatC(Xtilde[j][0].data(), 3 * j);
+}
+
+// Worksharing versions of the row functions: called by every thread of the
+// enclosing parallel team for the same (j, player).  The k-loops (dot products)
+// are shared; the row accumulation q[s] = sum_k alpha_k Xtilde[k][s] is done as
+// per-thread partials over k-chunks reduced under a critical section.  Same
+// arithmetic as filter_row/control_row up to summation order.
+struct RowScratch { std::array<double, N_MAX> c; std::array<Vec3, N_MAX> q; };
+static void filter_row_ws(int j,
+    const Kernel2D& X, const Mat3& Pi, int obs_index,
+    double obs_gain_val, Kernel2D& Xtilde, Kernel2D& A_store, RowScratch& sc) {
+    const Mat3 I_minus_Pi = Mat3::Identity() - Pi;
+    const double g = obs_gain_val, prec = g * g, dt2_prec = g_dt * g_dt * prec;
+    if (j == 0) {
+        #pragma omp single
+        { Xtilde[0][0] = I_minus_Pi * X[0][0]; A_store[0][0].setZero(); }
+        return;
+    }
+    using FlatC = Eigen::Map<const Eigen::VectorXd>;
+    using Flat = Eigen::Map<Eigen::VectorXd>;
+    const double* xj = X[j][0].data();
+    #pragma omp for schedule(static) nowait
+    for (int k = 0; k < j; ++k) {
+        const double* xk = Xtilde[k][0].data();
+        sc.c[k] = (k > 0 ? FlatC(xk, 3 * k).dot(FlatC(xj, 3 * k)) : 0.0) + Xtilde[k][k].dot(X[j][k]);
+    }
+    #pragma omp single
+    Flat(sc.q[0].data(), 3 * j).setZero();
+    // implicit barrier: c complete, q zeroed
+    {
+        std::array<Vec3, N_MAX> ql; Flat qlf(ql[0].data(), 3 * j); qlf.setZero(); bool any = false;
+        #pragma omp for schedule(static) nowait
+        for (int k = 1; k < j; ++k) {
+            const double alpha = dt2_prec * sc.c[k] + g_dt * g * X[j][k](obs_index);
+            qlf.head(3 * k) += alpha * FlatC(Xtilde[k][0].data(), 3 * k); any = true;
+        }
+        if (any) {
+            #pragma omp critical(row_reduce)
+            Flat(sc.q[0].data(), 3 * j) += qlf;
+        }
+    }
+    #pragma omp barrier
+    #pragma omp for schedule(static)
+    for (int s = 0; s < j; ++s)
+        Xtilde[j][s] = I_minus_Pi * X[j][s] - (dt2_prec * sc.c[s] * Xtilde[s][s] + sc.q[s]);
+    #pragma omp single
+    {
+        Xtilde[j][j] = I_minus_Pi * X[j][j];
+        const double sigma_minus = g_dt * FlatC(Xtilde[j][0].data(), 3 * j).squaredNorm();
+        const double scale = 1.0 / (1.0 + g_dt * prec * sigma_minus);
+        Flat(Xtilde[j][0].data(), 3 * (j + 1)) *= scale;
+        Flat(A_store[j][0].data(), 3 * j) = (g_dt * prec) * FlatC(Xtilde[j][0].data(), 3 * j);
+    }
+}
+static void control_row_ws(int j,
+    const Kernel2D& D, const Kernel2D& Xtilde,
+    double obs_gain_val, int obs_index, const Mat3& Pi, Kernel2D& calD, RowScratch& sc) {
+    Vec3 e_i = Vec3::Zero(); e_i(obs_index) = 1.0;
+    const double g = obs_gain_val, DT_g = g_dt * g, dt_prec = g_dt * g * g;
+    if (j == 0) {
+        #pragma omp single
+        calD[0][0].setZero();
+        return;
+    }
+    using FlatC = Eigen::Map<const Eigen::VectorXd>;
+    using Flat = Eigen::Map<Eigen::VectorXd>;
+    const double* dj = D[j][0].data();
+    #pragma omp for schedule(static) nowait
+    for (int k = 1; k <= j; ++k) sc.c[k] = FlatC(Xtilde[k][0].data(), 3 * k).dot(FlatC(dj, 3 * k));
+    #pragma omp single
+    { sc.c[0] = 0.0; Flat(sc.q[0].data(), 3 * j).setZero(); }
+    {
+        std::array<Vec3, N_MAX> ql; Flat qlf(ql[0].data(), 3 * j); qlf.setZero(); bool any = false;
+        #pragma omp for schedule(static) nowait
+        for (int k = 1; k <= j; ++k) {
+            const double beta = DT_g * D[j][k](obs_index) + g_dt * sc.c[k] * dt_prec;
+            const int len = 3 * std::min(k, j);
+            qlf.head(len) += beta * FlatC(Xtilde[k][0].data(), len); any = true;
+        }
+        if (any) {
+            #pragma omp critical(row_reduce)
+            Flat(sc.q[0].data(), 3 * j) += qlf;
+        }
+    }
+    #pragma omp barrier
+    #pragma omp for schedule(static)
+    for (int s = 0; s < j; ++s)
+        calD[j][s] = Pi * D[j][s] + sc.q[s] + DT_g * sc.c[s] * e_i;
+    #pragma omp single
+    { calD[j][j] = Pi * D[j][j] + DT_g * sc.c[j] * e_i; calD[j][0](obs_index) = 0.0; }
 }
 
 static void compute_filter_kernels(
@@ -409,6 +500,30 @@ void forward_environment(
         Kernel2D X, calD1, calD2;
         X.setZero(); calD1.setZero(); calD2.setZero();
         const Vec3 sigE0 = g_sigma * E0();
+        static const bool ws_march = [] { const char* e = std::getenv("LQG_FORWARD_PAIR"); return !(e && std::atoi(e)); }();
+        if (ws_march && g_n >= 400 && !omp_in_parallel() && omp_get_max_threads() > 2) {   // per-row barriers only pay off for large N
+            // Worksharing march: all threads work on the same row j of both players.
+            static RowScratch sc1, sc2;     // shared scratch per player (one march at a time at top level)
+            #pragma omp parallel
+            {
+                for (int j = 0; j < g_n; ++j) {
+                    #pragma omp single
+                    {
+                        X[j][j] = sigE0;
+                        for (int s = 0; s < j; ++s)
+                            X[j][s] = X[j - 1][s] + g_dt * (calD1[j - 1][s] + calD2[j - 1][s]);
+                    }
+                    filter_row_ws(j, X, Pi_1, obs_idx_1, obs_gain1, env.Xtilde1, env.A_store1, sc1);
+                    filter_row_ws(j, X, Pi_2, obs_idx_2, obs_gain2, env.Xtilde2, env.A_store2, sc2);
+                    control_row_ws(j, D1, env.Xtilde1, obs_gain1, obs_idx_1, Pi_1, calD1, sc1);
+                    control_row_ws(j, D2, env.Xtilde2, obs_gain2, obs_idx_2, Pi_2, calD2, sc2);
+                }
+            }
+            env.X = X;
+            env.obs_gain1 = obs_gain1; env.obs_gain2 = obs_gain2;
+            env.obs_idx1 = obs_idx_1; env.obs_idx2 = obs_idx_2;
+            return;
+        }
         // One two-thread region for the whole march (a region per row would be
         // spawned thousands of times inside the parallel pre-solve); the two
         // players' rows are independent given row j of X.
@@ -589,6 +704,62 @@ void backward_kernels(const Kernel2D& X, const Kernel2D& Xtildek,
         }
         for (int r = 0; r <= j; ++r)
             Hx[j][r] = Hx[tp][r] + g_dt * (X[tp][r] + W[r]);
+    }
+}
+
+// Both players' backward adjoints in lockstep inside one parallel region:
+// the two recursions run over the same levels, so each level is two
+// worksharing loops (moments over (player, t2); then accumulation, W and the
+// new Hx row over (player, r)) with an implicit barrier each.  Same arithmetic
+// as backward_kernels; results identical.
+struct BackwardPlayer {
+    const Kernel2D* Xt; const Kernel2D* Dk; const std::array<double, N_MAX>* prec; double gain; int obs; Kernel2D* Hx;
+    std::vector<Vec3> W;            // W[t][r], row-major t * n + r
+    std::vector<Mat3> M; std::vector<double> pv;
+};
+void backward_kernels_pair(const Kernel2D& X, BackwardPlayer& P1, BackwardPlayer& P2, double terminal_state_weight) {
+    const int n = g_n;
+    BackwardPlayer* P[2] = {&P1, &P2};
+    for (int q = 0; q < 2; ++q) {
+        BackwardPlayer& p = *P[q];
+        p.Hx->setZero();
+        for (int s = 0; s < n; ++s) (*p.Hx)[n - 1][s] = terminal_state_weight * X[n - 1][s];
+        if (static_cast<int>(p.W.size()) < n * n) p.W.resize(n * n);
+        if (static_cast<int>(p.M.size()) < n) { p.M.resize(n); p.pv.resize(n); }
+    }
+    using FlatC = Eigen::Map<const Eigen::VectorXd>;
+    #pragma omp parallel if (!omp_in_parallel())
+    {
+        for (int j = n - 2; j >= 0; --j) {
+            const int tp = j + 1, len = tp + 1, nt2 = n - tp - 1;
+            // moments of the later levels against Xtilde[tp][.], both players
+            #pragma omp for schedule(static)
+            for (int q = 0; q < 2 * nt2; ++q) {
+                BackwardPlayer& p = *P[q / nt2]; const int t2 = tp + 1 + q % nt2;
+                const Kernel2D& Hx = *p.Hx; const Kernel2D& Xt = *p.Xt;
+                Mat3 Mm = Mat3::Zero();
+                const Vec3* hxrow = &Hx[t2][0]; const Vec3* xtrow = &Xt[tp][0];
+                for (int z = 0; z < len; ++z) Mm.noalias() += hxrow[z] * xtrow[z].transpose();
+                p.M[t2] = Mm;
+                p.pv[t2] = FlatC(X[t2][0].data(), 3 * len).dot(FlatC(Xt[tp][0].data(), 3 * len));
+            }
+            // accumulation, W[tp][r] and the new row Hx[j][r], both players
+            #pragma omp for schedule(static)
+            for (int q = 0; q < 2 * (j + 1); ++q) {
+                BackwardPlayer& p = *P[q / (j + 1)]; const int r = q % (j + 1);
+                Kernel2D& Hx = *p.Hx; const Kernel2D& Dk = *p.Dk;
+                Vec3 acc = Vec3::Zero(), diag = Vec3::Zero();
+                for (int t2 = tp + 1; t2 < n; ++t2) {
+                    const Vec3& d = Dk[t2][r]; const Vec3& w = p.W[t2 * n + r];
+                    acc.noalias() += p.M[t2] * d; acc -= p.pv[t2] * w;
+                    diag += Hx[t2][tp] * d(p.obs) - w * X[t2][tp](p.obs);
+                }
+                const double Pk = (*p.prec)[tp];
+                const Vec3 Wr = p.gain * g_dt * diag + g_dt * Pk * g_dt * acc;
+                p.W[tp * n + r] = Wr;
+                Hx[j][r] = Hx[tp][r] + g_dt * (X[tp][r] + Wr);
+            }
+        }
     }
 }
 
@@ -979,6 +1150,8 @@ static EquilibriumResult solve_equilibrium_core(
     static const double ANDERSON_START = [] { const char* e = std::getenv("LQG_ANDERSON_START"); return e ? std::atof(e) : 0.5; }(); const double ANDERSON_GROWTH = anderson.growth;
     Eigen::VectorXd xa, fa;
     bool anderson_active = false;
+    static const bool lockstep = [] { const char* e = std::getenv("LQG_BACKWARD_SECTIONS"); return !(e && std::atoi(e)); }();   // default: lockstep pair
+    BackwardPlayer bp1, bp2;
     double best_err = std::numeric_limits<double>::infinity(); int since_best = 0;   // stagnation guard
     constexpr int ANDERSON_STALL = 8;
 
@@ -986,6 +1159,11 @@ static EquilibriumResult solve_equilibrium_core(
         forward_environment(D1, D2, p1_val, p2_val, FORWARD_INNER_ITERS,
                             Pi_1, obs_idx_1, Pi_2, obs_idx_2, env);
 
+        if (lockstep) {
+            bp1.Xt = &env.Xtilde2; bp1.Dk = &D2; bp1.prec = &prec2; bp1.gain = p2_val; bp1.obs = obs_idx_2; bp1.Hx = &Hx1;
+            bp2.Xt = &env.Xtilde1; bp2.Dk = &D1; bp2.prec = &prec1; bp2.gain = p1_val; bp2.obs = obs_idx_1; bp2.Hx = &Hx2;
+            backward_kernels_pair(env.X, bp1, bp2, g_terminal_weight);
+        } else {
         #pragma omp parallel sections num_threads(2)
         {
             #pragma omp section
@@ -994,6 +1172,7 @@ static EquilibriumResult solve_equilibrium_core(
             #pragma omp section
             backward_kernels(env.X, env.Xtilde1, D1, prec1,
                              p1_val, obs_idx_1, g_terminal_weight, Hx2);
+        }
         }
 
         // Compute G = -(1/r_k)*Hx and residual F = G - D
