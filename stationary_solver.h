@@ -43,10 +43,6 @@ struct StationaryParams {
     int anderson_depth = 0;
     double anderson_mixing = 0.6;
 
-    // Forward Gram solves: false = dense Cholesky with refinement cache,
-    // true = FFT-based PCG with a Strang circulant preconditioner.
-    bool circulant_cg = false;
-
     // Optional warm start: policy kernels sampled on init_lag (one-sided lags,
     // ascending). When non-empty, linearly interpolated onto the solver grid in
     // place of the closed-form certainty-equivalent initialization.

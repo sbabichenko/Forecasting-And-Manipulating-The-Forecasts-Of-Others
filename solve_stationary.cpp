@@ -129,7 +129,7 @@ int main(int argc, char* argv[]) {
             }
         }
         else if (std::strcmp(argv[i], "--pcg") == 0)
-            p.circulant_cg = true;
+            ;   // accepted for old command lines; the FFT/PCG projection is now the only path
         else if (std::strcmp(argv[i], "--anderson") == 0 && i + 1 < argc)
             p.anderson_depth = std::atoi(argv[++i]);
         else if (std::strcmp(argv[i], "--anderson-mixing") == 0 && i + 1 < argc)

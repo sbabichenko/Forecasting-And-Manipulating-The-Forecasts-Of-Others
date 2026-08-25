@@ -231,11 +231,6 @@ static FilterProjection project_stationary_filter(
     return out;
 }
 
-struct LLTCache {
-    Eigen::LLT<Eigen::MatrixXd> llt;
-    bool valid = false;
-};
-
 // FFT workspace for one observer's Toeplitz-structured projection solve.
 // Correlations with the drift kernel xm are applied spectrally, and the
 // Gram solve runs as PCG with a Strang circulant preconditioner.
@@ -358,30 +353,6 @@ struct SpectralObserver {
     }
 };
 
-// Solve G Y = B with the cached Cholesky factor plus iterative refinement
-// against the current G; refactor only when refinement cannot reach tolerance.
-static Eigen::MatrixXd cached_spd_solve(LLTCache& c, const Eigen::MatrixXd& G,
-                                        const Eigen::MatrixXd& B) {
-    const double bn = B.norm() + 1e-300;
-    if (c.valid) {
-        Eigen::MatrixXd Y = c.llt.solve(B);
-        double prev = std::numeric_limits<double>::infinity();
-        for (int ref = 0; ref < 10; ++ref) {
-            const Eigen::MatrixXd R = B - G * Y;
-            const double rn = R.norm();
-            if (rn < 1e-9 * bn)
-                return Y;
-            if (rn > 0.3 * prev)
-                break;                      // stalled: factor too stale
-            prev = rn;
-            Y += c.llt.solve(R);
-        }
-    }
-    c.llt.compute(G);
-    c.valid = true;
-    return c.llt.solve(B);
-}
-
 // Exact forward block: each observer's filter is computed as an exact
 // orthogonal projection of the stacked shock vector onto the discrete signal
 // window (one SPD solve), instead of Picard-iterating the quadratic filter
@@ -391,8 +362,7 @@ static Eigen::MatrixXd cached_spd_solve(LLTCache& c, const Eigen::MatrixXd& G,
 static ForwardBlock solve_forward_block_exact(
     const StationaryGrid& grid, const StationaryParams& p,
     const std::vector<Vec3>& d1, const std::vector<Vec3>& d2,
-    const std::vector<Vec3>* x_init = nullptr,
-    LLTCache* fc1 = nullptr, LLTCache* fc2 = nullptr) {
+    const std::vector<Vec3>* x_init = nullptr) {
 
     const int n = grid.n;
     const int N3 = 3 * n;
@@ -425,137 +395,50 @@ static ForwardBlock solve_forward_block_exact(
 
     const Eigen::VectorXd d1s = stack(d1), d2s = stack(d2);
     Eigen::VectorXd xhat1s(N3), xhat2s(N3), c1s(N3), c2s(N3);
-    LLTCache local1, local2;
-    LLTCache& llt_c1 = fc1 ? *fc1 : local1;
-    LLTCache& llt_c2 = fc2 ? *fc2 : local2;
     double x_gam = 1.0;
     double x_best = std::numeric_limits<double>::infinity();
 
-    // Toeplitz-structured projection: the Gram matrix G = H H^T is Toeplitz
-    // in |j - j'| up to a window-truncation correction with closed form, so
-    // it is assembled in O(n^2) from prefix sums and H, H^T are applied as
-    // correlations -- the observation matrix is never materialized.
+    // Projection onto each observer's signal window: the Gram matrix H H^T is
+    // Toeplitz up to a truncation correction, so H and H^T are applied as
+    // correlations by FFT and the Gram solve is PCG with a circulant
+    // preconditioner (SpectralObserver); nothing n x n is materialized.
     std::vector<Vec3> xm(n, Vec3::Zero());
-    Eigen::MatrixXd C(p.circulant_cg ? 0 : n, p.circulant_cg ? 0 : n);   // C(delta, q) = sum_{m<=q} xm(m+delta).xm(m)
-    auto gram = [&](double gain, int chan) {
-        Eigen::MatrixXd G(n, n);
-        const double gh = gain * h;
-        const double g2h2 = gh * gh;
-        for (int j = 0; j < n; ++j) {
-            for (int jp = j; jp < n; ++jp) {
-                const int delta = jp - j;
-                const int q = n - 2 - jp;
-                double v = g2h2 * (q >= 0 ? C(delta, q) : 0.0);
-                if (delta == 0)
-                    v += 1.0 + 1e-12;
-                else
-                    v += gh * xm[delta - 1](chan);
-                G(j, jp) = v;
-                G(jp, j) = v;
-            }
-        }
-        return G;
-    };
-    auto apply_H = [&](double gain, int chan, const Eigen::VectorXd& s) {
-        Eigen::VectorXd y(n);
-        const double gh = gain * h;
-        for (int j = 0; j < n; ++j) {
-            double acc = s[3 * j + chan];
-            for (int k = j + 1; k < n; ++k)
-                acc += gh * (xm[k - j - 1](0) * s[3 * k] +
-                             xm[k - j - 1](1) * s[3 * k + 1] +
-                             xm[k - j - 1](2) * s[3 * k + 2]);
-            y[j] = acc;
-        }
-        return y;
-    };
-    auto apply_Ht = [&](double gain, int chan, const Eigen::VectorXd& z) {
-        Eigen::VectorXd s = Eigen::VectorXd::Zero(N3);
-        const double gh = gain * h;
-        for (int k = 0; k < n; ++k) {
-            s[3 * k + chan] += z[k];
-            Vec3 acc = Vec3::Zero();
-            for (int j = 0; j < k; ++j)
-                acc += z[j] * xm[k - j - 1];
-            s.segment<3>(3 * k) += gh * acc;
-        }
-        return s;
-    };
 
     for (int it = 0; it < p.forward_iters; ++it) {
         for (int i = 0; i + 1 < n; ++i)
             xm[i] = 0.5 * (fwd.x[i] + fwd.x[i + 1]);
         xm[n - 1].setZero();
         Eigen::VectorXd cvec = Eigen::VectorXd::Zero(n);
-        if (p.circulant_cg) {
-            // Only the full-range sums C(delta, n-2-delta) enter the
-            // circulant preconditioner, so skip the n x n running-sum table.
-            // Autocorrelation of xm over m = 0..n-2 by FFT.
-            int M2 = 1; while (M2 < 2 * n) M2 <<= 1;
-            Eigen::FFT<double> afft;
-            Eigen::VectorXcd acc = Eigen::VectorXcd::Zero(M2);
-            std::vector<double> abuf(M2, 0.0);
-            std::vector<std::complex<double>> aout(M2);
-            for (int ch = 0; ch < 3; ++ch) {
-                std::fill(abuf.begin(), abuf.end(), 0.0);
-                for (int m = 0; m <= n - 2; ++m) abuf[m] = xm[m](ch);
-                afft.fwd(aout, abuf);
-                Eigen::Map<Eigen::VectorXcd> A(aout.data(), M2);
-                acc.array() += (A.conjugate().array() * A.array());
-            }
-            std::vector<std::complex<double>> ain(acc.data(), acc.data() + M2);
-            std::vector<double> ares(M2);
-            afft.inv(ares, ain);
-            for (int delta = 0; delta < n; ++delta) cvec[delta] = ares[delta];
-        } else {
-            for (int delta = 0; delta < n; ++delta) {
-                double run = 0.0;
-                for (int m = 0; m < n; ++m) {
-                    if (m + delta <= n - 2 && m <= n - 2)
-                        run += xm[m + delta].dot(xm[m]);
-                    C(delta, m) = run;
-                }
-            }
+        // Autocorrelation of xm over m = 0..n-2 by FFT.
+        int M2 = 1; while (M2 < 2 * n) M2 <<= 1;
+        Eigen::FFT<double> afft;
+        Eigen::VectorXcd acc = Eigen::VectorXcd::Zero(M2);
+        std::vector<double> abuf(M2, 0.0);
+        std::vector<std::complex<double>> aout(M2);
+        for (int ch = 0; ch < 3; ++ch) {
+            std::fill(abuf.begin(), abuf.end(), 0.0);
+            for (int m = 0; m <= n - 2; ++m) abuf[m] = xm[m](ch);
+            afft.fwd(aout, abuf);
+            Eigen::Map<Eigen::VectorXcd> A(aout.data(), M2);
+            acc.array() += (A.conjugate().array() * A.array());
         }
+        std::vector<std::complex<double>> ain(acc.data(), acc.data() + M2);
+        std::vector<double> ares(M2);
+        afft.inv(ares, ain);
+        for (int delta = 0; delta < n; ++delta) cvec[delta] = ares[delta];
         const Eigen::VectorXd xs = stack(fwd.x);
-        if (p.circulant_cg) {
-            // Four independent projection solves (two observers x two
-            // right-hand sides), run concurrently.
-            Eigen::VectorXd ys[4];
+        // Four independent projection solves (two observers x two
+        // right-hand sides), run concurrently.
+        Eigen::VectorXd ys[4];
 #pragma omp parallel for schedule(static) if (n >= 64)
-            for (int task = 0; task < 4; ++task) {
-                const int obs = task / 2;
-                SpectralObserver so;
-                so.prepare(xm, obs == 0 ? g1 : g2, h, obs == 0 ? 1 : 2, cvec);
-                const Eigen::VectorXd& rhs = (task % 2 == 0) ? xs : (obs == 0 ? d1s : d2s);
-                ys[task] = so.applyHt(so.pcg(so.applyH(rhs), 300, 1e-10));
-            }
-            xhat1s = ys[0]; c1s = ys[1]; xhat2s = ys[2]; c2s = ys[3];
-        } else {
-#pragma omp parallel sections if (n >= 64)
-            {
-#pragma omp section
-                {
-                    const Eigen::MatrixXd G1 = gram(g1, 1);
-                    Eigen::MatrixXd B(n, 2);
-                    B.col(0) = apply_H(g1, 1, xs);
-                    B.col(1) = apply_H(g1, 1, d1s);
-                    const Eigen::MatrixXd Y = cached_spd_solve(llt_c1, G1, B);
-                    xhat1s = apply_Ht(g1, 1, Y.col(0));
-                    c1s = apply_Ht(g1, 1, Y.col(1));
-                }
-#pragma omp section
-                {
-                    const Eigen::MatrixXd G2 = gram(g2, 2);
-                    Eigen::MatrixXd B(n, 2);
-                    B.col(0) = apply_H(g2, 2, xs);
-                    B.col(1) = apply_H(g2, 2, d2s);
-                    const Eigen::MatrixXd Y = cached_spd_solve(llt_c2, G2, B);
-                    xhat2s = apply_Ht(g2, 2, Y.col(0));
-                    c2s = apply_Ht(g2, 2, Y.col(1));
-                }
-            }
+        for (int task = 0; task < 4; ++task) {
+            const int obs = task / 2;
+            SpectralObserver so;
+            so.prepare(xm, obs == 0 ? g1 : g2, h, obs == 0 ? 1 : 2, cvec);
+            const Eigen::VectorXd& rhs = (task % 2 == 0) ? xs : (obs == 0 ? d1s : d2s);
+            ys[task] = so.applyHt(so.pcg(so.applyH(rhs), 300, 1e-10));
         }
+        xhat1s = ys[0]; c1s = ys[1]; xhat2s = ys[2]; c2s = ys[3];
 
         std::vector<Vec3> c1_new = unstack(c1s);
         std::vector<Vec3> c2_new = unstack(c2s);
@@ -590,11 +473,10 @@ static ForwardBlock solve_forward_block_exact(
 static ForwardBlock solve_forward_block(
     const StationaryGrid& grid, const StationaryParams& p,
     const std::vector<Vec3>& d1, const std::vector<Vec3>& d2,
-    const std::vector<Vec3>* x_init = nullptr,
-    LLTCache* fc1 = nullptr, LLTCache* fc2 = nullptr) {
+    const std::vector<Vec3>* x_init = nullptr) {
 
     if (p.exact_forward)
-        return solve_forward_block_exact(grid, p, d1, d2, x_init, fc1, fc2);
+        return solve_forward_block_exact(grid, p, d1, d2, x_init);
 
     ForwardBlock fwd;
     fwd.x.assign(grid.n, Vec3::Zero());
@@ -1003,7 +885,6 @@ StationarySolution solve_stationary(const StationaryParams& params, bool verbose
 
     std::vector<Vec3> x_warm;                     // forward warm start (exact mode)
     FactorCache bwd_cache1, bwd_cache2;
-    LLTCache fwd_cache1, fwd_cache2;
     const int zdim = 6 * grid.n;                  // Anderson state: stacked (d1, d2)
     const int adepth = std::max(0, p.anderson_depth);
     Eigen::MatrixXd aa_dZ(zdim, std::max(1, adepth)), aa_dF(zdim, std::max(1, adepth));
@@ -1043,8 +924,7 @@ StationarySolution solve_stationary(const StationaryParams& params, bool verbose
         if (p.inexact_forward && std::isfinite(outer_prev) && outer_prev > 10.0 * p.tol)
             pf.forward_tol = std::max(p.forward_tol, std::min(1e-3, 1e-2 * outer_prev));
         fwd = solve_forward_block(grid, pf, d1, d2,
-                                  x_warm.empty() ? nullptr : &x_warm,
-                                  &fwd_cache1, &fwd_cache2);
+                                  x_warm.empty() ? nullptr : &x_warm);
         const auto t1 = tick();
 #pragma omp parallel sections if (grid.n >= 64)
         {
@@ -1119,7 +999,7 @@ StationarySolution solve_stationary(const StationaryParams& params, bool verbose
             auto residual_at = [&](const Eigen::VectorXd& zz) {
                 std::vector<Vec3> a(grid.n), b(grid.n);
                 unstack_z(zz, a, b);
-                ForwardBlock f = solve_forward_block(grid, p, a, b, &x_warm, nullptr, nullptr);
+                ForwardBlock f = solve_forward_block(grid, p, a, b, &x_warm);
                 BackwardBlock b1, b2;
 #pragma omp parallel sections if (grid.n >= 64)
                 {
