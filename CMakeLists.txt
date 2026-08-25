@@ -32,6 +32,27 @@ if(OpenMP_CXX_FOUND)
     target_link_libraries(solve_interactive PRIVATE OpenMP::OpenMP_CXX)
 endif()
 
+add_executable(solve_stationary
+    solve_stationary.cpp
+    stationary_solver.cpp
+    lqg_solver.cpp
+)
+target_link_libraries(solve_stationary PRIVATE Eigen3::Eigen)
+target_compile_options(solve_stationary PRIVATE -O3 -march=native -DNDEBUG -Wall -Wextra)
+# FFTW backend for Eigen's FFT (optional; kissfft fallback if absent)
+include(CheckIncludeFileCXX)
+check_include_file_cxx(fftw3.h HAVE_FFTW3_H)
+find_library(FFTW3_LIB fftw3)
+find_library(FFTW3_THREADS_LIB fftw3_threads)
+if(HAVE_FFTW3_H AND FFTW3_LIB AND FFTW3_THREADS_LIB)
+    target_compile_definitions(solve_stationary PRIVATE EIGEN_FFTW_DEFAULT)
+    target_link_libraries(solve_stationary PRIVATE ${FFTW3_THREADS_LIB} ${FFTW3_LIB} pthread)
+    message(STATUS "solve_stationary: using FFTW")
+endif()
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(solve_stationary PRIVATE OpenMP::OpenMP_CXX)
+endif()
+
 add_executable(benchmark
     benchmark.cpp
     lqg_solver.cpp
