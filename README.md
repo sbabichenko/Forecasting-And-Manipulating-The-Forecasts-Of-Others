@@ -317,10 +317,10 @@ any relaxation above 2/(1+|lambda|); the solver's job is to keep Newton
 supplied with a good iterate.  Two logic defects (an Anderson blow-up above
 the engagement threshold escaping the rejection logic; GMRES(30) too small
 for the Newton systems) were fixed; the p=0.1, T=3 path now continues to
-r=0.0074.  Result at N=40, full-pipeline criterion: see the stress log in
-this commit's message; T=1 solves every case, T=3 solves every case with
-r >= 0.05, and the residual T=3, r=0.01 failures are Newton systems that
-restarted GMRES(120) does not resolve (a preconditioner is the next step).
+r=0.0074.  Result at N=40, full-pipeline criterion, predictable control: 14/512 failures,
+all T=3, r=0.01 with a player at p <= 1; T=1 solves every case and T=3 every
+case with r >= 0.05.  The residual failures are an initial-time layer in the
+own-noise channel (see the diagnosis notes), not a solver defect.
 The dissertation's cases (T=1, r >= 0.05) are far inside the usable region.
 
 **Memory**: a single solve peaks at 15 MB (N=160), 60 MB (N=320), 173 MB
@@ -342,6 +342,12 @@ kernels per parameter point.
    on the basis, so the gain shows above N ~ 200 (N=320 forward 193 -> 106 ms,
    N=640 solve 3.3 -> 2.0 s); at N=160 the march is latency-bound (~10 us per
    row).  `LQG_FORWARD_WS=0` selects the two-thread pair march.
+
+Tried and rejected (Aug 25, second round): a blocked backward pass that
+serves B levels per pass over the later rows (traffic / B) -- results
+identical, time unchanged (N=640 1.84 -> 1.83 s): the pass is arithmetic-bound
+at ~6 GFlop/s per core, the rate of 3-wide vector arithmetic, not
+bandwidth-bound.  A wider (4-padded) layout would be the next lever.
 
 Timings for the (3,3) benchmark solve, 8 threads: N=40 3 ms, N=160 45-55 ms,
 N=320 0.4 s, N=640 1.9 s (N=160 was 1.4 s before the exact march, Hk-free
