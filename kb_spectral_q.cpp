@@ -240,7 +240,7 @@ struct Model {
         std::vector<std::vector<std::vector<MatrixXd>>> Aq, Mqq;   // per trader: impact blocks A[nu][k], form blocks Mq[nu][k]
         std::vector<MatrixXd> Ymat, alin_raw;           // per trader: FOC solution Y (R x q), a_lin before profit accounting
         std::vector<Eigen::PartialPivLU<MatrixXd>> Mlu; std::vector<MatrixXd> Msol;   // per trader: cascade system LU and its solution [dP; X] (2qN x q); empty if NT == 1
-        bool lin = false; };
+        bool lin = false; bool want_cert = false; };
 
     // one joint best-response pass; cs[i] is kmat layout (NC N x q)
     // Richardson iteration on A X = B with a nearby factorization as preconditioner (A given as a dense matrix here)
@@ -378,7 +378,7 @@ struct Model {
                     for (int ch = 0; ch < NC; ++ch) W.block(ch * N, 0, N, R).noalias() = Mq[nu][k] * Ht.block(ch * N, 0, N, R);
                     Kmat.block(nu * R, k * R, R, R).noalias() = Ht.transpose() * W;
                 }
-                if (dg) for (int nu = 0; nu < q; ++nu) {
+                if (dg && dg->want_cert) for (int nu = 0; nu < q; ++nu) {
                     MatrixXd W(NC * N, R);
                     for (int ch = 0; ch < NC; ++ch) W.block(ch * N, 0, N, R).noalias() = Mass * Ht.block(ch * N, 0, N, R);
                     Gm.block(nu * R, nu * R, R, R).noalias() = Ht.transpose() * W;
@@ -391,14 +391,15 @@ struct Model {
             out[i] = Ht * Y;
             if (dg) {
                 dg->Aq[i] = A; dg->Mqq[i] = Mq; dg->Ymat[i] = Y; dg->alin_raw[i] = a_lin;
-                dg->K[i] = Kmat; dg->G[i] = Gm; dg->a_lin[i] = a_lin; dg->dP[i].resize(q * q);
+                if (dg->want_cert) { dg->K[i] = Kmat; dg->G[i] = Gm; }
+                dg->a_lin[i] = a_lin; dg->dP[i].resize(q * q);
                 for (int nu = 0; nu < q; ++nu) for (int k = 0; k < q; ++k) dg->dP[i][nu * q + k] = dP[nu][k];
                 // profit flow needs A c: store in a_lin? compute here: flow = <c, a_lin - A c - eps c>
                 MatrixXd Ac = MatrixXd::Zero(NC * N, q);
                 for (int ch = 0; ch < NC; ++ch) for (int nu = 0; nu < q; ++nu) for (int k = 0; k < q; ++k) Ac.block(ch * N, nu, N, 1) += A[nu][k] * cs[i].block(ch * N, k, N, 1);
                 dg->a_lin[i] = a_lin - Ac - eps * cs[i];                        // integrand partner: flow = <c, this>
-                Eigen::GeneralizedSelfAdjointEigenSolver<MatrixXd> es(0.5 * (Kmat + Kmat.transpose()), Gm, Eigen::EigenvaluesOnly);
-                dg->margin[i] = es.eigenvalues().minCoeff();
+                if (dg->want_cert) { Eigen::GeneralizedSelfAdjointEigenSolver<MatrixXd> es(0.5 * (Kmat + Kmat.transpose()), Gm, Eigen::EigenvaluesOnly); dg->margin[i] = es.eigenvalues().minCoeff(); }
+                else dg->margin[i] = 0.0;
             }
         }
         return out;
@@ -660,7 +661,7 @@ struct Solver {
     VectorXd apply_Jinv(const VectorXd& r) const { VectorXd x = Jlu.solve(r); for (size_t k = 0; k < bu.size(); ++k) x += bu[k] * bv[k].dot(r); return x; }
     struct JinvOp { const Solver* S; VectorXd operator*(const VectorXd& r) const { return S->apply_Jinv(r); } };
     JinvOp Jinv{this};
-    bool jfnk = true; int gmres_max = 12; double gmres_tol = 1e-3; bool analytic = true; bool krylov_stalled = false; bool exact_newton = false; bool range_newton = false;
+    bool jfnk = true; int gmres_max = 12; double gmres_tol = 1e-3; bool analytic = true; bool krylov_stalled = false; bool exact_newton = false; bool range_newton = false; bool lagged = false; int lag_max_its = 6;
     Model::Diag cur; bool have_cur = false;   // factorizations at the current iterate, preconditioning nearby evaluations
     long gmres_its = 0;
     explicit Solver(Model& m) : M(m) {}
@@ -675,12 +676,13 @@ struct Solver {
           z = zbest; }
         VectorXd r = M.residual(z, &cur); have_cur = true; ++evals; double rn = r.cwiseAbs().maxCoeff(); const double rn0 = rn;
         const int n = static_cast<int>(z.size()); double last_ratio = 0.0; int step = 0; int fails = 0; bool fresh = false;
-        double rn_at10 = std::numeric_limits<double>::infinity();
+        double rn_at10 = std::numeric_limits<double>::infinity(); int last_gmres = 0;
         bool use_krylov = jfnk && !exact_newton;     // hybrid: Newton-Krylov until GMRES stalls in this solve, then chord + Broyden for the rest of it
         for (; step < maxsteps && rn > tol; ++step) {
             if (step == 10) rn_at10 = rn;
             if (step == 20 && rn > 0.3 * rn_at10) break;      // not making progress: hand back for eps bisection
-            if (!range_newton && (exact_newton || !have_J || (last_ratio > refresh_ratio && o.jacobians < (use_krylov ? 1 : max_jacobians)))) {   // under JFNK the Broyden-updated inverse is only a preconditioner: refresh at most once per solve
+            const bool need_refactor = lagged ? (!have_J || last_gmres > lag_max_its) : (exact_newton || !have_J || (last_ratio > refresh_ratio && o.jacobians < (use_krylov ? 1 : max_jacobians)));
+            if (!range_newton && need_refactor) {   // under JFNK the Broyden-updated inverse is only a preconditioner: refresh at most once per solve
                 Jstore.resize(n, n); MatrixXd& Jm = Jstore; const double eps_fd = 1e-7 * std::max(1.0, z.cwiseAbs().maxCoeff());
                 Model::Diag& base = cur; const VectorXd rb = r;   // factorizations at z precondition the columns
                 if (analytic) {
@@ -691,7 +693,7 @@ struct Solver {
 #pragma omp parallel for schedule(dynamic, 4)
                     for (int i = 0; i < n; ++i) { VectorXd zp = z; zp[i] += eps_fd; Jm.col(i) = (M.residual(zp, nullptr, &base) - rb) / eps_fd; }
                     evals += n;
-                } new (&Jlu) Eigen::PartialPivLU<Eigen::Ref<MatrixXd>>(Jstore); bu.clear(); bv.clear(); have_J = true; ++o.jacobians; last_ratio = 0.0; fresh = true;   // factors in place
+                } new (&Jlu) Eigen::PartialPivLU<Eigen::Ref<MatrixXd>>(Jstore); bu.clear(); bv.clear(); have_J = true; ++o.jacobians; last_ratio = 0.0; fresh = true; last_gmres = 0;   // factors in place
             } else fresh = false;
             VectorXd dz;
             if (range_newton) {
@@ -727,6 +729,30 @@ struct Solver {
                 const VectorXd dw = Jr.partialPivLu().solve(-rr);
                 dz = M.pack(expand(dw));
                 fresh = true;
+            } else if (lagged && !fresh) {
+                // inexact Newton with the lagged exact LU as right preconditioner and exact Jacobian actions
+                const Model::LinBase LB = M.linbase(cur);
+                auto Jv = [&](const VectorXd& v) { std::vector<MatrixXd> d = M.dphi_fast(cur, LB, M.unpack(v)); return VectorXd(M.pack(d) - v); };
+                const int m = gmres_max; const double bn = r.norm();
+                std::vector<VectorXd> V; MatrixXd H = MatrixXd::Zero(m + 1, m);
+                VectorXd cs = VectorXd::Zero(m), sn = VectorXd::Zero(m), g = VectorXd::Zero(m + 1);
+                V.push_back(-r / bn); g[0] = bn;
+                int k = 0;
+                for (; k < m; ++k) {
+                    VectorXd w = Jv(apply_Jinv(V[k])); ++gmres_its;
+                    for (int j = 0; j <= k; ++j) { H(j, k) = w.dot(V[j]); w -= H(j, k) * V[j]; }
+                    H(k + 1, k) = w.norm(); const double hn = H(k + 1, k);
+                    for (int j = 0; j < k; ++j) { const double t = cs[j] * H(j, k) + sn[j] * H(j + 1, k); H(j + 1, k) = -sn[j] * H(j, k) + cs[j] * H(j + 1, k); H(j, k) = t; }
+                    const double d = std::hypot(H(k, k), H(k + 1, k)); cs[k] = H(k, k) / d; sn[k] = H(k + 1, k) / d; H(k, k) = d; H(k + 1, k) = 0.0;
+                    g[k + 1] = -sn[k] * g[k]; g[k] = cs[k] * g[k];
+                    if (std::abs(g[k + 1]) < 1e-6 * bn || hn < 1e-14 * bn) { ++k; break; }
+                    V.push_back(w / hn);
+                }
+                const VectorXd y = H.topLeftCorner(k, k).triangularView<Eigen::Upper>().solve(g.head(k));
+                VectorXd wsum = VectorXd::Zero(n); for (int j = 0; j < k; ++j) wsum += y[j] * V[j];
+                dz = apply_Jinv(wsum);
+                last_gmres = k;
+                if (verbose) std::fprintf(stderr, "    lagged-LU gmres %d its\n", k);
             } else if (use_krylov && !fresh) {
                 // Newton-Krylov: solve J dz = -r by right-preconditioned GMRES, P = Jinv (stale),
                 // J v by finite differences through the base-preconditioned residual.
@@ -756,7 +782,9 @@ struct Solver {
             } else dz = -apply_Jinv(r);
             double lam = 1.0; bool acc = false;
             for (int ls = 0; ls < 8; ++ls) {
-                const VectorXd zt = z + lam * dz; const VectorXd rt = M.residual(zt, nullptr, &cur); ++evals; const double rtn = rt.cwiseAbs().maxCoeff();
+                const VectorXd zt = z + lam * dz;
+                Model::Diag nd; const bool with_diag = (ls == 0);          // the full step is usually accepted: factor it directly
+                const VectorXd rt = with_diag ? M.residual(zt, &nd) : M.residual(zt, nullptr, &cur); ++evals; const double rtn = rt.cwiseAbs().maxCoeff();
                 if (std::isfinite(rtn) && rtn < (1.0 - 1e-4 * lam) * rn) {
                     const VectorXd sz = zt - z, yr = rt - r; const VectorXd Jy = (exact_newton || range_newton) ? VectorXd(VectorXd::Zero(sz.size())) : apply_Jinv(yr); const double den = sz.dot(Jy);
                     if (!exact_newton && !range_newton && std::abs(den) > 1e-14 * sz.norm() * Jy.norm()) {
@@ -765,7 +793,7 @@ struct Solver {
                         bu.push_back((sz - Jy) / den); bv.push_back(vT);
                     }
                     last_ratio = rtn / rn; z = zt; r = rt; rn = rtn; acc = true;
-                    Model::Diag nd; r = M.residual(z, &nd); ++evals; rn = r.cwiseAbs().maxCoeff(); cur = std::move(nd);   // refresh factorizations at the accepted point
+                    if (with_diag) cur = std::move(nd); else { cur = Model::Diag(); r = M.residual(z, &cur); ++evals; rn = r.cwiseAbs().maxCoeff(); }   // factorizations at the accepted point
                     if (range_newton) {
                         // project c_i onto range(Ht_i(c)):  c_i <- Ht_i G_i^{-1} Ht_i^T M c_i
                         std::vector<MatrixXd> cs = M.unpack(z);
@@ -805,7 +833,7 @@ int main(int argc, char* argv[]) {
     std::vector<VectorXd> gam;
     { std::string s = argv[6]; size_t p = 0; while (p <= s.size()) { size_t e = s.find(';', p); if (e == std::string::npos) e = s.size(); auto v = parse_list(s.substr(p, e - p)); VectorXd g(q); for (int k = 0; k < q; ++k) g[k] = v.size() == 1 ? v[0] : v[k]; gam.push_back(g); p = e + 1; } }
     MatrixXd SV = MatrixXd::Identity(q, q), SZ = MatrixXd::Identity(q, q);
-    double tol = 1e-10, split_b = 0.0, map_alpha = 0.0; int uniform = 0, coarse = 0, n1 = 0; bool verbose = false, eval_only = false, adaptive = true, tangent = true, use_jfnk = true, use_analytic = true, check_jac = false, exact_nt = true, range_nt = false; int gm_max = 12; double gm_tol = 1e-3; std::vector<double> path; std::string init_file;
+    double tol = 1e-10, split_b = 0.0, map_alpha = 0.0; int uniform = 0, coarse = 0, n1 = 0; bool verbose = false, eval_only = false, adaptive = true, tangent = true, use_jfnk = true, use_analytic = true, check_jac = false, exact_nt = true, range_nt = false, lagged_nt = true; int gm_max = 12, lag_its = 8; double gm_tol = 1e-3; std::vector<double> path; std::string init_file;
     for (int i = 7; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--sigma-v") && i + 1 < argc) { auto v = parse_list(argv[++i]); for (int r = 0; r < q; ++r) for (int c = 0; c < q; ++c) SV(r, c) = v[r * q + c]; }
         else if (!std::strcmp(argv[i], "--sigma-z") && i + 1 < argc) { auto v = parse_list(argv[++i]); for (int r = 0; r < q; ++r) for (int c = 0; c < q; ++c) SZ(r, c) = v[r * q + c]; }
@@ -819,6 +847,8 @@ int main(int argc, char* argv[]) {
         else if (!std::strcmp(argv[i], "--newton")) exact_nt = true;
         else if (!std::strcmp(argv[i], "--hybrid")) exact_nt = false;
         else if (!std::strcmp(argv[i], "--range")) range_nt = true;
+        else if (!std::strcmp(argv[i], "--lagged") && i + 1 < argc) { lagged_nt = true; lag_its = std::atoi(argv[++i]); }
+        else if (!std::strcmp(argv[i], "--no-lag")) lagged_nt = false;
         else if (!std::strcmp(argv[i], "--gmres") && i + 2 < argc) { gm_max = std::atoi(argv[++i]); gm_tol = std::atof(argv[++i]); }
         else if (!std::strcmp(argv[i], "--fd-jacobian")) use_analytic = false;
         else if (!std::strcmp(argv[i], "--check-jacobian")) check_jac = true;
@@ -893,7 +923,7 @@ int main(int argc, char* argv[]) {
     };
 
     Model M(N, L, path.front(), rho, q, gam, SV, SZ, n1, split_b, map_alpha);
-    Solver S(M); S.verbose = verbose; S.jfnk = use_jfnk; S.gmres_max = gm_max; S.gmres_tol = gm_tol; S.analytic = use_analytic; S.exact_newton = exact_nt; S.range_newton = range_nt;
+    Solver S(M); S.verbose = verbose; S.jfnk = use_jfnk; S.gmres_max = gm_max; S.gmres_tol = gm_tol; S.analytic = use_analytic; S.exact_newton = exact_nt; S.range_newton = range_nt; S.lagged = lagged_nt; S.lag_max_its = lag_its;
     VectorXd z = VectorXd::Zero(M.dim() * M.NT);
     Solver::Out o; o.ok = false;
     if (!init_file.empty()) {
@@ -932,7 +962,7 @@ int main(int argc, char* argv[]) {
     } else if (coarse > 0 && coarse < N && init_file.empty() && n1 == 0) {
         // coarse-to-fine: full continuation at N0 = coarse, interpolate, then solve the target directly at N
         Model Mc(coarse, L, path.front(), rho, q, gam, SV, SZ);
-        Solver Sc(Mc); Sc.verbose = verbose; Sc.jfnk = use_jfnk; Sc.analytic = use_analytic; Sc.exact_newton = exact_nt; Sc.range_newton = range_nt;
+        Solver Sc(Mc); Sc.verbose = verbose; Sc.jfnk = use_jfnk; Sc.analytic = use_analytic; Sc.exact_newton = exact_nt; Sc.range_newton = range_nt; Sc.lagged = lagged_nt; Sc.lag_max_its = lag_its;
         VectorXd zc = VectorXd::Zero(Mc.dim() * Mc.NT);
         bool okc = false;
         const Solver::Out oc = continuation(Mc, Sc, zc, path, 60, okc);
@@ -953,7 +983,7 @@ int main(int argc, char* argv[]) {
         z = o.z;
     }
     const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    Model::Diag dg; const std::vector<MatrixXd> cs = M.unpack(z); M.residual(z, &dg);
+    Model::Diag dg; dg.want_cert = true; const std::vector<MatrixXd> cs = M.unpack(z); M.residual(z, &dg);
     std::printf("{\"converged\":%s,\"residual\":%.3e,\"map_alpha\":%.15g,\"split_b\":%.15g,\"N1\":%d,\"N\":%d,\"L\":%.15g,\"eps\":%.15g,\"rho\":%.15g,\"q\":%d,\"NT\":%d,\"NC\":%d,\"seconds\":%.3f,\"evaluations\":%ld,\"gmres_iterations\":%ld,",
                 o.ok ? "true" : "false", o.resid, map_alpha, split_b, n1, N, L, M.eps, rho, q, M.NT, M.NC, secs, S.evals, S.gmres_its);
     std::printf("\"lambda\":"); print_mat(dg.lam); std::printf(",");
