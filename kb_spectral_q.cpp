@@ -34,6 +34,8 @@ using Eigen::MatrixXd;
 using Eigen::VectorXd;
 
 namespace {
+static long g_pre_ok = 0, g_pre_fallback = 0, g_full = 0; static double g_t_full = 0, g_t_pre = 0;
+static inline double now_s(){ return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 
 VectorXd cheb_nodes(int N, double lo, double hi) {
     VectorXd x(N);
@@ -194,15 +196,18 @@ struct Model {
     // Ht: (NC N) x (q N); H = Ht^T Mass_block.
     MatrixXd obs_Ht(const std::vector<std::vector<VectorXd>>& kw, int id_ch0) const {
         MatrixXd Ht = MatrixXd::Zero(NC * N, q * N);
-        for (int o = 0; o < q; ++o) {
-            for (int ch = 0; ch < NC; ++ch)
-                if (kw[o][ch].size()) Ht.block(ch * N, o * N, N, N) = volterra(kw[o][ch]);
-            Ht.block((id_ch0 + o) * N, o * N, N, N) += MatrixXd::Identity(N, N);
+        const int nb = q * NC;
+#pragma omp parallel for schedule(dynamic) if (!omp_in_parallel())
+        for (int b = 0; b < nb; ++b) {
+            const int o = b / NC, ch = b % NC;
+            if (kw[o][ch].size()) Ht.block(ch * N, o * N, N, N) = volterra(kw[o][ch]);
         }
+        for (int o = 0; o < q; ++o) Ht.block((id_ch0 + o) * N, o * N, N, N) += MatrixXd::Identity(N, N);
         return Ht;
     }
     MatrixXd Htmass(const MatrixXd& Ht) const {   // H = Ht^T blockdiag(Mass): (q N) x (NC N)
         MatrixXd H(Ht.cols(), Ht.rows());
+#pragma omp parallel for schedule(static) if (!omp_in_parallel())
         for (int ch = 0; ch < NC; ++ch) H.block(0, ch * N, Ht.cols(), N).noalias() = Ht.block(ch * N, 0, N, Ht.cols()).transpose() * Mass;
         return H;
     }
@@ -272,6 +277,7 @@ struct Model {
         const bool use_pre = pre && static_cast<int>(pre->Klu.size()) == NT && !dg;
         // each trader's observation operator (residual flow + own signal) and policy rows y_j = G_j^{-1} H_j c^j
         std::vector<MatrixXd> Htj(NT), Hj(NT), yj(NT);
+#pragma omp parallel for schedule(static) if (!omp_in_parallel() && NT > 1)
         for (int j = 0; j < NT; ++j) {
             const MatrixXd Htfo = obs_Ht(flow_kw(kvec(ctot - cs[j])), q);
             const MatrixXd Hts = obs_Ht(signal_kw(g, j), (2 + j) * q);
@@ -338,8 +344,9 @@ struct Model {
                     rhs.segment(nu * R, R).noalias() += Ht.block(ch * N, 0, N, R).transpose() * (Mass * a_lin.block(ch * N, nu, N, 1));
             VectorXd yv;
             MatrixXd Kmat, Gm;
+            bool solved = false;
             if (use_pre) {
-                // matrix-free K apply: y -> sum_ch Hc^T Mq (Hc y), preconditioned Richardson with the base LU
+                // matrix-free K apply, preconditioned Richardson with the base LU; fall back to assembly if it stalls
                 auto applyK = [&](const VectorXd& y) {
                     VectorXd out = VectorXd::Zero(R * q);
                     for (int ch = 0; ch < NC; ++ch) {
@@ -350,20 +357,31 @@ struct Model {
                     return out;
                 };
                 yv = pre->Klu[i].solve(rhs);
-                for (int it = 0; it < 6; ++it) {
+                const double rn0 = std::max(1.0, rhs.cwiseAbs().maxCoeff()); double prev = std::numeric_limits<double>::infinity();
+                for (int it = 0; it < 12; ++it) {
                     const VectorXd res = rhs - applyK(yv);
-                    if (res.cwiseAbs().maxCoeff() < 1e-14 * std::max(1.0, rhs.cwiseAbs().maxCoeff())) break;
+                    const double rn = res.cwiseAbs().maxCoeff();
+                    if (rn < 1e-14 * rn0) { solved = true; break; }
+                    if (rn > 0.7 * prev) break;        // not contracting: stale preconditioner
+                    prev = rn;
                     yv += pre->Klu[i].solve(res);
                 }
-            } else {
+            }
+            if (solved) ++g_pre_ok; else if (use_pre) ++g_pre_fallback;
+            if (!solved) {
+                ++g_full;
+                // assemble K = sum_ch Hc^T Mq Hc as blockdiag-apply plus one large product per (nu, k)
                 Kmat = MatrixXd::Zero(R * q, R * q); Gm = MatrixXd::Zero(R * q, R * q);
-                // K[(nu, r),(k, r')] = sum_ch Ht(ch-block, r)^T Mq_{nu k} Ht(ch-block, r')
-                for (int ch = 0; ch < NC; ++ch) {
-                    const MatrixXd Hc = Ht.block(ch * N, 0, N, R);                 // N x R
-                    for (int nu = 0; nu < q; ++nu) {
-                        for (int k = 0; k < q; ++k) Kmat.block(nu * R, k * R, R, R).noalias() += Hc.transpose() * Mq[nu][k] * Hc;
-                        if (dg) Gm.block(nu * R, nu * R, R, R).noalias() += Hc.transpose() * Mass * Hc;
-                    }
+                for (int nu = 0; nu < q; ++nu) for (int k = 0; k < q; ++k) {
+                    MatrixXd W(NC * N, R);
+#pragma omp parallel for schedule(static) if (!omp_in_parallel())
+                    for (int ch = 0; ch < NC; ++ch) W.block(ch * N, 0, N, R).noalias() = Mq[nu][k] * Ht.block(ch * N, 0, N, R);
+                    Kmat.block(nu * R, k * R, R, R).noalias() = Ht.transpose() * W;
+                }
+                if (dg) for (int nu = 0; nu < q; ++nu) {
+                    MatrixXd W(NC * N, R);
+                    for (int ch = 0; ch < NC; ++ch) W.block(ch * N, 0, N, R).noalias() = Mass * Ht.block(ch * N, 0, N, R);
+                    Gm.block(nu * R, nu * R, R, R).noalias() = Ht.transpose() * W;
                 }
                 Eigen::PartialPivLU<MatrixXd> lu(Kmat);
                 yv = lu.solve(rhs);
@@ -464,7 +482,7 @@ struct Model {
 
     VectorXd pack(const std::vector<MatrixXd>& cs) const { VectorXd z(NT * NC * N * q); for (int i = 0; i < NT; ++i) for (int k = 0; k < q; ++k) z.segment((i * q + k) * NC * N, NC * N) = cs[i].col(k); return z; }
     std::vector<MatrixXd> unpack(const VectorXd& z) const { std::vector<MatrixXd> cs(NT, MatrixXd(NC * N, q)); for (int i = 0; i < NT; ++i) for (int k = 0; k < q; ++k) cs[i].col(k) = z.segment((i * q + k) * NC * N, NC * N); return cs; }
-    VectorXd residual(const VectorXd& z, Diag* dg = nullptr, const Diag* pre = nullptr) const { return pack(phi(unpack(z), dg, pre)) - z; }
+    VectorXd residual(const VectorXd& z, Diag* dg = nullptr, const Diag* pre = nullptr) const { const double t0 = now_s(); VectorXd r = pack(phi(unpack(z), dg, pre)) - z; (dg || !pre ? g_t_full : g_t_pre) += now_s() - t0; return r; }
 
     // profit flow per trader, by channel block (V, Z, trader noises) and by stock (demand component)
     MatrixXd profit(const std::vector<MatrixXd>& cs, const Diag& dg, int i) const {
@@ -481,25 +499,35 @@ struct Model {
 // ----------------------------------------------------------------- newton
 
 struct Solver {
-    Model& M; MatrixXd Jinv; bool have_J = false; long evals = 0; bool verbose = false; double refresh_ratio = 0.8; int max_jacobians = 3;
-    bool jfnk = false; int gmres_max = 30; double gmres_tol = 1e-3; bool analytic = true;
+    Model& M; bool have_J = false; long evals = 0; bool verbose = false; double refresh_ratio = 0.8; int max_jacobians = 3;
+    // inverse Jacobian as an LU plus Broyden rank-one corrections: Jinv r = LU^{-1} r + sum_k u_k (v_k . r)
+    Eigen::PartialPivLU<MatrixXd> Jlu; std::vector<VectorXd> bu, bv;
+    VectorXd apply_Jinv(const VectorXd& r) const { VectorXd x = Jlu.solve(r); for (size_t k = 0; k < bu.size(); ++k) x += bu[k] * bv[k].dot(r); return x; }
+    struct JinvOp { const Solver* S; VectorXd operator*(const VectorXd& r) const { return S->apply_Jinv(r); } };
+    JinvOp Jinv{this};
+    bool jfnk = true; int gmres_max = 12; double gmres_tol = 1e-3; bool analytic = true; bool krylov_stalled = false;
+    Model::Diag cur; bool have_cur = false;   // factorizations at the current iterate, preconditioning nearby evaluations
     long gmres_its = 0;
     explicit Solver(Model& m) : M(m) {}
     struct Out { VectorXd z; double resid; int steps, jacobians; bool ok; };
     Out solve(VectorXd z, double tol, int pre = 0, double relax = 0.1, int maxsteps = 30) {
         Out o; o.jacobians = 0; o.ok = false;
         { double lam = relax, best = std::numeric_limits<double>::infinity(); VectorXd zbest = z;
-          for (int k = 0; k < pre; ++k) { const VectorXd r = M.residual(z); ++evals; const double rn = r.cwiseAbs().maxCoeff();
+          for (int k = 0; k < pre; ++k) { const VectorXd r = have_cur ? M.residual(z, nullptr, &cur) : M.residual(z); ++evals; const double rn = r.cwiseAbs().maxCoeff();
               if (verbose && k % 20 == 0) std::fprintf(stderr, "  pre %d: |r| %.3e relax %.3g\n", k, rn, lam);
               if (!std::isfinite(rn) || rn > 2.0 * best) { z = zbest; lam *= 0.5; if (lam < 1e-3) break; continue; }
               if (rn < best) { best = rn; zbest = z; } if (rn < 1e-3) break; z += lam * r; }
           z = zbest; }
-        VectorXd r = M.residual(z); ++evals; double rn = r.cwiseAbs().maxCoeff(); const double rn0 = rn;
+        VectorXd r = M.residual(z, &cur); have_cur = true; ++evals; double rn = r.cwiseAbs().maxCoeff(); const double rn0 = rn;
         const int n = static_cast<int>(z.size()); double last_ratio = 0.0; int step = 0; int fails = 0; bool fresh = false;
+        double rn_at10 = std::numeric_limits<double>::infinity();
+        bool use_krylov = jfnk;     // hybrid: Newton-Krylov until GMRES stalls in this solve, then chord + Broyden for the rest of it
         for (; step < maxsteps && rn > tol; ++step) {
-            if (!have_J || (last_ratio > refresh_ratio && o.jacobians < (jfnk ? 1 : max_jacobians))) {   // under JFNK the Broyden-updated inverse is only a preconditioner: refresh at most once per solve
+            if (step == 10) rn_at10 = rn;
+            if (step == 20 && rn > 0.3 * rn_at10) break;      // not making progress: hand back for eps bisection
+            if (!have_J || (last_ratio > refresh_ratio && o.jacobians < (use_krylov ? 1 : max_jacobians))) {   // under JFNK the Broyden-updated inverse is only a preconditioner: refresh at most once per solve
                 MatrixXd Jm(n, n); const double eps_fd = 1e-7 * std::max(1.0, z.cwiseAbs().maxCoeff());
-                Model::Diag base; const VectorXd rb = M.residual(z, &base); ++evals;   // base factorizations precondition the columns
+                Model::Diag& base = cur; const VectorXd rb = r;   // factorizations at z precondition the columns
                 if (analytic) {
 #pragma omp parallel for schedule(dynamic, 8)
                     for (int i = 0; i < n; ++i) { VectorXd e = VectorXd::Zero(n); e[i] = 1.0; Jm.col(i) = M.pack(M.dphi(base, M.unpack(e))) - e; }
@@ -507,13 +535,13 @@ struct Solver {
 #pragma omp parallel for schedule(dynamic, 4)
                     for (int i = 0; i < n; ++i) { VectorXd zp = z; zp[i] += eps_fd; Jm.col(i) = (M.residual(zp, nullptr, &base) - rb) / eps_fd; }
                     evals += n;
-                } Jinv = Jm.partialPivLu().inverse(); have_J = true; ++o.jacobians; last_ratio = 0.0; fresh = true;
+                } Jlu.compute(Jm); bu.clear(); bv.clear(); have_J = true; ++o.jacobians; last_ratio = 0.0; fresh = true;
             } else fresh = false;
             VectorXd dz;
-            if (jfnk && !fresh) {
+            if (use_krylov && !fresh) {
                 // Newton-Krylov: solve J dz = -r by right-preconditioned GMRES, P = Jinv (stale),
                 // J v by finite differences through the base-preconditioned residual.
-                Model::Diag base; const VectorXd rb = M.residual(z, &base); ++evals;
+                Model::Diag& base = cur; const VectorXd rb = r;
                 const double hfd = 1e-7 * std::max(1.0, z.cwiseAbs().maxCoeff());
                 auto Jv = [&](const VectorXd& v) { const double vn = v.norm(); if (vn == 0) return VectorXd(VectorXd::Zero(n)); const VectorXd zp = z + (hfd / vn) * v; ++evals; return VectorXd((M.residual(zp, nullptr, &base) - rb) * (vn / hfd)); };
                 const int m = gmres_max; const double bn = r.norm();
@@ -522,7 +550,7 @@ struct Solver {
                 V.push_back(-r / bn); g[0] = bn;
                 int k = 0; bool ok_g = false;
                 for (; k < m; ++k) {
-                    VectorXd w = Jv(Jinv * V[k]); ++gmres_its;
+                    VectorXd w = Jv(apply_Jinv(V[k])); ++gmres_its;
                     for (int j = 0; j <= k; ++j) { H(j, k) = w.dot(V[j]); w -= H(j, k) * V[j]; }
                     H(k + 1, k) = w.norm(); const double hn = H(k + 1, k);
                     for (int j = 0; j < k; ++j) { const double t = cs[j] * H(j, k) + sn[j] * H(j + 1, k); H(j + 1, k) = -sn[j] * H(j, k) + cs[j] * H(j + 1, k); H(j, k) = t; }
@@ -533,17 +561,23 @@ struct Solver {
                 }
                 const VectorXd y = H.topLeftCorner(k, k).triangularView<Eigen::Upper>().solve(g.head(k));
                 VectorXd wsum = VectorXd::Zero(n); for (int j = 0; j < k; ++j) wsum += y[j] * V[j];
-                dz = Jinv * wsum;
+                dz = apply_Jinv(wsum);
                 if (verbose) std::fprintf(stderr, "    gmres %d its%s\n", k, ok_g ? "" : " (not converged)");
-                (void)ok_g;   // take the GMRES step regardless; the line search and the contraction test decide whether to refresh
-            } else dz = -(Jinv * r);
+                if (!ok_g) { use_krylov = false; krylov_stalled = true; last_ratio = 1.0; if (verbose) std::fprintf(stderr, "    krylov stalled: switching to chord\n"); }   // preconditioner has drifted
+            } else dz = -apply_Jinv(r);
             double lam = 1.0; bool acc = false;
             for (int ls = 0; ls < 8; ++ls) {
-                const VectorXd zt = z + lam * dz; const VectorXd rt = M.residual(zt); ++evals; const double rtn = rt.cwiseAbs().maxCoeff();
+                const VectorXd zt = z + lam * dz; const VectorXd rt = M.residual(zt, nullptr, &cur); ++evals; const double rtn = rt.cwiseAbs().maxCoeff();
                 if (std::isfinite(rtn) && rtn < (1.0 - 1e-4 * lam) * rn) {
-                    const VectorXd sz = zt - z, yr = rt - r, Jy = Jinv * yr; const double den = sz.dot(Jy);
-                    if (std::abs(den) > 1e-14 * sz.norm() * Jy.norm()) Jinv.noalias() += ((sz - Jy) * (sz.transpose() * Jinv)) / den;
-                    last_ratio = rtn / rn; z = zt; r = rt; rn = rtn; acc = true; break;
+                    const VectorXd sz = zt - z, yr = rt - r, Jy = apply_Jinv(yr); const double den = sz.dot(Jy);
+                    if (std::abs(den) > 1e-14 * sz.norm() * Jy.norm()) {
+                        // good Broyden update of the inverse: Jinv += (sz - Jy) (sz^T Jinv) / den  ->  u = (sz - Jy)/den, v = Jinv^T sz
+                        VectorXd vT = Jlu.transpose().solve(sz); for (size_t k = 0; k < bu.size(); ++k) vT += bv[k] * bu[k].dot(sz);
+                        bu.push_back((sz - Jy) / den); bv.push_back(vT);
+                    }
+                    last_ratio = rtn / rn; z = zt; r = rt; rn = rtn; acc = true;
+                    Model::Diag nd; r = M.residual(z, &nd); ++evals; rn = r.cwiseAbs().maxCoeff(); cur = std::move(nd);   // refresh factorizations at the accepted point
+                    break;
                 }
                 lam *= 0.5;
             }
@@ -552,7 +586,7 @@ struct Solver {
                 if (!fresh) { last_ratio = 1.0; continue; }               // stale Jacobian: refresh once
                 // fresh Jacobian and still no descent: damped residual step, then keep the chord
                 if (++fails > 5) break;
-                z += relax * r; r = M.residual(z); ++evals; rn = r.cwiseAbs().maxCoeff(); last_ratio = 0.0; continue;
+                z += relax * r; { Model::Diag nd; r = M.residual(z, &nd); cur = std::move(nd); } ++evals; rn = r.cwiseAbs().maxCoeff(); last_ratio = 0.0; continue;
             }
             fails = 0;
             if (!std::isfinite(rn) || rn > 1e6 * std::max(rn0, 1.0)) break;
@@ -575,7 +609,7 @@ int main(int argc, char* argv[]) {
     std::vector<VectorXd> gam;
     { std::string s = argv[6]; size_t p = 0; while (p <= s.size()) { size_t e = s.find(';', p); if (e == std::string::npos) e = s.size(); auto v = parse_list(s.substr(p, e - p)); VectorXd g(q); for (int k = 0; k < q; ++k) g[k] = v.size() == 1 ? v[0] : v[k]; gam.push_back(g); p = e + 1; } }
     MatrixXd SV = MatrixXd::Identity(q, q), SZ = MatrixXd::Identity(q, q);
-    double tol = 1e-10, split_b = 0.0, map_alpha = 0.0; int uniform = 0, coarse = 0, n1 = 0; bool verbose = false, eval_only = false, adaptive = true, tangent = true, use_jfnk = false, use_analytic = true, check_jac = false; int gm_max = 30; double gm_tol = 1e-3; std::vector<double> path; std::string init_file;
+    double tol = 1e-10, split_b = 0.0, map_alpha = 0.0; int uniform = 0, coarse = 0, n1 = 0; bool verbose = false, eval_only = false, adaptive = true, tangent = true, use_jfnk = true, use_analytic = true, check_jac = false; int gm_max = 12; double gm_tol = 1e-3; std::vector<double> path; std::string init_file;
     for (int i = 7; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--sigma-v") && i + 1 < argc) { auto v = parse_list(argv[++i]); for (int r = 0; r < q; ++r) for (int c = 0; c < q; ++c) SV(r, c) = v[r * q + c]; }
         else if (!std::strcmp(argv[i], "--sigma-z") && i + 1 < argc) { auto v = parse_list(argv[++i]); for (int r = 0; r < q; ++r) for (int c = 0; c < q; ++c) SZ(r, c) = v[r * q + c]; }
@@ -585,6 +619,7 @@ int main(int argc, char* argv[]) {
         else if (!std::strcmp(argv[i], "--verbose")) verbose = true;
         else if (!std::strcmp(argv[i], "--eval-only")) eval_only = true;
         else if (!std::strcmp(argv[i], "--jfnk")) use_jfnk = true;
+        else if (!std::strcmp(argv[i], "--chord")) use_jfnk = false;
         else if (!std::strcmp(argv[i], "--gmres") && i + 2 < argc) { gm_max = std::atoi(argv[++i]); gm_tol = std::atof(argv[++i]); }
         else if (!std::strcmp(argv[i], "--fd-jacobian")) use_analytic = false;
         else if (!std::strcmp(argv[i], "--check-jacobian")) check_jac = true;
@@ -637,7 +672,7 @@ int main(int argc, char* argv[]) {
             }
             o = S.solve(zstart, tol, (k == 0 && pre0 > 0) ? pre0 : 0, 0.1);
             if (!o.ok) { S.have_J = false; o = S.solve(z, tol, k == 0 ? 0 : 30, 0.1); }
-            if (verbose) std::fprintf(stderr, "[N=%d] eps=%g: %s |r| %.2e, %d steps, %d jacobians, %ld evals, %.1f s elapsed\n", M.N, path[k], o.ok ? "ok" : "FAIL", o.resid, o.steps, o.jacobians, S.evals, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+            if (verbose) std::fprintf(stderr, "[N=%d] eps=%g: %s |r| %.2e, %d steps, %d jacobians, %ld evals, %.1f s elapsed | FOC solves: preconditioned ok %ld, fallback %ld, full %ld; time full-evals %.2f s, pre-evals %.2f s\n", M.N, path[k], o.ok ? "ok" : "FAIL", o.resid, o.steps, o.jacobians, S.evals, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), g_pre_ok, g_pre_fallback, g_full, g_t_full, g_t_pre);
             if (!o.ok) {
                 if (k > 0 && bisections < 6) { ++bisections; path.insert(path.begin() + k, 0.5 * (path[k - 1] + path[k])); have_prev = false; S.have_J = false; factor = std::sqrt(factor); --k; continue; }
                 break;
