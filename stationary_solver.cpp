@@ -1032,9 +1032,17 @@ StationarySolution solve_stationary(const StationaryParams& params, bool verbose
     const auto secs = [](auto a, auto b) {
         return std::chrono::duration<double>(b - a).count(); };
 
+    double outer_prev = std::numeric_limits<double>::infinity();
     for (int it = 0; it < p.max_iters; ++it) {
         const auto t0 = tick();
-        fwd = solve_forward_block(grid, p, d1, d2,
+        // Inexact inner solve: the forward block only needs to be accurate
+        // relative to the current outer residual.  Once the outer residual is
+        // within a decade of tolerance, revert to the full forward tolerance
+        // so the converged solution does not depend on this.
+        StationaryParams pf = p;
+        if (p.inexact_forward && std::isfinite(outer_prev) && outer_prev > 10.0 * p.tol)
+            pf.forward_tol = std::max(p.forward_tol, std::min(1e-3, 1e-2 * outer_prev));
+        fwd = solve_forward_block(grid, pf, d1, d2,
                                   x_warm.empty() ? nullptr : &x_warm,
                                   &fwd_cache1, &fwd_cache2);
         const auto t1 = tick();
@@ -1066,6 +1074,7 @@ StationarySolution solve_stationary(const StationaryParams& params, bool verbose
         sol.relative_residual = std::max(gap1.relative, gap2.relative);
         sol.absolute_residual = std::max(gap1.absolute, gap2.absolute);
         sol.residual = sol.relative_residual;
+        outer_prev = sol.relative_residual;
         sol.forward_residual = fwd.residual;
         sol.backward_residual1 = bwd1.residual;
         sol.backward_residual2 = bwd2.residual;

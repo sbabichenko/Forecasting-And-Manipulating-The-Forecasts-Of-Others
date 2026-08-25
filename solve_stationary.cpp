@@ -57,7 +57,7 @@ static void usage(const char* argv0) {
         "[--quadrature simpson|trapezoid] "
         "[--forward-iters <n>] [--forward-relax <x>] "
         "[--backward-iters <n>] [--backward-relax <x>] "
-        "[--init <warm-start csv>] [--verbose]\n",
+        "[--init <warm-start csv>] [--inexact-forward] [--verbose]\n",
         argv0);
 }
 
@@ -145,6 +145,7 @@ int main(int argc, char* argv[]) {
                 return 1;
             }
         }
+        else if (std::strcmp(argv[i], "--inexact-forward") == 0) p.inexact_forward = true;
         else if (std::strcmp(argv[i], "--init") == 0 && i + 1 < argc) {
             if (!load_init_csv(argv[++i], p)) {
                 std::fprintf(stderr, "failed to read --init warm-start CSV: %s\n", argv[i]);

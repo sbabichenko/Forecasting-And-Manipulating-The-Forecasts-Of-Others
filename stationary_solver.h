@@ -24,6 +24,7 @@ struct StationaryParams {
     int forward_iters = 500;
     double forward_relax = 0.05;
     double forward_tol = 1e-8;
+    bool inexact_forward = false;   // loosen forward_tol while the outer residual is large
 
     int backward_iters = 500;
     double backward_relax = 0.05;
