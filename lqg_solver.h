@@ -181,8 +181,8 @@ inline Mat3 Pi2() {
 struct EnvironmentResult {
     Kernel2D X;
     Kernel2D Xtilde1, Xtilde2;
-    // Rank-1 filter factorization: A_store[k][s] for s < k
-    Kernel2D A_store1, A_store2;
+    // The rank-1 filter factor A[k][s] = dt * gain^2 * Xtilde[k][s] (s < k), A[k][k] = 0,
+    // is not stored; it is formed from Xtilde where F is materialized.
     // Observation parameters (needed for F materialization)
     double obs_gain1, obs_gain2;
     int obs_idx1, obs_idx2;
@@ -207,7 +207,7 @@ void state_kernel_from_calD(const Kernel2D& calD1, const Kernel2D& calD2,
                             Kernel2D& X);
 
 void primitive_control_kernel(
-    const Kernel2D& D, const Kernel2D& Xtilde, const Kernel2D& A_store,
+    const Kernel2D& D, const Kernel2D& Xtilde,
     double obs_gain_val, int obs_index, const Mat3& Pi, Kernel2D& calD);
 
 void forward_environment(
@@ -301,7 +301,7 @@ CostPair compute_costs_general(const EnvironmentResult& env,
 
 // ---------- F materialization (for figure output only) ----------
 // Builds F[j][u][s] for ALL j. Writes into pre-allocated Kernel3D.
-void materialize_F(const Kernel2D& Xtilde, const Kernel2D& A_store,
+void materialize_F(const Kernel2D& Xtilde,
                    double obs_gain, int obs_index, Kernel3D& F);
 
 // ---------- F slice computation (memory-efficient) ----------
@@ -315,12 +315,12 @@ struct FSlice {
     const Mat3& operator()(int u, int s) const { return data[u * n + s]; }
 };
 
-std::unique_ptr<FSlice> compute_F_slice_at_T(const Kernel2D& Xtilde, const Kernel2D& A_store,
+std::unique_ptr<FSlice> compute_F_slice_at_T(const Kernel2D& Xtilde,
                                               double obs_gain, int obs_index);
 
 // Compute F kernel at arbitrary time index t_idx (0-based grid index).
 // Same algorithm as compute_F_slice_at_T but stops iteration at t_idx.
-std::unique_ptr<FSlice> compute_F_slice_at(const Kernel2D& Xtilde, const Kernel2D& A_store,
+std::unique_ptr<FSlice> compute_F_slice_at(const Kernel2D& Xtilde,
                                             double obs_gain, int obs_index, int t_idx);
 
 // ---------- exact discrete conditional expectation (post-processing) ----------

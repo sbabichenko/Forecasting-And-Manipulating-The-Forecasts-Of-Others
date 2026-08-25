@@ -2,7 +2,7 @@
 //
 // The 36MB Kernel3D F is never materialized during solving. Products
 // like sum_u F[j][u][s]^T * v[u] are computed from the rank-1
-// decomposition F[j][u][s] = border + sum_k Xtilde[k][u] * A_store[k][s]^T.
+// decomposition F[j][u][s] = border + sum_k Xtilde[k][u] * A[k][s]^T, A[k][s] = dt gain^2 Xtilde[k][s] (s < k).
 
 #include <cstdlib>
 #include <Eigen/Dense>
@@ -89,7 +89,7 @@ void state_kernel_from_calD(const Kernel2D& calD1, const Kernel2D& calD2,
 
 // --- compute_filter_kernels (F-free) ---
 //
-// Computes Xtilde and A_store without materializing F.
+// Computes Xtilde without materializing F.
 // gamma_b (border_lt) is identically zero by causality:
 // Xtilde[u][s] = 0 for s > u.
 
@@ -98,7 +98,7 @@ void state_kernel_from_calD(const Kernel2D& calD1, const Kernel2D& calD2,
 // the rows can be produced in a single causal march (forward_environment).
 static void filter_row(int j,
     const Kernel2D& X, const Mat3& Pi, int obs_index,
-    double obs_gain_val, Kernel2D& Xtilde, Kernel2D& A_store) {
+    double obs_gain_val, Kernel2D& Xtilde) {
 
     const Mat3 I_minus_Pi = Mat3::Identity() - Pi;
     const double g = obs_gain_val;
@@ -107,7 +107,6 @@ static void filter_row(int j,
 
     if (j == 0) {
         Xtilde[0][0] = I_minus_Pi * X[0][0];
-        A_store[0][0].setZero();
         return;
     }
     using FlatC = Eigen::Map<const Eigen::VectorXd>;
@@ -138,8 +137,6 @@ static void filter_row(int j,
     const double scale = 1.0 / (1.0 + g_dt * prec * sigma_minus);
     Flat(Xtilde[j][0].data(), 3 * (j + 1)) *= scale;
 
-    const double dt_prec = g_dt * prec;
-    Flat(A_store[j][0].data(), 3 * j) = dt_prec * FlatC(Xtilde[j][0].data(), 3 * j);
 }
 
 // Worksharing versions of the row functions: called by every thread of the
@@ -150,12 +147,12 @@ static void filter_row(int j,
 struct RowScratch { std::array<double, N_MAX> c; std::array<Vec3, N_MAX> q; };
 static void filter_row_ws(int j,
     const Kernel2D& X, const Mat3& Pi, int obs_index,
-    double obs_gain_val, Kernel2D& Xtilde, Kernel2D& A_store, RowScratch& sc) {
+    double obs_gain_val, Kernel2D& Xtilde, RowScratch& sc) {
     const Mat3 I_minus_Pi = Mat3::Identity() - Pi;
     const double g = obs_gain_val, prec = g * g, dt2_prec = g_dt * g_dt * prec;
     if (j == 0) {
         #pragma omp single
-        { Xtilde[0][0] = I_minus_Pi * X[0][0]; A_store[0][0].setZero(); }
+        { Xtilde[0][0] = I_minus_Pi * X[0][0]; }
         return;
     }
     using FlatC = Eigen::Map<const Eigen::VectorXd>;
@@ -191,7 +188,6 @@ static void filter_row_ws(int j,
         const double sigma_minus = g_dt * FlatC(Xtilde[j][0].data(), 3 * j).squaredNorm();
         const double scale = 1.0 / (1.0 + g_dt * prec * sigma_minus);
         Flat(Xtilde[j][0].data(), 3 * (j + 1)) *= scale;
-        Flat(A_store[j][0].data(), 3 * j) = (g_dt * prec) * FlatC(Xtilde[j][0].data(), 3 * j);
     }
 }
 static void control_row_ws(int j,
@@ -235,11 +231,11 @@ static void control_row_ws(int j,
 static void compute_filter_kernels(
     const Kernel2D& X, const Mat3& Pi, int obs_index,
     double obs_gain_val, int filter_iters, double relax,
-    Kernel2D& Xtilde, Kernel2D& A_store) {
+    Kernel2D& Xtilde) {
     (void)filter_iters;
     (void)relax;
     for (int j = 0; j < g_n; ++j)
-        filter_row(j, X, Pi, obs_index, obs_gain_val, Xtilde, A_store);
+        filter_row(j, X, Pi, obs_index, obs_gain_val, Xtilde);
 }
 
 // --- primitive_control_kernel (F-free) ---
@@ -250,7 +246,7 @@ static void compute_filter_kernels(
 // Row j of the primitive control kernel from D[j] and rows k <= j of the
 // filter kernels.
 static void control_row(int j,
-    const Kernel2D& D, const Kernel2D& Xtilde, const Kernel2D& A_store,
+    const Kernel2D& D, const Kernel2D& Xtilde,
     double obs_gain_val, int obs_index, const Mat3& Pi, Kernel2D& calD) {
 
     Vec3 e_i = Vec3::Zero();
@@ -274,8 +270,8 @@ static void control_row(int j,
     for (int k = 1; k <= j; ++k)
         partial_d_k[k] = FlatC(Xtilde[k][0].data(), 3 * k).dot(FlatC(dj, 3 * k));
 
-    // q[s] = sum_{s < k <= j} ( DT_g D[j][k](obs) Xtilde[k][s] + g_dt partial_d_k[k] A_store[k][s] ),
-    // accumulated by rows; A_store[k][s] = dt prec Xtilde[k][s] for s < k
+    // q[s] = sum_{s < k <= j} ( DT_g D[j][k](obs) Xtilde[k][s] + g_dt partial_d_k[k] A[k][s] ),
+    // accumulated by rows; A[k][s] = dt prec Xtilde[k][s] for s < k
     std::array<Vec3, N_MAX> q;
     Flat qf(q[0].data(), 3 * j); qf.setZero();
     const double dt_prec = g_dt * g * g;
@@ -292,14 +288,13 @@ static void control_row(int j,
 
     // No source-time-zero observation-noise shock is available to controls.
     calD[j][0](obs_index) = 0.0;
-    (void)A_store;
 }
 
 void primitive_control_kernel(
-    const Kernel2D& D, const Kernel2D& Xtilde, const Kernel2D& A_store,
+    const Kernel2D& D, const Kernel2D& Xtilde,
     double obs_gain_val, int obs_index, const Mat3& Pi, Kernel2D& calD) {
     for (int j = 0; j < g_n; ++j)
-        control_row(j, D, Xtilde, A_store, obs_gain_val, obs_index, Pi, calD);
+        control_row(j, D, Xtilde, obs_gain_val, obs_index, Pi, calD);
 }
 
 // --- CE-based filter: incremental rank-1 projection ---
@@ -513,8 +508,8 @@ void forward_environment(
                         for (int s = 0; s < j; ++s)
                             X[j][s] = X[j - 1][s] + g_dt * (calD1[j - 1][s] + calD2[j - 1][s]);
                     }
-                    filter_row_ws(j, X, Pi_1, obs_idx_1, obs_gain1, env.Xtilde1, env.A_store1, sc1);
-                    filter_row_ws(j, X, Pi_2, obs_idx_2, obs_gain2, env.Xtilde2, env.A_store2, sc2);
+                    filter_row_ws(j, X, Pi_1, obs_idx_1, obs_gain1, env.Xtilde1, sc1);
+                    filter_row_ws(j, X, Pi_2, obs_idx_2, obs_gain2, env.Xtilde2, sc2);
                     control_row_ws(j, D1, env.Xtilde1, obs_gain1, obs_idx_1, Pi_1, calD1, sc1);
                     control_row_ws(j, D2, env.Xtilde2, obs_gain2, obs_idx_2, Pi_2, calD2, sc2);
                 }
@@ -537,12 +532,12 @@ void forward_environment(
                         X[j][s] = X[j - 1][s] + g_dt * (calD1[j - 1][s] + calD2[j - 1][s]);
                 }   // implicit barrier
                 if (tid == 0) {
-                    filter_row(j, X, Pi_1, obs_idx_1, obs_gain1, env.Xtilde1, env.A_store1);
-                    control_row(j, D1, env.Xtilde1, env.A_store1, obs_gain1, obs_idx_1, Pi_1, calD1);
+                    filter_row(j, X, Pi_1, obs_idx_1, obs_gain1, env.Xtilde1);
+                    control_row(j, D1, env.Xtilde1, obs_gain1, obs_idx_1, Pi_1, calD1);
                 }
                 if (tid == nth - 1) {
-                    filter_row(j, X, Pi_2, obs_idx_2, obs_gain2, env.Xtilde2, env.A_store2);
-                    control_row(j, D2, env.Xtilde2, env.A_store2, obs_gain2, obs_idx_2, Pi_2, calD2);
+                    filter_row(j, X, Pi_2, obs_idx_2, obs_gain2, env.Xtilde2);
+                    control_row(j, D2, env.Xtilde2, obs_gain2, obs_idx_2, Pi_2, calD2);
                 }
                 #pragma omp barrier
             }
@@ -578,20 +573,20 @@ void forward_environment(
             #pragma omp section
             compute_filter_kernels(X, Pi_1, obs_idx_1, obs_gain1,
                                    FILTER_INNER_ITERS, FILTER_RELAX,
-                                   env.Xtilde1, env.A_store1);
+                                   env.Xtilde1);
             #pragma omp section
             compute_filter_kernels(X, Pi_2, obs_idx_2, obs_gain2,
                                    FILTER_INNER_ITERS, FILTER_RELAX,
-                                   env.Xtilde2, env.A_store2);
+                                   env.Xtilde2);
         }
 
         #pragma omp parallel sections
         {
             #pragma omp section
-            primitive_control_kernel(D1, env.Xtilde1, env.A_store1,
+            primitive_control_kernel(D1, env.Xtilde1,
                                      obs_gain1, obs_idx_1, Pi_1, calD1_new);
             #pragma omp section
-            primitive_control_kernel(D2, env.Xtilde2, env.A_store2,
+            primitive_control_kernel(D2, env.Xtilde2,
                                      obs_gain2, obs_idx_2, Pi_2, calD2_new);
         }
 
@@ -1237,10 +1232,10 @@ static EquilibriumResult solve_equilibrium_core(
     #pragma omp parallel sections
     {
         #pragma omp section
-        primitive_control_kernel(D1, env.Xtilde1, env.A_store1,
+        primitive_control_kernel(D1, env.Xtilde1,
                                  p1_val, obs_idx_1, Pi_1, calD1);
         #pragma omp section
-        primitive_control_kernel(D2, env.Xtilde2, env.A_store2,
+        primitive_control_kernel(D2, env.Xtilde2,
                                  p2_val, obs_idx_2, Pi_2, calD2);
     }
 
@@ -1343,28 +1338,14 @@ EquilibriumResult solve_equilibrium_ce(
     forward_environment_ce(D1, D2, p1_val, p2_val, FORWARD_INNER_ITERS,
                            Pi_1, obs_idx_1, Pi_2, obs_idx_2, env);
 
-    // After convergence: populate A_store (for F materialization / API compat)
-    // and compute final calD via CE projection, all in parallel.
-    // Reuse Hx1/Hx2 as scratch for the throwaway Xtilde from compute_filter_kernels.
+    // After convergence: final calD via CE projection, both players in parallel.
     Kernel2D calD1, calD2;
     #pragma omp parallel sections
     {
         #pragma omp section
-        {
-            compute_filter_kernels(env.X, Pi_1, obs_idx_1, p1_val,
-                                   FILTER_INNER_ITERS, FILTER_RELAX,
-                                   Hx1, env.A_store1);
-            compute_ce_filter_and_calD(env.X, D1, obs_idx_1, p1_val,
-                                        env.Xtilde1, calD1);
-        }
+        compute_ce_filter_and_calD(env.X, D1, obs_idx_1, p1_val, env.Xtilde1, calD1);
         #pragma omp section
-        {
-            compute_filter_kernels(env.X, Pi_2, obs_idx_2, p2_val,
-                                   FILTER_INNER_ITERS, FILTER_RELAX,
-                                   Hx2, env.A_store2);
-            compute_ce_filter_and_calD(env.X, D2, obs_idx_2, p2_val,
-                                        env.Xtilde2, calD2);
-        }
+        compute_ce_filter_and_calD(env.X, D2, obs_idx_2, p2_val, env.Xtilde2, calD2);
     }
 
     return {D1, D2, std::move(env), std::move(calD1), std::move(calD2), residuals};
@@ -1405,15 +1386,16 @@ CostPair compute_costs_general(const EnvironmentResult& env,
 
 // --- materialize_F (for figure output only) ---
 //
-// Builds F[j][u][s] incrementally from Xtilde + A_store.
-// F[j][u][s] = F[j-1][u][s] + Xtilde[j][u] * A_store[j][s]^T  (interior)
+// Builds F[j][u][s] incrementally from Xtilde.
+// F[j][u][s] = F[j-1][u][s] + Xtilde[j][u] * A[j][s]^T  (interior), A[j][s] = dt g^2 Xtilde[j][s]
 // Borders: F[j][u][j] = g*Xtilde[j][u]*e_i^T, F[j][j][s] = g*e_i*Xtilde[j][s]^T
 
-void materialize_F(const Kernel2D& Xtilde, const Kernel2D& A_store,
+void materialize_F(const Kernel2D& Xtilde,
                    double obs_gain, int obs_index, Kernel3D& F) {
     Vec3 e_i = Vec3::Zero();
     e_i(obs_index) = 1.0;
     double g = obs_gain;
+    const double dt_prec = g_dt * g * g;
 
     F[0][0][0].setZero();
     for (int j = 1; j < g_n; ++j) {
@@ -1425,7 +1407,7 @@ void materialize_F(const Kernel2D& Xtilde, const Kernel2D& A_store,
 
         for (int u = 0; u < j; ++u)
             for (int s = 0; s < j; ++s)
-                F[j][u][s] = F[j - 1][u][s] + Xtilde[j][u] * A_store[j][s].transpose();
+                F[j][u][s] = F[j - 1][u][s] + Xtilde[j][u] * (dt_prec * Xtilde[j][s]).transpose();
     }
 }
 
@@ -1434,11 +1416,12 @@ void materialize_F(const Kernel2D& Xtilde, const Kernel2D& A_store,
 // Computes F[g_n-1][u][s] using ping-pong of two N_MAX×N_MAX slices
 // instead of the full 3D kernel. Memory: ~2 * N_MAX^2 * 72 bytes ≈ 0.9MB.
 
-std::unique_ptr<FSlice> compute_F_slice_at(const Kernel2D& Xtilde, const Kernel2D& A_store,
+std::unique_ptr<FSlice> compute_F_slice_at(const Kernel2D& Xtilde,
                                             double obs_gain, int obs_index, int t_idx) {
     Vec3 e_i = Vec3::Zero();
     e_i(obs_index) = 1.0;
     double g = obs_gain;
+    const double dt_prec = g_dt * g * g;
 
     // Two slices for ping-pong: prev = F[j-1], cur = F[j]
     // Heap-allocated; pointer swap avoids deep copy.
@@ -1456,10 +1439,10 @@ std::unique_ptr<FSlice> compute_F_slice_at(const Kernel2D& Xtilde, const Kernel2
         }
         (*cur)(j, j).setZero();
 
-        // Interior: F[j][u][s] = F[j-1][u][s] + Xtilde[j][u] * A_store[j][s]^T
+        // Interior: F[j][u][s] = F[j-1][u][s] + Xtilde[j][u] * A[j][s]^T, A[j][s] = dt g^2 Xtilde[j][s]
         for (int u = 0; u < j; ++u)
             for (int s = 0; s < j; ++s)
-                (*cur)(u, s) = (*prev)(u, s) + Xtilde[j][u] * A_store[j][s].transpose();
+                (*cur)(u, s) = (*prev)(u, s) + Xtilde[j][u] * (dt_prec * Xtilde[j][s]).transpose();
 
         std::swap(prev, cur);
     }
@@ -1468,9 +1451,9 @@ std::unique_ptr<FSlice> compute_F_slice_at(const Kernel2D& Xtilde, const Kernel2
     return prev;
 }
 
-std::unique_ptr<FSlice> compute_F_slice_at_T(const Kernel2D& Xtilde, const Kernel2D& A_store,
+std::unique_ptr<FSlice> compute_F_slice_at_T(const Kernel2D& Xtilde,
                                               double obs_gain, int obs_index) {
-    return compute_F_slice_at(Xtilde, A_store, obs_gain, obs_index, g_n - 1);
+    return compute_F_slice_at(Xtilde, obs_gain, obs_index, g_n - 1);
 }
 
 // --- Exact discrete conditional expectation ---

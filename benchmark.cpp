@@ -4,6 +4,7 @@
 
 #include "lqg_solver.h"
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <fstream>
 #include <string>
@@ -27,13 +28,15 @@ static void bench(int n, double T, double p1, double p2, double b1, double b2, d
 
     // 1. solve_equilibrium
     auto t0 = Clock::now();
-    auto eq = solve_equilibrium(p1, p2, false);
+    double obs_gain1 = std::sqrt(p1);
+    double obs_gain2 = std::sqrt(p2);
+    auto eq = solve_equilibrium(obs_gain1, obs_gain2, false);
     double eq_ms = ms_since(t0);
     printf("  solve_equilibrium:    %7.1f ms  (%zu iters)\n", eq_ms, eq.residuals.size());
 
     // 2. solve_bar_equilibrium
     t0 = Clock::now();
-    auto bar = solve_bar_equilibrium(eq.env, eq.D1, eq.D2, p1*p1, p2*p2, 2000, 0.08, 1e-10);
+    auto bar = solve_bar_equilibrium(eq.env, eq.D1, eq.D2, p1, p2, 2000, 0.08, 1e-10);
     double bar_ms = ms_since(t0);
     printf("  solve_bar_equilibrium:%7.1f ms\n", bar_ms);
 
@@ -44,20 +47,24 @@ static void bench(int n, double T, double p1, double p2, double b1, double b2, d
     printf("  compute_costs:        %7.1f ms\n", cost_ms);
 
     // 4. wedges (backward_bar_adjoints)
-    auto prec1 = make_constant_prec(p1*p1);
-    auto prec2 = make_constant_prec(p2*p2);
+    auto prec1 = make_constant_prec(p1);
+    auto prec2 = make_constant_prec(p2);
     t0 = Clock::now();
-    auto bba1 = backward_bar_adjoints(eq.env.X, eq.env.Xtilde2, eq.D2, bar.barX, b1, prec2, 0.0);
-    auto bba2 = backward_bar_adjoints(eq.env.X, eq.env.Xtilde1, eq.D1, bar.barX, b2, prec1, 0.0);
+    auto bba1 = backward_bar_adjoints(eq.env.X, eq.env.Xtilde2, eq.D2,
+                                      bar.barX, b1, prec2,
+                                      eq.env.obs_gain2, eq.env.obs_idx2, g_terminal_weight);
+    auto bba2 = backward_bar_adjoints(eq.env.X, eq.env.Xtilde1, eq.D1,
+                                      bar.barX, b2, prec1,
+                                      eq.env.obs_gain1, eq.env.obs_idx1, g_terminal_weight);
     double wedge_ms = ms_since(t0);
     printf("  wedges (bba x2):      %7.1f ms\n", wedge_ms);
 
     // 5. compute_F_slice_at_T (both players)
     t0 = Clock::now();
-    auto F1 = compute_F_slice_at_T(eq.env.Xtilde1, eq.env.A_store1, eq.env.obs_gain1, eq.env.obs_idx1);
+    auto F1 = compute_F_slice_at_T(eq.env.Xtilde1, eq.env.obs_gain1, eq.env.obs_idx1);
     double f1_ms = ms_since(t0);
     t0 = Clock::now();
-    auto F2 = compute_F_slice_at_T(eq.env.Xtilde2, eq.env.A_store2, eq.env.obs_gain2, eq.env.obs_idx2);
+    auto F2 = compute_F_slice_at_T(eq.env.Xtilde2, eq.env.obs_gain2, eq.env.obs_idx2);
     double f2_ms = ms_since(t0);
     printf("  F_slice player 1:     %7.1f ms\n", f1_ms);
     printf("  F_slice player 2:     %7.1f ms\n", f2_ms);

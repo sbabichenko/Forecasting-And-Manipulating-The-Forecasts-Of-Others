@@ -278,7 +278,7 @@ int main(int argc, char** argv) {
     if (g_n > N_MAX_3D) std::cout << "  skipped: N exceeds N_MAX_3D\n";
     else {
         Kernel3D F1;
-        materialize_F(env.Xtilde1, env.A_store1, env.obs_gain1, env.obs_idx1, F1);
+        materialize_F(env.Xtilde1, env.obs_gain1, env.obs_idx1, F1);
         write_F1_T(DATA_DIR + "/fig7_F1_T.csv", F1);
     }
 
