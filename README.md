@@ -259,6 +259,17 @@ estimates respond to the player's own observation noise at lag 0 with weight
 the causal filter against a projection built at the final time, i.e. a
 smoother; it is not a discrepancy of the march.
 
+**Stationarity check** (`test_stationarity N p1 p2 r`): finite differences of the
+discrete cost with respect to single entries of player 1's kernel, with player
+2's strategy, both mean controls and player 1's own projection frozen (the
+deviation of the control appendix), against the same gradient at 0.9 x the
+equilibrium.  Interior ratios are 0.03-0.06 at N=160 and shrink with N; the
+coordinate born at t and the band beside it sit at ~0.15-0.2 (first order in
+dt).  This check found that `compute_costs_general` omitted the diagonal
+(s = j) from its variance sums while the first-order condition charges
+r D(j,j); the sums now run over s <= j (an O(dt) change of the cost values,
+extrapolated J1 unchanged at 4.097).
+
 **Robustness** (stress grid: T in {1, 3}, r in {0.01, 0.05, 0.1, 0.5}, p in
 {0.1, 1, 10, 50}^2, sigma in {0.5, 1}, terminal weight in {0, 1}; 512 cases).
 For small effort cost r the best-response map -(1/r) Hx is far from a

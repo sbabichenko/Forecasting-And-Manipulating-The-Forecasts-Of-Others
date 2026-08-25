@@ -100,3 +100,10 @@ target_compile_options(kb_spectral_q PRIVATE -O3 -march=native -DNDEBUG -std=c++
 if(OpenMP_CXX_FOUND)
     target_link_libraries(kb_spectral_q PRIVATE OpenMP::OpenMP_CXX)
 endif()
+
+add_executable(test_stationarity test_stationarity.cpp lqg_solver.cpp)
+target_include_directories(test_stationarity PRIVATE ${EIGEN3_INCLUDE_DIR})
+target_compile_options(test_stationarity PRIVATE -O3 -march=native)
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(test_stationarity PRIVATE OpenMP::OpenMP_CXX)
+endif()

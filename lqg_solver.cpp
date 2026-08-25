@@ -1537,10 +1537,14 @@ CostPair compute_costs_general(const EnvironmentResult& env,
                                const BarSolution& bar_sol,
                                double r1_val, double r2_val,
                                double b1_val, double b2_val) {
+    // Variance sums run over s <= j: the coordinate born at j (the state's own increment and
+    // the control's loading on the current innovation) is part of X_j and D_j at step j.  The
+    // first-order condition charges r D(j,j); a cost that omitted the diagonal was not
+    // stationary at the solver's fixed point there (finite-difference check, Aug 2026).
     double J1 = 0.0, J2 = 0.0;
     for (int j = 0; j < g_n; ++j) {
         double var_X = 0.0, var_D1 = 0.0, var_D2 = 0.0;
-        for (int s = 0; s < j; ++s) {
+        for (int s = 0; s <= j; ++s) {
             var_X += g_dt * env.X[j][s].squaredNorm();
             var_D1 += g_dt * calD1[j][s].squaredNorm();
             var_D2 += g_dt * calD2[j][s].squaredNorm();
@@ -1553,7 +1557,7 @@ CostPair compute_costs_general(const EnvironmentResult& env,
     if (g_terminal_weight != 0.0) {
         const int j = g_n - 1;
         double var_X_T = 0.0;
-        for (int s = 0; s < j; ++s)
+        for (int s = 0; s <= j; ++s)
             var_X_T += g_dt * env.X[j][s].squaredNorm();
         double dx1_T = bar_sol.barX[j] - b1_val;
         double dx2_T = bar_sol.barX[j] - b2_val;
