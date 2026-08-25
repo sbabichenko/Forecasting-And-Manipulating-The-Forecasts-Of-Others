@@ -28,11 +28,12 @@ extern double g_dt;    // = g_T / (g_n - 1)
 
 // Call this before any solver calls when changing N or T
 void set_grid(int n, double T);
+extern long g_anderson_fallbacks;   // diagnostic: solves that fell back from Anderson to Picard
 
 // ---------- default constants ----------
 constexpr double RHO = 0.1;
 extern double g_x0;  // initial state (default 0.0)
-constexpr double TERMINAL_STATE_WEIGHT = 0.0;
+constexpr double DEFAULT_TERMINAL_STATE_WEIGHT = 0.0;
 constexpr double B1_DEFAULT = 1.0;
 constexpr double B2_DEFAULT = -1.0;
 
@@ -41,6 +42,12 @@ constexpr int FILTER_INNER_ITERS = 6;
 constexpr double FILTER_RELAX = 0.55;
 constexpr int MAX_PICARD_ITERS = 10000;
 constexpr double PICARD_RELAX = 0.15;
+constexpr double PICARD_RELAX_MIN = 0.01;
+constexpr double PICARD_RELAX_MAX = 0.25;
+constexpr double PICARD_RELAX_BACKOFF = 0.5;
+constexpr double PICARD_RELAX_GROWTH = 1.03;
+constexpr double PICARD_RESIDUAL_GROWTH_LIMIT = 1.02;
+constexpr double PICARD_RESIDUAL_DECAY_FOR_GROWTH = 0.90;
 constexpr double PICARD_TOL = 1e-5;
 
 // Mutable game parameters (modified by interactive app)
@@ -49,6 +56,7 @@ extern double g_b2;
 extern double g_r1;  // player 1 control cost weight
 extern double g_r2;  // player 2 control cost weight
 extern double g_sigma;  // state diffusion coefficient (default 1.0)
+extern double g_terminal_weight;  // terminal tracking weight q_T
 
 // Snapshot of all mutable runtime solver parameters.
 struct SolverContext {
@@ -60,6 +68,7 @@ struct SolverContext {
     double r2;
     double sigma;
     double x0;
+    double terminal_weight;
 
     static SolverContext capture_current();
     void apply() const;
@@ -212,28 +221,39 @@ void forward_environment(
 // Hk-free version: uses internal ping-pong buffers instead of 36MB Kernel3D
 void backward_kernels(const Kernel2D& X, const Kernel2D& Xtildek,
                       const Kernel2D& Dk, const std::array<double, N_MAX>& prec_k,
+                      double obs_gain_k, int obs_idx_k,
                       double terminal_state_weight,
                       Kernel2D& Hx);
 
 // Version that also outputs the kernel information wedge V^i(t,r)
 void backward_kernels(const Kernel2D& X, const Kernel2D& Xtildek,
                       const Kernel2D& Dk, const std::array<double, N_MAX>& prec_k,
+                      double obs_gain_k, int obs_idx_k,
                       double terminal_state_weight,
                       Kernel2D& Hx, Kernel2D& Vkernel);
 
 // Legacy version that also fills Hk (only needed for figure output)
 void backward_kernels(const Kernel2D& X, const Kernel2D& Xtildek,
                       const Kernel2D& Dk, const std::array<double, N_MAX>& prec_k,
+                      double obs_gain_k, int obs_idx_k,
                       double terminal_state_weight,
                       Kernel2D& Hx, Kernel3D& Hk);
 
 BackwardBarResult backward_bar_adjoints(
     const Kernel2D& X, const Kernel2D& Xtildek, const Kernel2D& Dk,
     const std::array<double, N_MAX>& barX, double b,
-    const std::array<double, N_MAX>& prec_k, double terminal_weight);
+    const std::array<double, N_MAX>& prec_k,
+    double obs_gain_k, int obs_idx_k,
+    double terminal_weight);
+
+double mean_information_wedge_at(
+    const Kernel2D& Xtildek, const Kernel2D& barHk,
+    const std::array<double, N_MAX>& prec_k,
+    double obs_gain_k, int obs_idx_k, int t_idx);
 
 BarSolution solve_bar_equilibrium(
     const EnvironmentResult& env, const Kernel2D& D1, const Kernel2D& D2,
+    // Precision inputs P_i = gamma_i^2.
     double prec1, double prec2,
     int max_iters = 2000, double relax = 0.08, double tol = 1e-10,
     bool verbose = false);
@@ -245,18 +265,22 @@ struct EquilibriumResult {
     std::vector<double> residuals;
 };
 
+// Solver-level convention: these arguments are observation gains gamma_i.
+// Paper-level precision p_i should be passed as std::sqrt(p_i).
 EquilibriumResult solve_equilibrium(
     double p1_val, double p2_val, bool verbose = true,
     const Mat3& Pi_1 = Pi1(), int obs_idx_1 = 1,
     const Mat3& Pi_2 = Pi2(), int obs_idx_2 = 2);
 
-// CE-based version: uses discrete conditional expectation in the Picard loop
+// CE-based version: uses discrete conditional expectation in the Picard loop.
+// The first two arguments are observation gains gamma_i.
 EquilibriumResult solve_equilibrium_ce(
     double p1_val, double p2_val, bool verbose = true,
     const Mat3& Pi_1 = Pi1(), int obs_idx_1 = 1,
     const Mat3& Pi_2 = Pi2(), int obs_idx_2 = 2);
 
-// Warm-started version: uses D1_init, D2_init as initial guesses
+// Warm-started version: uses D1_init, D2_init as initial guesses.
+// The first two arguments are observation gains gamma_i.
 EquilibriumResult solve_equilibrium_warm(
     double p1_val, double p2_val,
     const Kernel2D& D1_init, const Kernel2D& D2_init,

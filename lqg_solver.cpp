@@ -5,6 +5,7 @@
 // decomposition F[j][u][s] = border + sum_k Xtilde[k][u] * A_store[k][s]^T.
 
 #include <cstdlib>
+#include <Eigen/Dense>
 #ifdef _OPENMP
 #include <omp.h>
 #else
@@ -564,42 +565,50 @@ void backward_kernels(const Kernel2D& X, const Kernel2D& Xtildek,
     Vec3 e_obs = Vec3::Zero();
     e_obs(obs_idx_k) = 1.0;
 
-    ensure_hk_buffers();
-    // Only zero the portion we'll use (g_n rows × g_n cols)
-    for (int z = 0; z < g_n; ++z)
-        for (int r = 0; r < g_n; ++r)
-            (*s_hk_buf0)(z, r).setZero();
-    HkSlice* cur = s_hk_buf0.get();
-    HkSlice* nxt = s_hk_buf1.get();
+    // Hk-free formulation.  With Hk[n-1] = 0 and
+    //   Hk[t](z, r) = Hk[t+1](z, r) + dt (Dk[t+1][r] Hx[t+1][z]^T - X[t+1][z] W[t+1][r]^T),
+    // Hk[t] is the sum over t' > t of rank-one (in z, r) terms, so the two
+    // contractions the recursion needs are formed from 3x3 moments instead of
+    // an N^2 array of 3x3 blocks:
+    //   sum_z Hk[tp](z, r)^T Xtilde[tp][z]
+    //     = sum_{t' > tp} dt ( M_{t'} Dk[t'][r] - p_{t'} W[t'][r] ),
+    //   M_{t'} = sum_{z <= tp} Hx[t'][z] Xtilde[tp][z]^T,   p_{t'} = sum_{z <= tp} X[t'][z] . Xtilde[tp][z],
+    //   Hk[tp](tp, r)^T e = sum_{t' > tp} dt ( Hx[t'][tp] (Dk[t'][r] . e) - W[t'][r] (X[t'][tp] . e) ).
+    // Cost O(N^3) flops with O(N^2) vectors of memory, no block array.
+    const int n = g_n;
+    static thread_local std::vector<Vec3> Whist;      // W[t][r], r <= t-1, row-major t * n + r
+    if (static_cast<int>(Whist.size()) < n * n) Whist.resize(n * n);
+    static thread_local std::vector<Mat3> Mbuf;       // M_{t'} for the current level
+    static thread_local std::vector<double> pbuf;     // p_{t'}
+    if (static_cast<int>(Mbuf.size()) < n) { Mbuf.resize(n); pbuf.resize(n); }
 
-    for (int j = g_n - 2; j >= 0; --j) {
-        int tp = j + 1;  // t+1
-        double Pk = prec_k[tp];
+    std::array<Vec3, N_MAX> W;
+    for (int j = n - 2; j >= 0; --j) {
+        const int tp = j + 1;  // t+1
+        const double Pk = prec_k[tp];
 
-        // W[r] = Gamma^T E Hk[tp][tp][r]
-        //      + g_dt * Pk * sum_z Hk[tp][z][r]^T * Xtilde[tp][z]
-        std::array<Vec3, N_MAX> W;
+        // moments of the later levels against Xtilde[tp][.]
+        for (int t2 = tp + 1; t2 < n; ++t2) {
+            Mat3 M = Mat3::Zero(); double pv = 0.0;
+            const Vec3* hxrow = &Hx[t2][0]; const Vec3* xrow = &X[t2][0]; const Vec3* xtrow = &Xtildek[tp][0];
+            for (int z = 0; z <= tp; ++z) { M.noalias() += hxrow[z] * xtrow[z].transpose(); pv += xrow[z].dot(xtrow[z]); }
+            Mbuf[t2] = M; pbuf[t2] = pv;
+        }
+        // W[r] = Gamma^T E Hk[tp][tp][r] + g_dt * Pk * sum_z Hk[tp][z][r]^T * Xtilde[tp][z]
+        // Diagonal innovation-birth term: Gamma^T E H^k_t(t, .), from delta w^k_t(t) = E^{k,T} Gamma^k(t) e^k_t.
         for (int r = 0; r <= j; ++r) {
-            Vec3 acc = Vec3::Zero();
-            for (int z = 0; z <= tp; ++z)
-                acc += (*cur)(z, r).transpose() * Xtildek[tp][z];
-            // Diagonal innovation-birth term:
-            // Gamma^T E H^k_t(t, .), from delta w^k_t(t)
-            // = E^{k,T} Gamma^k(t) e^k_t.
-            W[r] = obs_gain_k * ((*cur)(tp, r).transpose() * e_obs)
-                 + g_dt * Pk * acc;
+            Vec3 acc = Vec3::Zero(), diag = Vec3::Zero();
+            for (int t2 = tp + 1; t2 < n; ++t2) {
+                const Vec3& d = Dk[t2][r]; const Vec3& w = Whist[t2 * n + r];
+                acc.noalias() += Mbuf[t2] * d; acc -= pbuf[t2] * w;
+                diag += Hx[t2][tp] * d(obs_idx_k) - w * X[t2][tp](obs_idx_k);
+            }
+            W[r] = obs_gain_k * g_dt * diag + g_dt * Pk * g_dt * acc;
+            Whist[tp * n + r] = W[r];
         }
 
         for (int r = 0; r <= j; ++r)
             Hx[j][r] = Hx[tp][r] + g_dt * (X[tp][r] + W[r]);
-
-        for (int z = 0; z <= j; ++z)
-            for (int r = 0; r <= j; ++r)
-                (*nxt)(z, r) = (*cur)(z, r)
-                    + g_dt * (Dk[tp][r] * Hx[tp][z].transpose()
-                          - X[tp][z] * W[r].transpose());
-
-        std::swap(cur, nxt);
     }
 }
 
@@ -883,6 +892,41 @@ static bool adapt_picard_damping(double err, double& prev_err,
     return true;
 }
 
+// Anderson acceleration (type II) on the stacked kernel vector x = (D1, D2).
+// Given the history of iterates x_k and their images g_k = G(x_k), the next
+// iterate is x = sum_i a_i ((1 - beta) x_i + beta g_i) with sum a_i = 1
+// minimising |sum_i a_i f_i|, f_i = g_i - x_i.  Depth m keeps the last m + 1
+// pairs.
+long g_anderson_fallbacks = 0;   // solves in which acceleration was abandoned (diagnostic)
+struct AndersonState {
+    int depth = 5; double beta = 0.6; double first_step = 0.15; double growth = 3.0;   // growth: residual increase tolerated in one accelerated step
+    std::vector<Eigen::VectorXd> xs, fs;     // history, newest last
+    void reset() { xs.clear(); fs.clear(); }
+    // x, f (= g - x) of the current iterate; on return x holds the next iterate
+    bool step(Eigen::VectorXd& x, const Eigen::VectorXd& f) {
+        xs.push_back(x); fs.push_back(f);
+        if (static_cast<int>(xs.size()) > depth + 1) { xs.erase(xs.begin()); fs.erase(fs.begin()); }
+        const int m = static_cast<int>(xs.size()) - 1;
+        if (m == 0) { x = x + first_step * f; return true; }   // first move: the safe relaxation, not beta
+        Eigen::MatrixXd dF(f.size(), m), dX(f.size(), m);
+        for (int i = 0; i < m; ++i) { dF.col(i) = fs[i + 1] - fs[i]; dX.col(i) = xs[i + 1] - xs[i]; }
+        const Eigen::MatrixXd G = dF.transpose() * dF;
+        Eigen::LDLT<Eigen::MatrixXd> ldlt(G + 1e-12 * G.trace() * Eigen::MatrixXd::Identity(m, m));
+        const Eigen::VectorXd gamma = ldlt.solve(dF.transpose() * f);
+        if (!gamma.allFinite()) { reset(); return false; }
+        x = x + beta * f - (dX + beta * dF) * gamma;
+        return true;
+    }
+};
+
+static void pack_kernels(const Kernel2D& D1, const Kernel2D& D2, int tri, Eigen::VectorXd& x) {
+    x.resize(6 * tri);
+    for (int i = 0; i < tri; ++i) { x.segment<3>(3 * i) = D1.data[i]; x.segment<3>(3 * (tri + i)) = D2.data[i]; }
+}
+static void unpack_kernels(const Eigen::VectorXd& x, int tri, Kernel2D& D1, Kernel2D& D2) {
+    for (int i = 0; i < tri; ++i) { D1.data[i] = x.segment<3>(3 * i); D2.data[i] = x.segment<3>(3 * (tri + i)); }
+}
+
 // Core solver: takes initial D1, D2 (may be zero or warm-started)
 static EquilibriumResult solve_equilibrium_core(
     double p1_val, double p2_val,
@@ -905,11 +949,24 @@ static EquilibriumResult solve_equilibrium_core(
     double relax = PICARD_RELAX;
     bool have_prev = false;
 
+    // Anderson acceleration of the outer fixed point (LQG_ANDERSON="depth,beta";
+    // depth 0 restores plain relaxed Picard).  Engaged once the relaxed Picard
+    // iteration has brought the residual below ANDERSON_START; a step that
+    // increases the residual by more than ANDERSON_GROWTH is rejected, the
+    // history cleared, and a Picard step taken from the previous iterate.
+    static const AndersonState and_cfg = [] { AndersonState a; if (const char* e = std::getenv("LQG_ANDERSON")) { double d = 5, b = 0.6, g = 3.0; if (std::sscanf(e, "%lf,%lf,%lf", &d, &b, &g) >= 1) { a.depth = static_cast<int>(d); a.beta = b; a.growth = g; } } return a; }();
+    AndersonState anderson = and_cfg;
+    constexpr double ANDERSON_START = 0.5; const double ANDERSON_GROWTH = anderson.growth;
+    Eigen::VectorXd xa, fa;
+    bool anderson_active = false;
+    double best_err = std::numeric_limits<double>::infinity(); int since_best = 0;   // stagnation guard
+    constexpr int ANDERSON_STALL = 8;
+
     for (int it = 1; it <= MAX_PICARD_ITERS; ++it) {
         forward_environment(D1, D2, p1_val, p2_val, FORWARD_INNER_ITERS,
                             Pi_1, obs_idx_1, Pi_2, obs_idx_2, env);
 
-        #pragma omp parallel sections
+        #pragma omp parallel sections num_threads(2)
         {
             #pragma omp section
             backward_kernels(env.X, env.Xtilde2, D2, prec2,
@@ -937,6 +994,29 @@ static EquilibriumResult solve_equilibrium_core(
         }
         if (it == MAX_PICARD_ITERS)
             break;
+
+        if (err < 0.98 * best_err) { best_err = err; since_best = 0; } else ++since_best;
+        if (anderson.depth > 0 && err < ANDERSON_START) {
+            const bool stalled = anderson_active && since_best >= ANDERSON_STALL;
+            const bool blew_up = anderson_active && have_prev && err > prev_err * ANDERSON_GROWTH;
+            if (stalled || blew_up) {
+                // Give up on acceleration for this solve: restore the best Picard-safe
+                // iterate seen and continue with the relaxed Picard iteration, which is
+                // known to converge (44 iterations on the benchmark).
+                anderson.reset(); anderson.depth = 0; anderson_active = false;
+                D1 = prev_D1; D2 = prev_D2; have_prev = false;
+                relax = PICARD_RELAX; ++g_anderson_fallbacks;
+                if (verbose || std::getenv("LQG_ANDERSON_TRACE")) std::fprintf(stderr, "  [anderson %s at it=%d err=%.2e prev=%.2e] p=(%.3g,%.3g) r=(%g,%g) sigma=%g b=(%g,%g)\n", stalled ? "stalled" : "diverging", it, err, prev_err, p1_val, p2_val, g_r1, g_r2, g_sigma, g_b1, g_b2);
+                // the Picard update below acts on the restored iterate with a stale Hx,
+                // which only affects the size of this one relaxation step
+            } else {
+                pack_kernels(D1, D2, TRI, xa);
+                fa.resize(6 * TRI);
+                for (int i = 0; i < TRI; ++i) { fa.segment<3>(3 * i) = neg_inv_r1 * Hx1.data[i] - D1.data[i]; fa.segment<3>(3 * (TRI + i)) = neg_inv_r2 * Hx2.data[i] - D2.data[i]; }
+                prev_D1 = D1; prev_D2 = D2; prev_err = err; have_prev = true; anderson.first_step = relax;
+                if (anderson.step(xa, fa)) { unpack_kernels(xa, TRI, D1, D2); anderson_active = true; continue; }
+            }
+        }
 
         if (!adapt_picard_damping(err, prev_err, relax, D1, D2,
                                   prev_D1, prev_D2, have_prev,

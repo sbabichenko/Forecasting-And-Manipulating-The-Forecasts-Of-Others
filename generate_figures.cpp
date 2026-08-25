@@ -770,6 +770,7 @@ int main(int argc, char** argv) {
     g_sigma = 1.0;
 
     std::cout << "\n" << std::string(60, '=') << "\n";
+    std::cout << "Anderson fallbacks to Picard: " << g_anderson_fallbacks << "\n";
     std::cout << "All data written to " << DATA_DIR << "/\n";
     std::cout << "Run: python3 plot_figures.py\n";
 

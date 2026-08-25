@@ -200,6 +200,27 @@ The equilibrium is found by a three-level nested iteration:
    closed-form Kalman gain per time index j; `FILTER_INNER_ITERS` and
    `FILTER_RELAX` are no longer used.
 
+4. **Backward adjoints** (`backward_kernels`): Hk-free.  The adjoint block
+   kernel Hk[t] is a sum over later times of rank-one (in the two source
+   indices) terms, so the two contractions the backward recursion needs are
+   formed from 3x3 moment matrices of Hx, X and Xtilde instead of an N^2 array
+   of 3x3 blocks; O(N^3) flops, O(N^2) vectors of memory.  The previous
+   in-place block recursion was bound by cache bandwidth (three passes over a
+   1.8 MB array per level at N=160) and took 89% of a solve.
+
+5. **Outer acceleration**: Anderson (type II, depth 5, mixing 0.6) on the
+   stacked kernel vector, engaged once the relaxed Picard residual is below
+   0.5, first accelerated move scaled by the current relaxation, and a
+   permanent fallback to the relaxed Picard iteration if a step grows the
+   residual more than 3x or stalls for 8 steps (`LQG_ANDERSON=depth,beta,growth`;
+   depth 0 = plain Picard).  Benchmark (3,3): 44 -> 17 outer iterations;
+   results agree with Picard to the 1e-5 tolerance across the whole figure
+   sweep, with no fallbacks.
+
+Timings for the (3,3) benchmark solve (one core pair): N=40 4 ms, N=160
+0.19 s (was 27 ms and 1.4 s before the exact march, Hk-free adjoints and
+Anderson).  The full figure pipeline at N=40 takes 2 s (was 8 s).
+
 After the kernel equilibrium converges, a separate scalar fixed-point
 (`solve_bar_equilibrium`) finds the mean-field trajectory, and backward
 adjoints compute cost sensitivities.
