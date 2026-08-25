@@ -158,6 +158,9 @@ struct Forward {
                 AH.block(0, j * N, N, N).noalias() += HW(j, q) * HX.row(j * m + q).transpose() * HS[j].row(q);
                 AT.block(0, j * N, N, N).noalias() += TW(j, q) * TX.row(j * m + q).transpose() * TY[j].row(q);
             }
+        // the layouts are only needed to build AH and AT
+        HS.clear(); HS.shrink_to_fit(); TY.clear(); TY.shrink_to_fit();
+        HX.resize(0, 0); TX.resize(0, 0); HW.resize(0, 0); TW.resize(0, 0);
         // cumulative integral (C f)(a_j) = int_0^{a_j} f
         cumint = MatrixXd::Zero(N, N);
         for (int j = 0; j < N; ++j) {
@@ -322,6 +325,8 @@ struct Backward {
         for (int j = 0; j < N; ++j)
             for (int q = 0; q < m; ++q)
                 if (SW(j, q) != 0.0) R[j].noalias() += SW(j, q) * SPf[j].row(q).transpose() * SPg[j].row(q);
+        // the layouts are only needed to build QT and R
+        lay.clear(); lay.shrink_to_fit(); SPf.clear(); SPf.shrink_to_fit(); SPg.clear(); SPg.shrink_to_fit(); SW.resize(0, 0);
     }
 
     VectorXd shifted_inner(const MatrixXd& f, const MatrixXd& g) const {
