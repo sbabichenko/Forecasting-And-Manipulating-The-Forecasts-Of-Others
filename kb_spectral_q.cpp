@@ -748,7 +748,7 @@ struct Solver {
     VectorXd apply_Jinv(const VectorXd& r) const { VectorXd x = Jlu.solve(r); for (size_t k = 0; k < bu.size(); ++k) x += bu[k] * bv[k].dot(r); return x; }
     struct JinvOp { const Solver* S; VectorXd operator*(const VectorXd& r) const { return S->apply_Jinv(r); } };
     JinvOp Jinv{this};
-    bool jfnk = true; int gmres_max = 12; double gmres_tol = 1e-3; bool analytic = true; bool batched = true; int chunk = 48; bool krylov_stalled = false; bool exact_newton = false; bool range_newton = false; bool lagged = false; int lag_max_its = 6;
+    bool jfnk = true; int gmres_max = 12; double gmres_tol = 1e-3; bool analytic = true; bool batched = false; int chunk = 48; bool krylov_stalled = false; bool exact_newton = false; bool range_newton = false; bool lagged = false; int lag_max_its = 6;
     Model::Diag cur; bool have_cur = false;   // factorizations at the current iterate, preconditioning nearby evaluations
     long gmres_its = 0;
     explicit Solver(Model& m) : M(m) {}
@@ -933,7 +933,7 @@ int main(int argc, char* argv[]) {
     std::vector<VectorXd> gam;
     { std::string s = argv[6]; size_t p = 0; while (p <= s.size()) { size_t e = s.find(';', p); if (e == std::string::npos) e = s.size(); auto v = parse_list(s.substr(p, e - p)); VectorXd g(q); for (int k = 0; k < q; ++k) g[k] = v.size() == 1 ? v[0] : v[k]; gam.push_back(g); p = e + 1; } }
     MatrixXd SV = MatrixXd::Identity(q, q), SZ = MatrixXd::Identity(q, q);
-    double tol = 1e-10, split_b = 0.0, map_alpha = 0.0; int uniform = 0, coarse = 0, n1 = 0; bool verbose = false, eval_only = false, adaptive = true, tangent = true, use_jfnk = true, use_analytic = true, check_jac = false, exact_nt = true, range_nt = false, lagged_nt = true; int gm_max = 12, lag_its = 8, pre_steps = 60, chunk_sz = 48; double min_ratio = 0.25; bool no_batch = false; double gm_tol = 1e-3; std::vector<double> path; std::string init_file;
+    double tol = 1e-10, split_b = 0.0, map_alpha = 0.0; int uniform = 0, coarse = 0, n1 = 0; bool verbose = false, eval_only = false, adaptive = true, tangent = true, use_jfnk = true, use_analytic = true, check_jac = false, exact_nt = true, range_nt = false, lagged_nt = true; int gm_max = 12, lag_its = 8, pre_steps = 60, chunk_sz = 48; double min_ratio = 0.25; bool no_batch = true; double gm_tol = 1e-3; std::vector<double> path; std::string init_file;
     for (int i = 7; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--sigma-v") && i + 1 < argc) { auto v = parse_list(argv[++i]); for (int r = 0; r < q; ++r) for (int c = 0; c < q; ++c) SV(r, c) = v[r * q + c]; }
         else if (!std::strcmp(argv[i], "--sigma-z") && i + 1 < argc) { auto v = parse_list(argv[++i]); for (int r = 0; r < q; ++r) for (int c = 0; c < q; ++c) SZ(r, c) = v[r * q + c]; }
@@ -950,6 +950,7 @@ int main(int argc, char* argv[]) {
         else if (!std::strcmp(argv[i], "--lagged") && i + 1 < argc) { lagged_nt = true; lag_its = std::atoi(argv[++i]); }
         else if (!std::strcmp(argv[i], "--no-lag")) lagged_nt = false;
         else if (!std::strcmp(argv[i], "--no-batch")) no_batch = true;
+        else if (!std::strcmp(argv[i], "--batch")) no_batch = false;
         else if (!std::strcmp(argv[i], "--chunk") && i + 1 < argc) chunk_sz = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--pre") && i + 1 < argc) pre_steps = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--min-ratio") && i + 1 < argc) min_ratio = std::atof(argv[++i]);
