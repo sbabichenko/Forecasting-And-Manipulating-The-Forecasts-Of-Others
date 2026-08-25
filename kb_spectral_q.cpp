@@ -354,7 +354,7 @@ int main(int argc, char* argv[]) {
     std::vector<VectorXd> gam;
     { std::string s = argv[6]; size_t p = 0; while (p <= s.size()) { size_t e = s.find(';', p); if (e == std::string::npos) e = s.size(); auto v = parse_list(s.substr(p, e - p)); VectorXd g(q); for (int k = 0; k < q; ++k) g[k] = v.size() == 1 ? v[0] : v[k]; gam.push_back(g); p = e + 1; } }
     MatrixXd SV = MatrixXd::Identity(q, q), SZ = MatrixXd::Identity(q, q);
-    double tol = 1e-10; int uniform = 0; bool verbose = false, eval_only = false; std::vector<double> path; std::string init_file;
+    double tol = 1e-10; int uniform = 0, coarse = 0; bool verbose = false, eval_only = false, adaptive = true, tangent = true; std::vector<double> path; std::string init_file;
     for (int i = 7; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--sigma-v") && i + 1 < argc) { auto v = parse_list(argv[++i]); for (int r = 0; r < q; ++r) for (int c = 0; c < q; ++c) SV(r, c) = v[r * q + c]; }
         else if (!std::strcmp(argv[i], "--sigma-z") && i + 1 < argc) { auto v = parse_list(argv[++i]); for (int r = 0; r < q; ++r) for (int c = 0; c < q; ++c) SZ(r, c) = v[r * q + c]; }
@@ -363,6 +363,11 @@ int main(int argc, char* argv[]) {
         else if (!std::strcmp(argv[i], "--uniform") && i + 1 < argc) uniform = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--verbose")) verbose = true;
         else if (!std::strcmp(argv[i], "--eval-only")) eval_only = true;
+        else if (!std::strcmp(argv[i], "--adaptive")) adaptive = true;
+        else if (!std::strcmp(argv[i], "--no-adaptive")) adaptive = false;
+        else if (!std::strcmp(argv[i], "--no-tangent")) tangent = false;
+        else if (!std::strcmp(argv[i], "--tangent")) tangent = true;
+        else if (!std::strcmp(argv[i], "--coarse") && i + 1 < argc) coarse = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--init") && i + 1 < argc) init_file = argv[++i];
         else if (!std::strcmp(argv[i], "--threads") && i + 1 < argc) {
 #ifdef _OPENMP
@@ -377,46 +382,94 @@ int main(int argc, char* argv[]) {
 #endif
     if (path.empty()) { for (double e : {0.3, 0.1, 0.05, 0.02, 0.01, 0.005, 0.002}) if (e > eps) path.push_back(e); path.push_back(eps); }   // correlated-value cases need the finer path
     const auto t0 = std::chrono::steady_clock::now();
+    // continuation in eps on a given model from a start vector; returns the solution at the target (or the last good one)
+    auto continuation = [&](Model& M, Solver& S, VectorXd z, std::vector<double> path, int pre0, bool& ok_out) {
+        VectorXd zprev; double eprev = 0; bool have_prev = false;
+        Solver::Out o; o.ok = false;
+        int bisections = 0; double factor = 0.4;                   // adaptive: next eps = factor * current
+        for (size_t k = 0; k < path.size(); ++k) {
+            M.eps = path[k];
+            VectorXd zstart = z;
+            if (have_prev) {
+                // candidates: plain warm start, secant extrapolation, tangent predictor (if a Jacobian exists)
+                std::vector<std::pair<double, VectorXd>> cands;
+                const VectorXd zx = z + (z - zprev) * ((path[k] - path[k - 1]) / (path[k - 1] - eprev));
+                cands.emplace_back(M.residual(z).cwiseAbs().maxCoeff(), z);
+                cands.emplace_back(M.residual(zx).cwiseAbs().maxCoeff(), zx); S.evals += 2;
+                if (tangent && S.have_J) {
+                    const double e1 = path[k - 1], d = 1e-3 * e1;
+                    M.eps = e1;       const VectorXd r0 = M.residual(z);
+                    M.eps = e1 + d;   const VectorXd r1 = M.residual(z);
+                    M.eps = path[k];  S.evals += 2;
+                    const VectorXd zt = z - S.Jinv * ((r1 - r0) / d) * (path[k] - e1);
+                    cands.emplace_back(M.residual(zt).cwiseAbs().maxCoeff(), zt); ++S.evals;
+                }
+                size_t best = 0; for (size_t c = 1; c < cands.size(); ++c) if (std::isfinite(cands[c].first) && cands[c].first < cands[best].first) best = c;
+                zstart = cands[best].second;
+                if (verbose) { std::fprintf(stderr, "  start candidates |r|:"); for (auto& c : cands) std::fprintf(stderr, " %.2e", c.first); std::fprintf(stderr, " -> %zu\n", best); }
+            }
+            o = S.solve(zstart, tol, (k == 0 && pre0 > 0) ? pre0 : 0, 0.1);
+            if (!o.ok) { S.have_J = false; o = S.solve(z, tol, k == 0 ? 0 : 30, 0.1); }
+            if (verbose) std::fprintf(stderr, "[N=%d] eps=%g: %s |r| %.2e, %d steps, %d jacobians, %ld evals, %.1f s elapsed\n", M.N, path[k], o.ok ? "ok" : "FAIL", o.resid, o.steps, o.jacobians, S.evals, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+            if (!o.ok) {
+                if (k > 0 && bisections < 6) { ++bisections; path.insert(path.begin() + k, 0.5 * (path[k - 1] + path[k])); have_prev = false; S.have_J = false; factor = std::sqrt(factor); --k; continue; }
+                break;
+            }
+            if (k > 0) { zprev = z; eprev = path[k - 1]; have_prev = true; }
+            z = o.z;
+            if (adaptive && k + 1 < path.size()) {
+                // replace the rest of the path by one geometric step, sized by how easy this step was
+                if (o.steps <= 8) factor *= 0.6; else if (o.steps >= 20) factor = std::sqrt(factor);
+                factor = std::max(0.05, std::min(0.7, factor));
+                const double target = path.back();
+                double next = path[k] * factor; if (next < target) next = target;
+                path.erase(path.begin() + k + 1, path.end()); path.push_back(next); if (next > target) path.push_back(target);
+            }
+        }
+        ok_out = o.ok;
+        return o;
+    };
+
     Model M(N, L, path.front(), rho, q, gam, SV, SZ);
     Solver S(M); S.verbose = verbose;
-    VectorXd z = VectorXd::Zero(M.dim() * M.NT), zprev; double eprev = 0; bool have_prev = false;
-    Solver::Out o;
+    VectorXd z = VectorXd::Zero(M.dim() * M.NT);
+    Solver::Out o; o.ok = false;
     if (!init_file.empty()) {
-        // plain text: NT blocks of NC*q lines, each line N nodal values (channel-major, then component)
         std::FILE* f = std::fopen(init_file.c_str(), "r");
         if (!f) { std::fprintf(stderr, "cannot read %s\n", init_file.c_str()); return 1; }
         std::vector<MatrixXd> cs(M.NT, MatrixXd::Zero(M.NC * N, q));
         for (int i = 0; i < M.NT; ++i) for (int ch = 0; ch < M.NC; ++ch) for (int k = 0; k < q; ++k) for (int a = 0; a < N; ++a) { double x; if (std::fscanf(f, "%lf", &x) != 1) { std::fprintf(stderr, "short init file\n"); return 1; } cs[i](ch * N + a, k) = x; }
         std::fclose(f);
         z = M.pack(cs);
-        path = {eps};   // solve at the target cost directly from the warm start
+        path = {eps};
     }
+    bool ok = false;
     if (eval_only) {
         M.eps = eps;
         const VectorXd r = M.residual(z);
         std::fprintf(stderr, "eval-only: |r|_max %.3e  |r|_2 %.3e\n", r.cwiseAbs().maxCoeff(), r.norm());
-        o.z = z; o.resid = r.cwiseAbs().maxCoeff(); o.steps = 0; o.jacobians = 0; o.ok = true; path.clear();
-    }
-    int bisections = 0;
-    for (size_t k = 0; k < path.size(); ++k) {
-        M.eps = path[k];
-        VectorXd zstart = z;
-        if (have_prev) {   // secant extrapolation in eps, kept only if it has the smaller residual
-            const VectorXd zx = z + (z - zprev) * ((path[k] - path[k - 1]) / (path[k - 1] - eprev));
-            const double rx = M.residual(zx).cwiseAbs().maxCoeff(), rz = M.residual(z).cwiseAbs().maxCoeff(); S.evals += 2;
-            if (std::isfinite(rx) && rx < rz) zstart = zx;
-            if (verbose) std::fprintf(stderr, "  start: extrapolated |r| %.2e, plain %.2e -> %s\n", rx, rz, rx < rz ? "extrapolated" : "plain");
-        }
-        o = S.solve(zstart, tol, (k == 0 && init_file.empty()) ? 60 : 0, 0.1);
-        if (!o.ok) { S.have_J = false; o = S.solve(z, tol, k == 0 ? 0 : 30, 0.1); }          // plain warm start
-        if (verbose) std::fprintf(stderr, "eps=%g: %s |r| %.2e, %d steps, %d jacobians, %ld evals, %.1f s elapsed\n", path[k], o.ok ? "ok" : "FAIL", o.resid, o.steps, o.jacobians, S.evals, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
-        if (!o.ok) {
-            if (k > 0 && bisections < 4) {                                                   // bisect the eps step
-                ++bisections; path.insert(path.begin() + k, 0.5 * (path[k - 1] + path[k])); have_prev = false; S.have_J = false; --k; continue;
-            }
-            break;
-        }
-        if (k > 0) { zprev = z; eprev = path[k - 1]; have_prev = true; }
+        o.z = z; o.resid = r.cwiseAbs().maxCoeff(); o.steps = 0; o.jacobians = 0; o.ok = true;
+    } else if (coarse > 0 && coarse < N && init_file.empty()) {
+        // coarse-to-fine: full continuation at N0 = coarse, interpolate, then solve the target directly at N
+        Model Mc(coarse, L, path.front(), rho, q, gam, SV, SZ);
+        Solver Sc(Mc); Sc.verbose = verbose;
+        VectorXd zc = VectorXd::Zero(Mc.dim() * Mc.NT);
+        bool okc = false;
+        const Solver::Out oc = continuation(Mc, Sc, zc, path, 60, okc);
+        S.evals += Sc.evals;
+        if (!okc) { std::fprintf(stderr, "coarse continuation failed\n"); return 2; }
+        const MatrixXd P = Panel(coarse, 0.0, L).interp(M.K.x);            // (N x coarse)
+        const std::vector<MatrixXd> csc = Mc.unpack(oc.z);
+        std::vector<MatrixXd> cs(M.NT, MatrixXd::Zero(M.NC * N, q));
+        for (int i = 0; i < M.NT; ++i) for (int ch = 0; ch < M.NC; ++ch) cs[i].block(ch * N, 0, N, q) = P * csc[i].block(ch * coarse, 0, coarse, q);
+        z = M.pack(cs);
+        M.eps = eps;
+        o = S.solve(z, tol, 0, 0.1);
+        if (!o.ok) { S.have_J = false; o = S.solve(z, tol, 30, 0.1); }
+        if (verbose) std::fprintf(stderr, "[N=%d] eps=%g from coarse N=%d: %s |r| %.2e, %d steps, %d jacobians, %ld evals, %.1f s elapsed\n", N, eps, coarse, o.ok ? "ok" : "FAIL", o.resid, o.steps, o.jacobians, S.evals, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+        if (o.ok) z = o.z;
+    } else {
+        o = continuation(M, S, z, path, init_file.empty() ? 60 : 0, ok);
         z = o.z;
     }
     const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
