@@ -86,3 +86,10 @@ target_compile_options(solve_spectral PRIVATE -O3 -march=native -DNDEBUG -std=c+
 if(OpenMP_CXX_FOUND)
     target_link_libraries(solve_spectral PRIVATE OpenMP::OpenMP_CXX)
 endif()
+
+add_executable(kb_spectral kb_spectral.cpp)
+target_link_libraries(kb_spectral PRIVATE Eigen3::Eigen)
+target_compile_options(kb_spectral PRIVATE -O3 -march=native -DNDEBUG -std=c++17 -Wall -Wextra)
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(kb_spectral PRIVATE OpenMP::OpenMP_CXX)
+endif()
