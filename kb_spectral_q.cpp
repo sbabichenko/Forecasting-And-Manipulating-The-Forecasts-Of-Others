@@ -76,6 +76,58 @@ struct Panel {
     }
 };
 
+// Chebyshev grid on [0, L]: one panel, or two panels [0, b] and [b, L] sharing the node at b
+// (N1 nodes on the first, N - N1 + 1 on the second).  Kernels are piecewise smooth with a
+// possible kink at b, so every integral is split at b and at the kink's image.
+struct Grid {
+    // Chebyshev nodes in a computational coordinate s in [0, L], mapped to a = phi(s) with
+    // phi(s) = L (e^{alpha s/L} - 1) / (e^alpha - 1) (alpha = 0: identity).  The basis stays
+    // globally smooth while nodes cluster near a = 0.  Optionally two panels split at b (kept
+    // for experiments; it lets the discrete strategy space kink at b, which small-eps
+    // equilibria exploit).
+    int N, N1; double L, b, alpha; bool split;
+    Panel p1, p2; VectorXd s_nodes, x;
+    double phi(double s) const { return alpha == 0.0 ? s : L * (std::exp(alpha * s / L) - 1.0) / (std::exp(alpha) - 1.0); }
+    double phi_inv(double a) const { return alpha == 0.0 ? a : (L / alpha) * std::log(1.0 + a * (std::exp(alpha) - 1.0) / L); }
+    double dphi(double s) const { return alpha == 0.0 ? 1.0 : alpha * std::exp(alpha * s / L) / (std::exp(alpha) - 1.0); }
+    Grid(int N_, double L_, int N1_ = 0, double b_ = 0.0, double alpha_ = 0.0)
+        : N(N_), N1(N1_), L(L_), b(b_), alpha(alpha_), split(N1_ > 1 && b_ > 0 && b_ < L_),
+          p1(split ? N1_ : N_, 0.0, split ? b_ : L_), p2(split ? N_ - N1_ + 1 : 2, split ? b_ : 0.0, L_) {
+        if (split) { s_nodes.resize(N); s_nodes.head(N1) = p1.x; s_nodes.tail(N - N1) = p2.x.tail(N - N1); }
+        else s_nodes = p1.x;
+        x = s_nodes.unaryExpr([&](double s) { return phi(s); });
+    }
+    MatrixXd interp(const VectorXd& pts) const {
+        const VectorXd sp = pts.unaryExpr([&](double a) { return phi_inv(std::max(0.0, std::min(L, a))); });
+        if (!split) return p1.interp(sp);
+        MatrixXd M = MatrixXd::Zero(pts.size(), N);
+        for (int r = 0; r < pts.size(); ++r) {
+            VectorXd one(1); one << sp[r];
+            if (sp[r] < b) M.block(r, 0, 1, N1) = p1.interp(one);
+            else           M.block(r, N1 - 1, 1, N - N1 + 1) = p2.interp(one);
+        }
+        return M;
+    }
+    // Gauss-Legendre on [lo, hi] (physical), split at the breakpoints given (and at b);
+    // with a map each piece is integrated in s with the Jacobian phi'.
+    void quad(double lo, double hi, std::vector<double> breaks, VectorXd& u, VectorXd& w, int m) const {
+        if (split) breaks.push_back(phi(b));
+        std::vector<double> pts = {lo};
+        for (double c : breaks) if (c > lo + 1e-14 && c < hi - 1e-14) pts.push_back(c);
+        pts.push_back(hi);
+        std::sort(pts.begin(), pts.end());
+        std::vector<double> U, W;
+        for (size_t k = 0; k + 1 < pts.size(); ++k) {
+            if (pts[k + 1] - pts[k] <= 1e-14) continue;
+            VectorXd uu, ww;
+            gauss_legendre(m, phi_inv(pts[k]), phi_inv(pts[k + 1]), uu, ww);
+            for (int i = 0; i < m; ++i) { const double s = uu[i]; ww[i] *= dphi(s); uu[i] = phi(s); }
+            for (int i = 0; i < m; ++i) { U.push_back(uu[i]); W.push_back(ww[i]); }
+        }
+        u = Eigen::Map<VectorXd>(U.data(), U.size()); w = Eigen::Map<VectorXd>(W.data(), W.size());
+    }
+};
+
 std::vector<double> parse_list(const std::string& s, char sep = ',') {
     std::vector<double> v; size_t p = 0;
     while (p <= s.size()) { size_t q = s.find(sep, p); if (q == std::string::npos) q = s.size(); if (q > p) v.push_back(std::atof(s.substr(p, q - p).c_str())); p = q + 1; }
@@ -89,15 +141,15 @@ struct Model {
     double L, eps, rho;
     std::vector<VectorXd> gam;                     // per trader, per stock gain
     MatrixXd SV, SZ, SVh, SZh, SZhi;               // covariances, Cholesky factors, Sigma_Z^{-1/2}
-    Panel K;
+    Grid K;
     VectorXd wq;
     std::vector<MatrixXd> VOL, QA, QAT;            // Volterra row maps and Galerkin maps (N x N each)
     MatrixXd Mass;
     MatrixXd v;                                    // value kernel (NC x q), constant in age: V-factor f row = SVh(:, f)^T
 
-    Model(int N_, double L_, double eps_, double rho_, int q_, std::vector<VectorXd> g, MatrixXd SV_, MatrixXd SZ_)
-        : N(N_), q(q_), NT(static_cast<int>(g.size())), NC(q_ * (2 + static_cast<int>(g.size()))), m(N_ + 8),
-          L(L_), eps(eps_), rho(rho_), gam(std::move(g)), SV(std::move(SV_)), SZ(std::move(SZ_)), K(N_, 0.0, L_) {
+    Model(int N_, double L_, double eps_, double rho_, int q_, std::vector<VectorXd> g, MatrixXd SV_, MatrixXd SZ_, int N1_ = 0, double b_ = 0.0, double alpha_ = 0.0)
+        : N(N_), q(q_), NT(static_cast<int>(g.size())), NC(q_ * (2 + static_cast<int>(g.size()))), m(std::max(N_ - std::max(N1_, 1) + 1, N1_) + (alpha_ > 0 ? N_ : 8)),
+          L(L_), eps(eps_), rho(rho_), gam(std::move(g)), SV(std::move(SV_)), SZ(std::move(SZ_)), K(N_, L_, N1_, b_, alpha_) {
         SVh = Eigen::LLT<MatrixXd>(SV).matrixL();
         SZh = Eigen::LLT<MatrixXd>(SZ).matrixL();
         SZhi = SZh.inverse();
@@ -106,18 +158,19 @@ struct Model {
         for (int j = 0; j < N; ++j) {
             const double aj = K.x[j];
             if (aj > 0) {
-                gauss_legendre(m, 0.0, aj, u, w);
+                // (A_k c)(a_j) = int_0^{a_j} k(a_j - u) c(u) du; k has its kink at u = a_j - b
+                K.quad(0.0, aj, {aj - K.b}, u, w, m);
                 const MatrixXd Pk = K.interp((aj - u.array()).matrix()), Pc = K.interp(u);
                 VOL[j].noalias() = Pk.transpose() * w.asDiagonal() * Pc;
             }
         }
-        gauss_legendre(m, 0.0, L, u, w);
+        K.quad(0.0, L, {}, u, w, m);
         { const MatrixXd Pu = K.interp(u); wq = (w.transpose() * Pu).transpose(); Mass.noalias() = Pu.transpose() * w.asDiagonal() * Pu; }
         QA.assign(N, MatrixXd::Zero(N, N)); QAT.assign(N, MatrixXd::Zero(N, N));
-        for (int qq = 0; qq < m; ++qq) {
+        for (int qq = 0; qq < u.size(); ++qq) {
             const double a = u[qq];
             if (a <= 0) continue;
-            VectorXd ui, wi; gauss_legendre(m, 0.0, a, ui, wi);
+            VectorXd ui, wi; K.quad(0.0, a, {a - K.b}, ui, wi, m);
             const MatrixXd Pj = K.interp(ui), Pk = K.interp((a - ui.array()).matrix());
             const Eigen::RowVectorXd phia = K.interp(VectorXd::Constant(1, a)).row(0);
             const VectorXd disc = (-rho * (a - ui.array())).exp();
@@ -399,7 +452,7 @@ int main(int argc, char* argv[]) {
     std::vector<VectorXd> gam;
     { std::string s = argv[6]; size_t p = 0; while (p <= s.size()) { size_t e = s.find(';', p); if (e == std::string::npos) e = s.size(); auto v = parse_list(s.substr(p, e - p)); VectorXd g(q); for (int k = 0; k < q; ++k) g[k] = v.size() == 1 ? v[0] : v[k]; gam.push_back(g); p = e + 1; } }
     MatrixXd SV = MatrixXd::Identity(q, q), SZ = MatrixXd::Identity(q, q);
-    double tol = 1e-10; int uniform = 0, coarse = 0; bool verbose = false, eval_only = false, adaptive = true, tangent = true; std::vector<double> path; std::string init_file;
+    double tol = 1e-10, split_b = 0.0, map_alpha = 0.0; int uniform = 0, coarse = 0, n1 = 0; bool verbose = false, eval_only = false, adaptive = true, tangent = true; std::vector<double> path; std::string init_file;
     for (int i = 7; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--sigma-v") && i + 1 < argc) { auto v = parse_list(argv[++i]); for (int r = 0; r < q; ++r) for (int c = 0; c < q; ++c) SV(r, c) = v[r * q + c]; }
         else if (!std::strcmp(argv[i], "--sigma-z") && i + 1 < argc) { auto v = parse_list(argv[++i]); for (int r = 0; r < q; ++r) for (int c = 0; c < q; ++c) SZ(r, c) = v[r * q + c]; }
@@ -408,6 +461,8 @@ int main(int argc, char* argv[]) {
         else if (!std::strcmp(argv[i], "--uniform") && i + 1 < argc) uniform = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--verbose")) verbose = true;
         else if (!std::strcmp(argv[i], "--eval-only")) eval_only = true;
+        else if (!std::strcmp(argv[i], "--split") && i + 2 < argc) { split_b = std::atof(argv[++i]); n1 = std::atoi(argv[++i]); }
+        else if (!std::strcmp(argv[i], "--map") && i + 1 < argc) map_alpha = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "--adaptive")) adaptive = true;
         else if (!std::strcmp(argv[i], "--no-adaptive")) adaptive = false;
         else if (!std::strcmp(argv[i], "--no-tangent")) tangent = false;
@@ -475,7 +530,7 @@ int main(int argc, char* argv[]) {
         return o;
     };
 
-    Model M(N, L, path.front(), rho, q, gam, SV, SZ);
+    Model M(N, L, path.front(), rho, q, gam, SV, SZ, n1, split_b, map_alpha);
     Solver S(M); S.verbose = verbose;
     VectorXd z = VectorXd::Zero(M.dim() * M.NT);
     Solver::Out o; o.ok = false;
@@ -494,7 +549,7 @@ int main(int argc, char* argv[]) {
         const VectorXd r = M.residual(z);
         std::fprintf(stderr, "eval-only: |r|_max %.3e  |r|_2 %.3e\n", r.cwiseAbs().maxCoeff(), r.norm());
         o.z = z; o.resid = r.cwiseAbs().maxCoeff(); o.steps = 0; o.jacobians = 0; o.ok = true;
-    } else if (coarse > 0 && coarse < N && init_file.empty()) {
+    } else if (coarse > 0 && coarse < N && init_file.empty() && n1 == 0) {
         // coarse-to-fine: full continuation at N0 = coarse, interpolate, then solve the target directly at N
         Model Mc(coarse, L, path.front(), rho, q, gam, SV, SZ);
         Solver Sc(Mc); Sc.verbose = verbose;
@@ -503,7 +558,7 @@ int main(int argc, char* argv[]) {
         const Solver::Out oc = continuation(Mc, Sc, zc, path, 60, okc);
         S.evals += Sc.evals;
         if (!okc) { std::fprintf(stderr, "coarse continuation failed\n"); return 2; }
-        const MatrixXd P = Panel(coarse, 0.0, L).interp(M.K.x);            // (N x coarse)
+        const MatrixXd P = Grid(coarse, L).interp(M.K.x);            // (N x coarse)
         const std::vector<MatrixXd> csc = Mc.unpack(oc.z);
         std::vector<MatrixXd> cs(M.NT, MatrixXd::Zero(M.NC * N, q));
         for (int i = 0; i < M.NT; ++i) for (int ch = 0; ch < M.NC; ++ch) cs[i].block(ch * N, 0, N, q) = P * csc[i].block(ch * coarse, 0, coarse, q);
@@ -519,8 +574,8 @@ int main(int argc, char* argv[]) {
     }
     const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     Model::Diag dg; const std::vector<MatrixXd> cs = M.unpack(z); M.residual(z, &dg);
-    std::printf("{\"converged\":%s,\"residual\":%.3e,\"N\":%d,\"L\":%.15g,\"eps\":%.15g,\"rho\":%.15g,\"q\":%d,\"NT\":%d,\"NC\":%d,\"seconds\":%.3f,\"evaluations\":%ld,",
-                o.ok ? "true" : "false", o.resid, N, L, M.eps, rho, q, M.NT, M.NC, secs, S.evals);
+    std::printf("{\"converged\":%s,\"residual\":%.3e,\"map_alpha\":%.15g,\"split_b\":%.15g,\"N1\":%d,\"N\":%d,\"L\":%.15g,\"eps\":%.15g,\"rho\":%.15g,\"q\":%d,\"NT\":%d,\"NC\":%d,\"seconds\":%.3f,\"evaluations\":%ld,",
+                o.ok ? "true" : "false", o.resid, map_alpha, split_b, n1, N, L, M.eps, rho, q, M.NT, M.NC, secs, S.evals);
     std::printf("\"lambda\":"); print_mat(dg.lam); std::printf(",");
     std::printf("\"sigma_v\":"); print_mat(SV); std::printf(",\"sigma_z\":"); print_mat(SZ); std::printf(",");
     std::printf("\"lag\":"); print_array(M.K.x); std::printf(",");
