@@ -371,7 +371,7 @@ struct Model {
             if (!solved) {
                 ++g_full;
                 // assemble K = sum_ch Hc^T Mq Hc as blockdiag-apply plus one large product per (nu, k)
-                Kmat = MatrixXd::Zero(R * q, R * q); Gm = MatrixXd::Zero(R * q, R * q);
+                Kmat = MatrixXd::Zero(R * q, R * q); if (dg && dg->want_cert) Gm = MatrixXd::Zero(R * q, R * q);   // Gm only for the certificate
                 for (int nu = 0; nu < q; ++nu) for (int k = 0; k < q; ++k) {
                     MatrixXd W(NC * N, R);
 #pragma omp parallel for schedule(static) if (!omp_in_parallel())
@@ -384,8 +384,9 @@ struct Model {
                     Gm.block(nu * R, nu * R, R, R).noalias() = Ht.transpose() * W;
                 }
                 Eigen::PartialPivLU<MatrixXd> lu(Kmat);
+                if (!(dg && dg->want_cert)) Kmat.resize(0, 0);                   // the factorization is all that is kept
                 yv = lu.solve(rhs);
-                if (dg) dg->Klu[i] = lu;
+                if (dg) dg->Klu[i] = std::move(lu);
             }
             MatrixXd Y(R, q); for (int nu = 0; nu < q; ++nu) Y.col(nu) = yv.segment(nu * R, R);
             out[i] = Ht * Y;
@@ -746,6 +747,7 @@ struct Solver {
     // inverse Jacobian as an LU plus Broyden rank-one corrections: Jinv r = LU^{-1} r + sum_k u_k (v_k . r)
     Eigen::MatrixXf Jstore; Eigen::PartialPivLU<Eigen::Ref<Eigen::MatrixXf>> Jlu{Jstore}; std::vector<VectorXd> bu, bv;
     bool single_prec = true;
+    void release() { Jstore.resize(0, 0); new (&Jlu) Eigen::PartialPivLU<Eigen::Ref<Eigen::MatrixXf>>(Jstore); bu.clear(); bv.clear(); bu.shrink_to_fit(); bv.shrink_to_fit(); }
     VectorXd apply_Jinv(const VectorXd& r) const { VectorXd x = Jlu.solve(r.cast<float>()).cast<double>(); for (size_t k = 0; k < bu.size(); ++k) x += bu[k] * bv[k].dot(r); return x; }
     struct JinvOp { const Solver* S; VectorXd operator*(const VectorXd& r) const { return S->apply_Jinv(r); } };
     JinvOp Jinv{this};
@@ -932,7 +934,9 @@ void print_mat(const MatrixXd& A) { std::printf("["); for (int r = 0; r < A.rows
 static bool threads_set = false;
 
 int main(int argc, char* argv[]) {
-    mallopt(M_MMAP_THRESHOLD, 1 << 30); mallopt(M_TRIM_THRESHOLD, 1 << 30); mallopt(M_TOP_PAD, 256 << 20);
+    if (const char* mp = std::getenv("KB_MALLOC")) {                     // experiment hook: "mmap_threshold,trim_threshold,top_pad" in bytes; "glibc" = defaults
+        if (std::string(mp) != "glibc") { long a, b, c; if (std::sscanf(mp, "%ld,%ld,%ld", &a, &b, &c) == 3) { mallopt(M_MMAP_THRESHOLD, (int)a); mallopt(M_TRIM_THRESHOLD, (int)b); mallopt(M_TOP_PAD, (int)c); } }
+    } else { mallopt(M_MMAP_THRESHOLD, 1 << 30); mallopt(M_TRIM_THRESHOLD, 1 << 30); mallopt(M_TOP_PAD, 256 << 20); }
     if (argc < 7) { std::fprintf(stderr, "usage: %s N L eps rho q \"g11,..;g21,..\" [--sigma-v ...] [--sigma-z ...] [--eps-path ...] [--tol t] [--uniform n] [--threads t] [--verbose]\n", argv[0]); return 1; }
     const int N = std::atoi(argv[1]); const double L = std::atof(argv[2]), eps = std::atof(argv[3]), rho = std::atof(argv[4]); const int q = std::atoi(argv[5]);
     std::vector<VectorXd> gam;
@@ -1094,6 +1098,7 @@ int main(int argc, char* argv[]) {
         z = o.z;
     }
     const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    S.release();                                                              // drop the stored Jacobian before the certificate
     Model::Diag dg; dg.want_cert = true; const std::vector<MatrixXd> cs = M.unpack(z); M.residual(z, &dg);
     std::printf("{\"converged\":%s,\"residual\":%.3e,\"map_alpha\":%.15g,\"split_b\":%.15g,\"N1\":%d,\"N\":%d,\"L\":%.15g,\"eps\":%.15g,\"rho\":%.15g,\"q\":%d,\"NT\":%d,\"NC\":%d,\"seconds\":%.3f,\"evaluations\":%ld,\"gmres_iterations\":%ld,",
                 o.ok ? "true" : "false", o.resid, map_alpha, split_b, n1, N, L, M.eps, rho, q, M.NT, M.NC, secs, S.evals, S.gmres_its);
