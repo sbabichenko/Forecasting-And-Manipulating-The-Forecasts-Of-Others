@@ -4,7 +4,7 @@
 // projection frozen, as in the control appendix) are compared with the same gradient at
 // 0.9 x the equilibrium kernel.  The ratio must be small and shrink with N in the interior;
 // the coordinate born at t and the band beside it are first-order in dt.
-//   usage: test_stationarity N p1 p2 r [scale=1.0] [freeze_own_filter=1] [diag_cost=0]
+//   usage: test_stationarity N p1 p2 r [scale=1.0] [freeze_own_filter=0; 1 uses a local march without the predictability restriction] [diag_cost=0]
 #include "lqg_solver.h"
 #include <Eigen/Dense>
 #include <cmath>
@@ -50,8 +50,10 @@ int main(int argc, char** argv) {
     Kernel2D Xeq = eq.env.X;                              // player 1's projection frozen at the equilibrium state
     const BarSolution bar0 = solve_bar_equilibrium(eq.env, eq.D1, eq.D2, p1, p2, 2000, 0.08, 1e-12);
     auto cost = [&](const Kernel2D& d1) {
-        EnvironmentResult env; Kernel2D c1, c2; env.X.resize(); env.Xtilde1.resize(); env.Xtilde2.resize(); c1.resize(); c2.resize();
-        march(d1, D2, g1, g2, freeze ? &Xeq : nullptr, env.X, env.Xtilde1, env.Xtilde2, c1, c2);
+        // production forward map (the local march above is kept only for the frozen-own-projection variant)
+        EnvironmentResult env; Kernel2D c1, c2;
+        if (freeze) { env.X.resize(); env.Xtilde1.resize(); env.Xtilde2.resize(); c1.resize(); c2.resize(); march(d1, D2, g1, g2, &Xeq, env.X, env.Xtilde1, env.Xtilde2, c1, c2); }
+        else { forward_environment(d1, D2, g1, g2, FORWARD_INNER_ITERS, Pi1(), 1, Pi2(), 2, env); c1 = env.calD1; c2 = env.calD2; }
         if (!diag_cost) return compute_costs_general(env, c1, c2, bar0, r, r, 1.0, -1.0).J1;
         double J = 0.0;
         for (int j = 0; j < g_n; ++j) { double vx = 0, vd = 0; for (int s = 0; s <= j; ++s) { vx += g_dt * env.X[j][s].squaredNorm(); vd += g_dt * c1[j][s].squaredNorm(); } J += g_dt * (vx + r * vd); }
