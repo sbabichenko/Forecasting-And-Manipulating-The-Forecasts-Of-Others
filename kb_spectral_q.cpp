@@ -296,10 +296,10 @@ struct Model {
 // ----------------------------------------------------------------- newton
 
 struct Solver {
-    Model& M; MatrixXd Jinv; bool have_J = false; long evals = 0; bool verbose = false; double refresh_ratio = 0.8;
+    Model& M; MatrixXd Jinv; bool have_J = false; long evals = 0; bool verbose = false; double refresh_ratio = 0.8; int max_jacobians = 3;
     explicit Solver(Model& m) : M(m) {}
     struct Out { VectorXd z; double resid; int steps, jacobians; bool ok; };
-    Out solve(VectorXd z, double tol, int pre = 0, double relax = 0.1, int maxsteps = 60) {
+    Out solve(VectorXd z, double tol, int pre = 0, double relax = 0.1, int maxsteps = 30) {
         Out o; o.jacobians = 0; o.ok = false;
         { double lam = relax, best = std::numeric_limits<double>::infinity(); VectorXd zbest = z;
           for (int k = 0; k < pre; ++k) { const VectorXd r = M.residual(z); ++evals; const double rn = r.cwiseAbs().maxCoeff();
@@ -308,14 +308,14 @@ struct Solver {
               if (rn < best) { best = rn; zbest = z; } if (rn < 1e-3) break; z += lam * r; }
           z = zbest; }
         VectorXd r = M.residual(z); ++evals; double rn = r.cwiseAbs().maxCoeff(); const double rn0 = rn;
-        const int n = static_cast<int>(z.size()); double last_ratio = 0.0; int step = 0;
+        const int n = static_cast<int>(z.size()); double last_ratio = 0.0; int step = 0; int fails = 0; bool fresh = false;
         for (; step < maxsteps && rn > tol; ++step) {
-            if (!have_J || last_ratio > refresh_ratio) {
+            if (!have_J || (last_ratio > refresh_ratio && o.jacobians < max_jacobians)) {
                 MatrixXd Jm(n, n); const double eps_fd = 1e-7 * std::max(1.0, z.cwiseAbs().maxCoeff());
 #pragma omp parallel for schedule(dynamic, 4)
                 for (int i = 0; i < n; ++i) { VectorXd zp = z; zp[i] += eps_fd; Jm.col(i) = (M.residual(zp) - r) / eps_fd; }
-                evals += n; Jinv = Jm.partialPivLu().inverse(); have_J = true; ++o.jacobians; last_ratio = 0.0;
-            }
+                evals += n; Jinv = Jm.partialPivLu().inverse(); have_J = true; ++o.jacobians; last_ratio = 0.0; fresh = true;
+            } else fresh = false;
             const VectorXd dz = -(Jinv * r); double lam = 1.0; bool acc = false;
             for (int ls = 0; ls < 8; ++ls) {
                 const VectorXd zt = z + lam * dz; const VectorXd rt = M.residual(zt); ++evals; const double rtn = rt.cwiseAbs().maxCoeff();
@@ -326,8 +326,14 @@ struct Solver {
                 }
                 lam *= 0.5;
             }
-            if (verbose) std::fprintf(stderr, "  newton %d: |r| %.3e step %.3g%s\n", step, rn, lam, acc ? "" : " (rejected)");
-            if (!acc) { if (last_ratio <= refresh_ratio) { last_ratio = 1.0; continue; } break; }
+            if (verbose) std::fprintf(stderr, "  newton %d: |r| %.3e step %.3g%s\n", step, rn, lam, acc ? "" : (fresh ? " (rejected, damped residual step)" : " (rejected, refresh)"));
+            if (!acc) {
+                if (!fresh) { last_ratio = 1.0; continue; }               // stale Jacobian: refresh once
+                // fresh Jacobian and still no descent: damped residual step, then keep the chord
+                if (++fails > 5) break;
+                z += relax * r; r = M.residual(z); ++evals; rn = r.cwiseAbs().maxCoeff(); last_ratio = 0.0; continue;
+            }
+            fails = 0;
             if (!std::isfinite(rn) || rn > 1e6 * std::max(rn0, 1.0)) break;
         }
         o.z = z; o.resid = rn; o.steps = step; o.ok = rn <= tol; return o;
@@ -391,14 +397,25 @@ int main(int argc, char* argv[]) {
         std::fprintf(stderr, "eval-only: |r|_max %.3e  |r|_2 %.3e\n", r.cwiseAbs().maxCoeff(), r.norm());
         o.z = z; o.resid = r.cwiseAbs().maxCoeff(); o.steps = 0; o.jacobians = 0; o.ok = true; path.clear();
     }
+    int bisections = 0;
     for (size_t k = 0; k < path.size(); ++k) {
         M.eps = path[k];
         VectorXd zstart = z;
-        if (have_prev) zstart = z + (z - zprev) * ((path[k] - path[k - 1]) / (path[k - 1] - eprev));
+        if (have_prev) {   // secant extrapolation in eps, kept only if it has the smaller residual
+            const VectorXd zx = z + (z - zprev) * ((path[k] - path[k - 1]) / (path[k - 1] - eprev));
+            const double rx = M.residual(zx).cwiseAbs().maxCoeff(), rz = M.residual(z).cwiseAbs().maxCoeff(); S.evals += 2;
+            if (std::isfinite(rx) && rx < rz) zstart = zx;
+            if (verbose) std::fprintf(stderr, "  start: extrapolated |r| %.2e, plain %.2e -> %s\n", rx, rz, rx < rz ? "extrapolated" : "plain");
+        }
         o = S.solve(zstart, tol, (k == 0 && init_file.empty()) ? 60 : 0, 0.1);
-        if (!o.ok) { S.have_J = false; o = S.solve(z, tol, k == 0 ? 0 : 30, 0.1); }
+        if (!o.ok) { S.have_J = false; o = S.solve(z, tol, k == 0 ? 0 : 30, 0.1); }          // plain warm start
         if (verbose) std::fprintf(stderr, "eps=%g: %s |r| %.2e, %d steps, %d jacobians, %ld evals, %.1f s elapsed\n", path[k], o.ok ? "ok" : "FAIL", o.resid, o.steps, o.jacobians, S.evals, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
-        if (!o.ok) break;
+        if (!o.ok) {
+            if (k > 0 && bisections < 4) {                                                   // bisect the eps step
+                ++bisections; path.insert(path.begin() + k, 0.5 * (path[k - 1] + path[k])); have_prev = false; S.have_J = false; --k; continue;
+            }
+            break;
+        }
         if (k > 0) { zprev = z; eprev = path[k - 1]; have_prev = true; }
         z = o.z;
     }
