@@ -290,15 +290,23 @@ like exp(gain T)).  Three layers now handle this:
   starts, ratio 0.7 per stage, bisecting a failed stage in log r
   (`LQG_R_CONTINUATION=0` disables).
 
-Result at N=40 with the exact-projection filter: 54/512 failures (169 with
-the Pi-based filter, 235 before the stability layers): every T=1 case solves,
-including r=0.01; T=3 solves all cases with r >= 0.05 and fails 54/64 at
-r=0.01.  The
-exact filter's closed loop is better damped, so the horizon sensitivity is
-much reduced.  A diagnostic line is printed when a cold start fails and
-continuation is tried; the dissertation's cases (T=1, r >= 0.05) are well
-inside the usable region.  The benchmark and the whole figure sweep are
-unchanged by these layers (they converge before any of them engages).
+What the remaining failures are (Aug 2026 diagnosis).  Along the r-path
+nothing physical diverges: the primitive control kernel calD, the control
+and state variances and the kernel part of the cost stay bounded and smooth
+(p=0.1, T=3: control variance 0.1-0.3, state variance 1.4-1.7, kernel cost
+~4) while the kernel D in estimated-noise coordinates grows like 1/r (it is
+control per unit of a vanishing quantity when information is scarce), and
+p=0.01 continues past the point where p=0.1 was lost.  dG/dD has eigenvalues
+of order -1/r (-200 at r=0.015), so the relaxed Picard iteration diverges for
+any relaxation above 2/(1+|lambda|); the solver's job is to keep Newton
+supplied with a good iterate.  Two logic defects (an Anderson blow-up above
+the engagement threshold escaping the rejection logic; GMRES(30) too small
+for the Newton systems) were fixed; the p=0.1, T=3 path now continues to
+r=0.0074.  Result at N=40, full-pipeline criterion: see the stress log in
+this commit's message; T=1 solves every case, T=3 solves every case with
+r >= 0.05, and the residual T=3, r=0.01 failures are Newton systems that
+restarted GMRES(120) does not resolve (a preconditioner is the next step).
+The dissertation's cases (T=1, r >= 0.05) are far inside the usable region.
 
 **Memory**: a single solve peaks at 15 MB (N=160), 60 MB (N=320), 173 MB
 (N=640), after storing Anderson's difference columns in single precision
