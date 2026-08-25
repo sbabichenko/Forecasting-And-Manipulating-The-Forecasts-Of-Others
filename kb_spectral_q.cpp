@@ -636,6 +636,93 @@ struct Model {
         return out;
     }
 
+    // ---- batched linearization: all directions at once.  D is (dim*NT) x nd, each column a packed
+    // direction; returns J D as (dim*NT) x nd (the Jacobian of Phi, without the -I).
+    // Every quantity that is a vector per direction becomes an (N x nd) block, so each tensor
+    // application is a GEMM.
+    MatrixXd dphi_batch(const Diag& B, const LinBase& L, const MatrixXd& D) const {
+        const int nd = static_cast<int>(D.cols()), R = 2 * q * N, blk = NC * N;
+        // direction blocks: dcs[i][ch][k] (N x nd); pack layout row = (i*q + k)*blk + ch*N + node
+        auto dblk = [&](int i, int ch, int k) { return D.block((i * q + k) * blk + ch * N, 0, N, nd); };
+        std::vector<std::vector<MatrixXd>> dct(NC, std::vector<MatrixXd>(q));
+        for (int ch = 0; ch < NC; ++ch) for (int k = 0; k < q; ++k) { dct[ch][k] = MatrixXd::Zero(N, nd); for (int i = 0; i < NT; ++i) dct[ch][k] += dblk(i, ch, k); }
+        auto flowk = [&](auto getblk, int o, int ch) { MatrixXd k = MatrixXd::Zero(N, nd); for (int u = 0; u < q; ++u) if (SZhi(o, u) != 0.0) k += SZhi(o, u) * getblk(ch, u); return k; };
+        // ---- market maker
+        std::vector<MatrixXd> rhsb(q, MatrixXd::Zero(q * N, nd)), dHtfb(q, MatrixXd::Zero(blk, nd));   // per nu
+        for (int o = 0; o < q; ++o) for (int ch = 0; ch < NC; ++ch) {
+            const MatrixXd k = flowk([&](int c, int u) { return dct[c][u]; }, o, ch);
+            for (int nu = 0; nu < q; ++nu) { rhsb[nu].block(o * N, 0, N, nd).noalias() += L.Pw1[ch * q + nu].transpose() * k; dHtfb[nu].block(ch * N, 0, N, nd).noalias() += L.Tbeta[o * q + nu] * k; }
+        }
+        std::vector<MatrixXd> dbeta(q), dp(q);        // per nu: (qN x nd), (blk x nd)
+        for (int nu = 0; nu < q; ++nu) { dbeta[nu] = B.Gflu.solve(rhsb[nu] - B.Hf * dHtfb[nu]); dp[nu] = dHtfb[nu] + B.Htf * dbeta[nu]; }
+        // ---- policy rows per trader j: kwj[j][r][ch] (N x nd) or empty; dyj[j][c] (R x nd)
+        std::vector<std::vector<std::vector<MatrixXd>>> kwj(NT, std::vector<std::vector<MatrixXd>>(2 * q, std::vector<MatrixXd>(NC)));
+        std::vector<std::vector<MatrixXd>> dyj(NT, std::vector<MatrixXd>(q));
+        for (int j = 0; j < NT; ++j) {
+            std::vector<MatrixXd> rhs(q, MatrixXd::Zero(R, nd)), dHty(q, MatrixXd::Zero(blk, nd));
+            for (int r = 0; r < 2 * q; ++r) for (int ch = 0; ch < NC; ++ch) {
+                MatrixXd k;
+                if (r < q) k = flowk([&](int c, int u) { return MatrixXd(dct[c][u] - dblk(j, c, u)); }, r, ch);
+                else { if (gam[j][r - q] == 0.0) continue; k = -gam[j][r - q] * dp[r - q].block(ch * N, 0, N, nd); }
+                if (k.cwiseAbs().maxCoeff() == 0.0) continue;
+                kwj[j][r][ch] = k;
+                for (int c = 0; c < q; ++c) { rhs[c].block(r * N, 0, N, nd).noalias() += L.Pw2[j][ch * q + c].transpose() * k; dHty[c].block(ch * N, 0, N, nd).noalias() += L.Ty[j][r * q + c] * k; }
+            }
+            for (int c = 0; c < q; ++c) { MatrixXd dcj(blk, nd); for (int ch = 0; ch < NC; ++ch) dcj.block(ch * N, 0, N, nd) = dblk(j, ch, c); dyj[j][c] = B.Glu[j].solve(rhs[c] + B.Hj[j] * (dcj - dHty[c])); }
+        }
+        MatrixXd out(D.rows(), nd);
+        for (int i = 0; i < NT; ++i) {
+            // ---- cascade: ddP[nu][k] (N x nd)
+            std::vector<std::vector<MatrixXd>> ddP(q, std::vector<MatrixXd>(q));
+            if (NT == 1) {
+                for (int nu = 0; nu < q; ++nu) for (int k = 0; k < q; ++k) { ddP[nu][k] = MatrixXd::Zero(N, nd); for (int o = 0; o < q; ++o) ddP[nu][k] += SZhi(o, k) * dbeta[nu].block(o * N, 0, N, nd); }
+            } else {
+                for (int k = 0; k < q; ++k) {
+                    MatrixXd drhs = MatrixXd::Zero(2 * q * N, nd);
+                    for (int nu = 0; nu < q; ++nu) for (int o = 0; o < q; ++o) { const auto db = dbeta[nu].block(o * N, 0, N, nd); drhs.block(nu * N, 0, N, nd) += SZhi(o, k) * db; drhs.block(nu * N, 0, N, nd).noalias() += L.TF[i][o * q + k] * db; }
+                    for (int u = 0; u < q; ++u) for (int j = 0; j < NT; ++j) if (j != i) for (int o = 0; o < q; ++o) {
+                        const auto drf = dyj[j][u].block(o * N, 0, N, nd); const auto drs = dyj[j][u].block((q + o) * N, 0, N, nd);
+                        drhs.block((q + u) * N, 0, N, nd) += SZhi(o, k) * drf;
+                        drhs.block((q + u) * N, 0, N, nd).noalias() += L.TF[i][o * q + k] * drf;
+                        drhs.block((q + u) * N, 0, N, nd).noalias() -= gam[j][o] * (L.TdP[i][o * q + k] * drs);
+                    }
+                    const MatrixXd dsol = B.Mlu[i].solve(drhs);
+                    for (int nu = 0; nu < q; ++nu) ddP[nu][k] = dsol.block(nu * N, 0, N, nd);
+                }
+            }
+            // ---- a_lin
+            std::vector<MatrixXd> dalin(q);   // per nu: (blk x nd)
+            for (int nu = 0; nu < q; ++nu) {
+                dalin[nu] = -dp[nu];
+                for (int ch = 0; ch < NC; ++ch) for (int k = 0; k < q; ++k) { dalin[nu].block(ch * N, 0, N, nd).noalias() += L.Tc[i][ch * q + k] * ddP[nu][k]; dalin[nu].block(ch * N, 0, N, nd).noalias() += B.Aq[i][nu][k] * dblk(i, ch, k); }
+            }
+            // ---- FOC
+            const MatrixXd& Ht = B.Htj[i]; const MatrixXd& Y = B.Ymat[i];
+            std::vector<MatrixXd> rhsK(q, MatrixXd::Zero(R, nd)), dKY(q, MatrixXd::Zero(R, nd)), dHtY(q, MatrixXd::Zero(blk, nd));
+            for (int ch = 0; ch < NC; ++ch) {
+                const auto Hc = Ht.block(ch * N, 0, N, R);
+                std::vector<MatrixXd> dC(q, MatrixXd::Zero(N, nd));
+                for (int r = 0; r < 2 * q; ++r) if (kwj[i][r][ch].size()) for (int k = 0; k < q; ++k) dC[k].noalias() += L.TY[i][r * q + k] * kwj[i][r][ch];
+                for (int k = 0; k < q; ++k) dHtY[k].block(ch * N, 0, N, nd) = dC[k];
+                for (int nu = 0; nu < q; ++nu) {
+                    for (int r = 0; r < 2 * q; ++r) if (kwj[i][r][ch].size()) { rhsK[nu].block(r * N, 0, N, nd).noalias() += L.Pma[i][ch * q + nu].transpose() * kwj[i][r][ch]; dKY[nu].block(r * N, 0, N, nd).noalias() += L.Pwq[i][ch * q + nu].transpose() * kwj[i][r][ch]; }
+                    rhsK[nu].noalias() += Hc.transpose() * (Mass * dalin[nu].block(ch * N, 0, N, nd));
+                    MatrixXd wd = MatrixXd::Zero(N, nd);
+                    for (int k = 0; k < q; ++k) { wd.noalias() += L.SC[i][ch * q + k] * ddP[nu][k]; wd.noalias() += L.SCa[i][ch * q + k] * ddP[k][nu]; wd.noalias() += B.Mqq[i][nu][k] * dC[k]; }
+                    dKY[nu].noalias() += Hc.transpose() * wd;
+                }
+            }
+            // K dY = rhs - dK Y, with the R q x R q factorization: stack nu blocks
+            MatrixXd rhsAll(R * q, nd); for (int nu = 0; nu < q; ++nu) rhsAll.block(nu * R, 0, R, nd) = rhsK[nu] - dKY[nu];
+            const MatrixXd dyAll = B.Klu[i].solve(rhsAll);
+            for (int k = 0; k < q; ++k) {
+                const MatrixXd oi = dHtY[k] + Ht * dyAll.block(k * R, 0, R, nd);      // (blk x nd)
+                out.block((i * q + k) * blk, 0, blk, nd) = oi;
+            }
+        }
+        return out;
+    }
+
     VectorXd pack(const std::vector<MatrixXd>& cs) const { VectorXd z(NT * NC * N * q); for (int i = 0; i < NT; ++i) for (int k = 0; k < q; ++k) z.segment((i * q + k) * NC * N, NC * N) = cs[i].col(k); return z; }
     std::vector<MatrixXd> unpack(const VectorXd& z) const { std::vector<MatrixXd> cs(NT, MatrixXd(NC * N, q)); for (int i = 0; i < NT; ++i) for (int k = 0; k < q; ++k) cs[i].col(k) = z.segment((i * q + k) * NC * N, NC * N); return cs; }
     VectorXd residual(const VectorXd& z, Diag* dg = nullptr, const Diag* pre = nullptr) const { const double t0 = now_s(); VectorXd r = pack(phi(unpack(z), dg, pre)) - z; (dg || !pre ? g_t_full : g_t_pre) += now_s() - t0; return r; }
@@ -661,7 +748,7 @@ struct Solver {
     VectorXd apply_Jinv(const VectorXd& r) const { VectorXd x = Jlu.solve(r); for (size_t k = 0; k < bu.size(); ++k) x += bu[k] * bv[k].dot(r); return x; }
     struct JinvOp { const Solver* S; VectorXd operator*(const VectorXd& r) const { return S->apply_Jinv(r); } };
     JinvOp Jinv{this};
-    bool jfnk = true; int gmres_max = 12; double gmres_tol = 1e-3; bool analytic = true; bool krylov_stalled = false; bool exact_newton = false; bool range_newton = false; bool lagged = false; int lag_max_its = 6;
+    bool jfnk = true; int gmres_max = 12; double gmres_tol = 1e-3; bool analytic = true; bool batched = true; int chunk = 48; bool krylov_stalled = false; bool exact_newton = false; bool range_newton = false; bool lagged = false; int lag_max_its = 6;
     Model::Diag cur; bool have_cur = false;   // factorizations at the current iterate, preconditioning nearby evaluations
     long gmres_its = 0;
     explicit Solver(Model& m) : M(m) {}
@@ -689,7 +776,16 @@ struct Solver {
             if (!range_newton && need_refactor) {   // under JFNK the Broyden-updated inverse is only a preconditioner: refresh at most once per solve
                 Jstore.resize(n, n); MatrixXd& Jm = Jstore; const double eps_fd = 1e-7 * std::max(1.0, z.cwiseAbs().maxCoeff());
                 Model::Diag& base = cur; const VectorXd rb = r;   // factorizations at z precondition the columns
-                if (analytic) {
+                if (analytic && batched) {
+                    const Model::LinBase LB = M.linbase(base);
+                    const int nchunks = (n + chunk - 1) / chunk;
+#pragma omp parallel for schedule(dynamic)
+                    for (int cidx = 0; cidx < nchunks; ++cidx) {
+                        const int c0 = cidx * chunk, nc = std::min(chunk, n - c0);
+                        MatrixXd D = MatrixXd::Zero(n, nc); for (int c = 0; c < nc; ++c) D(c0 + c, c) = 1.0;
+                        Jm.block(0, c0, n, nc) = M.dphi_batch(base, LB, D) - D;
+                    }
+                } else if (analytic) {
                     const Model::LinBase LB = M.linbase(base);
 #pragma omp parallel for schedule(dynamic, 8)
                     for (int i = 0; i < n; ++i) { VectorXd e = VectorXd::Zero(n); e[i] = 1.0; Jm.col(i) = M.pack(M.dphi_fast(base, LB, M.unpack(e))) - e; }
@@ -837,7 +933,7 @@ int main(int argc, char* argv[]) {
     std::vector<VectorXd> gam;
     { std::string s = argv[6]; size_t p = 0; while (p <= s.size()) { size_t e = s.find(';', p); if (e == std::string::npos) e = s.size(); auto v = parse_list(s.substr(p, e - p)); VectorXd g(q); for (int k = 0; k < q; ++k) g[k] = v.size() == 1 ? v[0] : v[k]; gam.push_back(g); p = e + 1; } }
     MatrixXd SV = MatrixXd::Identity(q, q), SZ = MatrixXd::Identity(q, q);
-    double tol = 1e-10, split_b = 0.0, map_alpha = 0.0; int uniform = 0, coarse = 0, n1 = 0; bool verbose = false, eval_only = false, adaptive = true, tangent = true, use_jfnk = true, use_analytic = true, check_jac = false, exact_nt = true, range_nt = false, lagged_nt = true; int gm_max = 12, lag_its = 8, pre_steps = 60; double min_ratio = 0.25; double gm_tol = 1e-3; std::vector<double> path; std::string init_file;
+    double tol = 1e-10, split_b = 0.0, map_alpha = 0.0; int uniform = 0, coarse = 0, n1 = 0; bool verbose = false, eval_only = false, adaptive = true, tangent = true, use_jfnk = true, use_analytic = true, check_jac = false, exact_nt = true, range_nt = false, lagged_nt = true; int gm_max = 12, lag_its = 8, pre_steps = 60, chunk_sz = 48; double min_ratio = 0.25; bool no_batch = false; double gm_tol = 1e-3; std::vector<double> path; std::string init_file;
     for (int i = 7; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--sigma-v") && i + 1 < argc) { auto v = parse_list(argv[++i]); for (int r = 0; r < q; ++r) for (int c = 0; c < q; ++c) SV(r, c) = v[r * q + c]; }
         else if (!std::strcmp(argv[i], "--sigma-z") && i + 1 < argc) { auto v = parse_list(argv[++i]); for (int r = 0; r < q; ++r) for (int c = 0; c < q; ++c) SZ(r, c) = v[r * q + c]; }
@@ -853,6 +949,8 @@ int main(int argc, char* argv[]) {
         else if (!std::strcmp(argv[i], "--range")) range_nt = true;
         else if (!std::strcmp(argv[i], "--lagged") && i + 1 < argc) { lagged_nt = true; lag_its = std::atoi(argv[++i]); }
         else if (!std::strcmp(argv[i], "--no-lag")) lagged_nt = false;
+        else if (!std::strcmp(argv[i], "--no-batch")) no_batch = true;
+        else if (!std::strcmp(argv[i], "--chunk") && i + 1 < argc) chunk_sz = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--pre") && i + 1 < argc) pre_steps = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--min-ratio") && i + 1 < argc) min_ratio = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "--gmres") && i + 2 < argc) { gm_max = std::atoi(argv[++i]); gm_tol = std::atof(argv[++i]); }
@@ -929,7 +1027,7 @@ int main(int argc, char* argv[]) {
     };
 
     Model M(N, L, path.front(), rho, q, gam, SV, SZ, n1, split_b, map_alpha);
-    Solver S(M); S.verbose = verbose; S.jfnk = use_jfnk; S.gmres_max = gm_max; S.gmres_tol = gm_tol; S.analytic = use_analytic; S.exact_newton = exact_nt; S.range_newton = range_nt; S.lagged = lagged_nt; S.lag_max_its = lag_its;
+    Solver S(M); S.verbose = verbose; S.jfnk = use_jfnk; S.gmres_max = gm_max; S.gmres_tol = gm_tol; S.analytic = use_analytic; S.exact_newton = exact_nt; S.range_newton = range_nt; S.lagged = lagged_nt; S.lag_max_its = lag_its; S.batched = !no_batch; S.chunk = chunk_sz;
     VectorXd z = VectorXd::Zero(M.dim() * M.NT);
     Solver::Out o; o.ok = false;
     if (!init_file.empty()) {
@@ -947,17 +1045,18 @@ int main(int argc, char* argv[]) {
         VectorXd zc = VectorXd::Random(z.size()) * 0.3;
         Model::Diag base; const VectorXd rb = M.residual(zc, &base);
         const double h = 1e-7 * std::max(1.0, zc.cwiseAbs().maxCoeff());
-        double maxrel = 0, maxfast = 0; int worst = -1;
+        double maxrel = 0, maxfast = 0, maxbatch = 0; int worst = -1;
         const Model::LinBase LB = M.linbase(base);
         for (int i = 0; i < static_cast<int>(zc.size()); i += std::max(1, static_cast<int>(zc.size()) / 40)) {
             VectorXd e = VectorXd::Zero(zc.size()); e[i] = 1.0;
             const VectorXd ca = M.pack(M.dphi_fast(base, LB, M.unpack(e))) - e;
             { const VectorXd cr = M.pack(M.dphi(base, M.unpack(e))) - e; maxfast = std::max(maxfast, (ca - cr).norm() / std::max(1e-12, cr.norm())); }
+            { const MatrixXd Dm = e; const VectorXd cb = M.dphi_batch(base, LB, Dm).col(0) - e; maxbatch = std::max(maxbatch, (ca - cb).norm() / std::max(1e-12, ca.norm())); }
             VectorXd zp = zc; zp[i] += h; const VectorXd cf = (M.residual(zp, nullptr, &base) - rb) / h;
             const double rel = (ca - cf).norm() / std::max(1e-12, cf.norm());
             if (rel > maxrel) { maxrel = rel; worst = i; }
         }
-        std::fprintf(stderr, "check-jacobian: fast vs FD %.2e (column %d), fast vs reference linearization %.2e\n", maxrel, worst, maxfast);
+        std::fprintf(stderr, "check-jacobian: fast vs FD %.2e (column %d), fast vs reference linearization %.2e, batched vs fast %.2e\n", maxrel, worst, maxfast, maxbatch);
         return maxrel < 1e-5 ? 0 : 3;
     }
     if (eval_only) {
@@ -968,7 +1067,7 @@ int main(int argc, char* argv[]) {
     } else if (coarse > 0 && coarse < N && init_file.empty() && n1 == 0) {
         // coarse-to-fine: full continuation at N0 = coarse, interpolate, then solve the target directly at N
         Model Mc(coarse, L, path.front(), rho, q, gam, SV, SZ);
-        Solver Sc(Mc); Sc.verbose = verbose; Sc.jfnk = use_jfnk; Sc.analytic = use_analytic; Sc.exact_newton = exact_nt; Sc.range_newton = range_nt; Sc.lagged = lagged_nt; Sc.lag_max_its = lag_its;
+        Solver Sc(Mc); Sc.verbose = verbose; Sc.jfnk = use_jfnk; Sc.analytic = use_analytic; Sc.exact_newton = exact_nt; Sc.range_newton = range_nt; Sc.lagged = lagged_nt; Sc.lag_max_its = lag_its; Sc.batched = !no_batch; Sc.chunk = chunk_sz;
         VectorXd zc = VectorXd::Zero(Mc.dim() * Mc.NT);
         bool okc = false;
         const Solver::Out oc = continuation(Mc, Sc, zc, path, pre_steps, okc);
