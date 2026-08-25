@@ -4,8 +4,17 @@
 // like sum_u F[j][u][s]^T * v[u] are computed from the rank-1
 // decomposition F[j][u][s] = border + sum_k Xtilde[k][u] * A_store[k][s]^T.
 
+#include <cstdlib>
+#ifdef _OPENMP
+#include <omp.h>
+#else
+static inline int omp_get_thread_num() { return 0; }
+static inline int omp_get_num_threads() { return 1; }
+static inline int omp_in_parallel() { return 0; }
+#endif
 #include "lqg_solver.h"
 #include <algorithm>
+#include <limits>
 
 // Runtime grid parameters
 int g_n = 40;
@@ -24,9 +33,20 @@ double g_r1 = RHO;
 double g_r2 = RHO;
 double g_sigma = 1.0;
 double g_x0 = 0.0;
+double g_terminal_weight = DEFAULT_TERMINAL_STATE_WEIGHT;
+
+static void enforce_initial_observation_noise_boundary(Kernel2D& calD, int obs_idx) {
+    if (g_n <= 0) return;
+    // Source index 0 is the left endpoint. There is no observation-noise
+    // increment born at t=0, so primitive control cannot load on W^i_0.
+    for (int j = 0; j < g_n; ++j)
+        calD[j][0](obs_idx) = 0.0;
+    calD[0][0].setZero();
+}
 
 SolverContext SolverContext::capture_current() {
-    return SolverContext{g_n, g_T, g_b1, g_b2, g_r1, g_r2, g_sigma, g_x0};
+    return SolverContext{g_n, g_T, g_b1, g_b2, g_r1, g_r2,
+                         g_sigma, g_x0, g_terminal_weight};
 }
 
 void SolverContext::apply() const {
@@ -37,6 +57,7 @@ void SolverContext::apply() const {
     g_r2 = r2;
     g_sigma = sigma;
     g_x0 = x0;
+    g_terminal_weight = terminal_weight;
 }
 
 ScopedSolverContext::ScopedSolverContext(const SolverContext& next)
@@ -70,24 +91,24 @@ void state_kernel_from_calD(const Kernel2D& calD1, const Kernel2D& calD2,
 // gamma_b (border_lt) is identically zero by causality:
 // Xtilde[u][s] = 0 for s > u.
 
-static void compute_filter_kernels(
+// Row j of the filter kernels from row j of X and rows k < j of Xtilde:
+// closed-form Kalman gain, no sub-iteration.  Only rows <= j are read, so
+// the rows can be produced in a single causal march (forward_environment).
+static void filter_row(int j,
     const Kernel2D& X, const Mat3& Pi, int obs_index,
-    double obs_gain_val, int filter_iters, double relax,
-    Kernel2D& Xtilde, Kernel2D& A_store) {
+    double obs_gain_val, Kernel2D& Xtilde, Kernel2D& A_store) {
 
     Mat3 I_minus_Pi = Mat3::Identity() - Pi;
-    Vec3 e_i = Vec3::Zero();
-    e_i(obs_index) = 1.0;
 
     double g = obs_gain_val;
     double prec = g * g;
     double dt2_prec = g_dt * g_dt * prec;
 
-    for (int j = 0; j < g_n; ++j) {
+    {
         if (j == 0) {
             Xtilde[0][0] = I_minus_Pi * X[0][0];
             A_store[0][0].setZero();
-            continue;
+            return;
         }
 
         // c_k = dot(Xtilde[k][0..k], X[j][0..k]),  partial_c_k = same but excluding u=k
@@ -141,12 +162,24 @@ static void compute_filter_kernels(
     }
 }
 
+static void compute_filter_kernels(
+    const Kernel2D& X, const Mat3& Pi, int obs_index,
+    double obs_gain_val, int filter_iters, double relax,
+    Kernel2D& Xtilde, Kernel2D& A_store) {
+    (void)filter_iters;
+    (void)relax;
+    for (int j = 0; j < g_n; ++j)
+        filter_row(j, X, Pi, obs_index, obs_gain_val, Xtilde, A_store);
+}
+
 // --- primitive_control_kernel (F-free) ---
 //
 // calD[j][s] = Pi*D[j][s] + g_dt * sum_u F[j][u][s]^T * D[j][u]
 // decomposed into border_gt, border_lt, and interior sums.
 
-void primitive_control_kernel(
+// Row j of the primitive control kernel from D[j] and rows k <= j of the
+// filter kernels.
+static void control_row(int j,
     const Kernel2D& D, const Kernel2D& Xtilde, const Kernel2D& A_store,
     double obs_gain_val, int obs_index, const Mat3& Pi, Kernel2D& calD) {
 
@@ -155,10 +188,12 @@ void primitive_control_kernel(
     double g = obs_gain_val;
     double DT_g = g_dt * g;
 
-    for (int j = 0; j < g_n; ++j) {
+    {
         if (j == 0) {
-            calD[0][0] = Pi * D[0][0];
-            continue;
+            // No observation increment has arrived at the initial grid point,
+            // so there is no primitive-shock feedback on the first point.
+            calD[0][0].setZero();
+            return;
         }
 
         // partial_d_k = sum_{u<k} dot(Xtilde[k][u], D[j][u])
@@ -193,7 +228,17 @@ void primitive_control_kernel(
 
         // s = j: only border_lt contributes
         calD[j][j] = Pi * D[j][j] + DT_g * partial_d_k[j] * e_i;
+
+        // No source-time-zero observation-noise shock is available to controls.
+        calD[j][0](obs_index) = 0.0;
     }
+}
+
+void primitive_control_kernel(
+    const Kernel2D& D, const Kernel2D& Xtilde, const Kernel2D& A_store,
+    double obs_gain_val, int obs_index, const Mat3& Pi, Kernel2D& calD) {
+    for (int j = 0; j < g_n; ++j)
+        control_row(j, D, Xtilde, A_store, obs_gain_val, obs_index, Pi, calD);
 }
 
 // --- CE-based filter: incremental rank-1 projection ---
@@ -302,6 +347,7 @@ static void compute_ce_filter_and_calD(
         }
         for (int z = 0; z <= j; ++z)
             calD[j][z] = Dvec.segment<3>(3*z);
+        calD[j][0](obs_idx) = 0.0;
     }
 }
 
@@ -317,15 +363,37 @@ static void forward_environment_ce(
     const Mat3& Pi_2, int obs_idx_2,
     EnvironmentResult& env) {
 
+    struct ForwardCEBufs {
+        Kernel2D calD1, calD2, X, calD1_new, calD2_new, X_new;
+        void resize() {
+            calD1.resize(); calD2.resize(); X.resize();
+            calD1_new.resize(); calD2_new.resize(); X_new.resize();
+        }
+    };
+    static thread_local ForwardCEBufs bufs;
+    bufs.resize();
+
     // Initial calD from Pi*D (same seed as standard forward_environment)
-    // Temporaries declared once outside the inner loop to avoid
-    // repeated Kernel2D construction (~300KB each at N=160).
-    Kernel2D calD1, calD2, X, calD1_new, calD2_new, X_new;
+    // Reused thread-local temporaries avoid repeated Kernel2D allocation
+    // across Picard iterations.
+    Kernel2D& calD1 = bufs.calD1;
+    Kernel2D& calD2 = bufs.calD2;
+    Kernel2D& X = bufs.X;
+    Kernel2D& calD1_new = bufs.calD1_new;
+    Kernel2D& calD2_new = bufs.calD2_new;
+    Kernel2D& X_new = bufs.X_new;
     for (int j = 0; j < g_n; ++j)
         for (int s = 0; s <= j; ++s) {
-            calD1[j][s] = Pi_1 * D1[j][s];
-            calD2[j][s] = Pi_2 * D2[j][s];
+            if (j == 0) {
+                calD1[j][s].setZero();
+                calD2[j][s].setZero();
+            } else {
+                calD1[j][s] = Pi_1 * D1[j][s];
+                calD2[j][s] = Pi_2 * D2[j][s];
+            }
         }
+    enforce_initial_observation_noise_boundary(calD1, obs_idx_1);
+    enforce_initial_observation_noise_boundary(calD2, obs_idx_2);
 
     state_kernel_from_calD(calD1, calD2, X);
 
@@ -361,12 +429,60 @@ void forward_environment(
     const Mat3& Pi_2, int obs_idx_2,
     EnvironmentResult& env) {
 
+    static const int relaxed_sweeps = [] { const char* e = std::getenv("LQG_FORWARD_RELAXED"); return e ? std::atoi(e) : 0; }();
+    if (relaxed_sweeps <= 0) {
+        // Exact causal march.  Row j of the state kernel depends on the primitive
+        // controls at earlier times only, row j of the filter kernels on row j of X
+        // and earlier filter rows, and row j of the controls on filter rows <= j.
+        // Marching j = 0..n-1 therefore produces the exact state--filter--control
+        // fixed point in one sweep, with no relaxation.
+        Kernel2D X, calD1, calD2;
+        X.setZero(); calD1.setZero(); calD2.setZero();
+        const Vec3 sigE0 = g_sigma * E0();
+        // One two-thread region for the whole march (a region per row would be
+        // spawned thousands of times inside the parallel pre-solve); the two
+        // players' rows are independent given row j of X.
+        #pragma omp parallel num_threads(2) if (g_n >= 64 && !omp_in_parallel())
+        {
+            const int tid = omp_get_thread_num(), nth = omp_get_num_threads();
+            for (int j = 0; j < g_n; ++j) {
+                #pragma omp single
+                {
+                    X[j][j] = sigE0;
+                    for (int s = 0; s < j; ++s)
+                        X[j][s] = X[j - 1][s] + g_dt * (calD1[j - 1][s] + calD2[j - 1][s]);
+                }   // implicit barrier
+                if (tid == 0) {
+                    filter_row(j, X, Pi_1, obs_idx_1, obs_gain1, env.Xtilde1, env.A_store1);
+                    control_row(j, D1, env.Xtilde1, env.A_store1, obs_gain1, obs_idx_1, Pi_1, calD1);
+                }
+                if (tid == nth - 1) {
+                    filter_row(j, X, Pi_2, obs_idx_2, obs_gain2, env.Xtilde2, env.A_store2);
+                    control_row(j, D2, env.Xtilde2, env.A_store2, obs_gain2, obs_idx_2, Pi_2, calD2);
+                }
+                #pragma omp barrier
+            }
+        }
+        env.X = X;
+        env.obs_gain1 = obs_gain1; env.obs_gain2 = obs_gain2;
+        env.obs_idx1 = obs_idx_1; env.obs_idx2 = obs_idx_2;
+        return;
+    }
+    inner_iters = relaxed_sweeps;
+
     Kernel2D calD1, calD2;
     for (int j = 0; j < g_n; ++j)
         for (int s = 0; s <= j; ++s) {
-            calD1[j][s] = Pi_1 * D1[j][s];
-            calD2[j][s] = Pi_2 * D2[j][s];
+            if (j == 0) {
+                calD1[j][s].setZero();
+                calD2[j][s].setZero();
+            } else {
+                calD1[j][s] = Pi_1 * D1[j][s];
+                calD2[j][s] = Pi_2 * D2[j][s];
+            }
         }
+    enforce_initial_observation_noise_boundary(calD1, obs_idx_1);
+    enforce_initial_observation_noise_boundary(calD2, obs_idx_2);
 
     Kernel2D X;
     state_kernel_from_calD(calD1, calD2, X);
@@ -438,11 +554,15 @@ static void ensure_hk_buffers() {
 void backward_kernels(const Kernel2D& X, const Kernel2D& Xtildek,
                       const Kernel2D& Dk,
                       const std::array<double, N_MAX>& prec_k,
+                      double obs_gain_k, int obs_idx_k,
                       double terminal_state_weight,
-                      Kernel2D& Hx) {
+    Kernel2D& Hx) {
     Hx.setZero();
     for (int s = 0; s < g_n; ++s)
-        Hx[g_n - 1][s] = -terminal_state_weight * X[g_n - 1][s];
+        Hx[g_n - 1][s] = terminal_state_weight * X[g_n - 1][s];
+
+    Vec3 e_obs = Vec3::Zero();
+    e_obs(obs_idx_k) = 1.0;
 
     ensure_hk_buffers();
     // Only zero the portion we'll use (g_n rows × g_n cols)
@@ -456,13 +576,18 @@ void backward_kernels(const Kernel2D& X, const Kernel2D& Xtildek,
         int tp = j + 1;  // t+1
         double Pk = prec_k[tp];
 
-        // W[r] = g_dt * Pk * sum_z Hk[tp][z][r]^T * Xtilde[tp][z]
+        // W[r] = Gamma^T E Hk[tp][tp][r]
+        //      + g_dt * Pk * sum_z Hk[tp][z][r]^T * Xtilde[tp][z]
         std::array<Vec3, N_MAX> W;
         for (int r = 0; r <= j; ++r) {
             Vec3 acc = Vec3::Zero();
             for (int z = 0; z <= tp; ++z)
                 acc += (*cur)(z, r).transpose() * Xtildek[tp][z];
-            W[r] = g_dt * Pk * acc;
+            // Diagonal innovation-birth term:
+            // Gamma^T E H^k_t(t, .), from delta w^k_t(t)
+            // = E^{k,T} Gamma^k(t) e^k_t.
+            W[r] = obs_gain_k * ((*cur)(tp, r).transpose() * e_obs)
+                 + g_dt * Pk * acc;
         }
 
         for (int r = 0; r <= j; ++r)
@@ -483,12 +608,16 @@ void backward_kernels(const Kernel2D& X, const Kernel2D& Xtildek,
 void backward_kernels(const Kernel2D& X, const Kernel2D& Xtildek,
                       const Kernel2D& Dk,
                       const std::array<double, N_MAX>& prec_k,
+                      double obs_gain_k, int obs_idx_k,
                       double terminal_state_weight,
                       Kernel2D& Hx, Kernel2D& Vkernel) {
     Hx.setZero();
     Vkernel.setZero();
     for (int s = 0; s < g_n; ++s)
-        Hx[g_n - 1][s] = -terminal_state_weight * X[g_n - 1][s];
+        Hx[g_n - 1][s] = terminal_state_weight * X[g_n - 1][s];
+
+    Vec3 e_obs = Vec3::Zero();
+    e_obs(obs_idx_k) = 1.0;
 
     ensure_hk_buffers();
     for (int z = 0; z < g_n; ++z)
@@ -506,10 +635,14 @@ void backward_kernels(const Kernel2D& X, const Kernel2D& Xtildek,
             Vec3 acc = Vec3::Zero();
             for (int z = 0; z <= tp; ++z)
                 acc += (*cur)(z, r).transpose() * Xtildek[tp][z];
-            W[r] = g_dt * Pk * acc;
+            // Diagonal innovation-birth term:
+            // Gamma^T E H^k_t(t, .), from delta w^k_t(t)
+            // = E^{k,T} Gamma^k(t) e^k_t.
+            W[r] = obs_gain_k * ((*cur)(tp, r).transpose() * e_obs)
+                 + g_dt * Pk * acc;
         }
 
-        // Store W[r] = V^i(t_{j+1}, r) into Vkernel
+        // Store corrected W[r] = V^i(t_{j+1}, r) into Vkernel
         for (int r = 0; r <= j; ++r)
             Vkernel[tp][r] = W[r];
 
@@ -530,11 +663,15 @@ void backward_kernels(const Kernel2D& X, const Kernel2D& Xtildek,
 void backward_kernels(const Kernel2D& X, const Kernel2D& Xtildek,
                       const Kernel2D& Dk,
                       const std::array<double, N_MAX>& prec_k,
+                      double obs_gain_k, int obs_idx_k,
                       double terminal_state_weight,
-                      Kernel2D& Hx, Kernel3D& Hk) {
+    Kernel2D& Hx, Kernel3D& Hk) {
     Hx.setZero();
     for (int s = 0; s < g_n; ++s)
-        Hx[g_n - 1][s] = -terminal_state_weight * X[g_n - 1][s];
+        Hx[g_n - 1][s] = terminal_state_weight * X[g_n - 1][s];
+
+    Vec3 e_obs = Vec3::Zero();
+    e_obs(obs_idx_k) = 1.0;
 
     for (int z = 0; z < g_n; ++z)
         for (int r = 0; r < g_n; ++r)
@@ -549,7 +686,11 @@ void backward_kernels(const Kernel2D& X, const Kernel2D& Xtildek,
             Vec3 acc = Vec3::Zero();
             for (int z = 0; z <= tp; ++z)
                 acc += Hk[tp][z][r].transpose() * Xtildek[tp][z];
-            W[r] = g_dt * Pk * acc;
+            // Diagonal innovation-birth term:
+            // Gamma^T E H^k_t(t, .), from delta w^k_t(t)
+            // = E^{k,T} Gamma^k(t) e^k_t.
+            W[r] = obs_gain_k * (Hk[tp][tp][r].transpose() * e_obs)
+                 + g_dt * Pk * acc;
         }
 
         for (int r = 0; r <= j; ++r)
@@ -568,7 +709,9 @@ void backward_kernels(const Kernel2D& X, const Kernel2D& Xtildek,
 BackwardBarResult backward_bar_adjoints(
     const Kernel2D& X, const Kernel2D& Xtildek, const Kernel2D& Dk,
     const std::array<double, N_MAX>& barX, double b,
-    const std::array<double, N_MAX>& prec_k, double terminal_weight) {
+    const std::array<double, N_MAX>& prec_k,
+    double obs_gain_k, int obs_idx_k,
+    double terminal_weight) {
 
     BackwardBarResult res;
     res.barHx.fill(0.0);
@@ -582,7 +725,11 @@ BackwardBarResult backward_bar_adjoints(
         double I_val = 0.0;
         for (int z = 0; z <= tp; ++z)
             I_val += Xtildek[tp][z].dot(res.barHk[tp][z]);
-        I_val *= g_dt * Pk;
+        // Diagonal innovation-birth term:
+        // Gamma^T E H^k_t(t, .), from delta w^k_t(t)
+        // = E^{k,T} Gamma^k(t) e^k_t.
+        I_val = obs_gain_k * res.barHk[tp][tp](obs_idx_k)
+              + g_dt * Pk * I_val;
 
         res.barHx[j] = res.barHx[tp] + g_dt * ((barX[tp] - b) + I_val);
 
@@ -591,6 +738,26 @@ BackwardBarResult backward_bar_adjoints(
                 + g_dt * (Dk[tp][s] * res.barHx[tp] - X[tp][s] * I_val);
     }
     return res;
+}
+
+double mean_information_wedge_at(
+    const Kernel2D& Xtildek, const Kernel2D& barHk,
+    const std::array<double, N_MAX>& prec_k,
+    double obs_gain_k, int obs_idx_k, int t_idx) {
+    // No observation increment has arrived at the initial grid point. The
+    // backward solver uses right-endpoint wedges on intervals, so the first
+    // displayed/exported point should remain zero.
+    if (t_idx <= 0)
+        return 0.0;
+
+    double acc = 0.0;
+    for (int z = 0; z <= t_idx; ++z)
+        acc += Xtildek[t_idx][z].dot(barHk[t_idx][z]);
+    // Diagonal innovation-birth term:
+    // Gamma^T E H^k_t(t, .), from delta w^k_t(t)
+    // = E^{k,T} Gamma^k(t) e^k_t.
+    return obs_gain_k * barHk[t_idx][t_idx](obs_idx_k)
+         + g_dt * prec_k[t_idx] * acc;
 }
 
 // --- solve_bar_equilibrium ---
@@ -616,10 +783,12 @@ BarSolution solve_bar_equilibrium(
         {
             #pragma omp section
             bba1 = backward_bar_adjoints(env.X, env.Xtilde2, D2,
-                                          barX, g_b1, prec2_arr, 0.0);
+                                          barX, g_b1, prec2_arr,
+                                          env.obs_gain2, env.obs_idx2, g_terminal_weight);
             #pragma omp section
             bba2 = backward_bar_adjoints(env.X, env.Xtilde1, D1,
-                                          barX, g_b2, prec1_arr, 0.0);
+                                          barX, g_b2, prec1_arr,
+                                          env.obs_gain1, env.obs_idx1, g_terminal_weight);
         }
 
         std::array<double, N_MAX> barD1_new, barD2_new;
@@ -638,6 +807,9 @@ BarSolution solve_bar_equilibrium(
         last_err = std::max(std::sqrt(d1) / std::max(1.0, std::sqrt(n1)),
                             std::sqrt(d2) / std::max(1.0, std::sqrt(n2)));
 
+        if (!std::isfinite(last_err))
+            break;
+
         for (int j = 0; j < g_n; ++j) {
             barD1[j] += relax * (barD1_new[j] - barD1[j]);
             barD2[j] += relax * (barD2_new[j] - barD2[j]);
@@ -655,22 +827,61 @@ BarSolution solve_bar_equilibrium(
     return sol;
 }
 
-// --- kernel_dot: SIMD-optimized dot over packed triangular data ---
+// --- solve_equilibrium: relaxed Picard iteration ---
 
-static double kernel_dot(const Kernel2D& a1, const Kernel2D& a2,
-                         const Kernel2D& b1, const Kernel2D& b2) {
-    const int FLAT = g_n * (g_n + 1) / 2 * 3;
-    Eigen::Map<const Eigen::VectorXd> va1(a1.data[0].data(), FLAT);
-    Eigen::Map<const Eigen::VectorXd> vb1(b1.data[0].data(), FLAT);
-    Eigen::Map<const Eigen::VectorXd> va2(a2.data[0].data(), FLAT);
-    Eigen::Map<const Eigen::VectorXd> vb2(b2.data[0].data(), FLAT);
-    return va1.dot(vb1) + va2.dot(vb2);
+static double best_response_residual(const Kernel2D& D1, const Kernel2D& D2,
+                                     const Kernel2D& Hx1, const Kernel2D& Hx2,
+                                     int tri_size,
+                                     double neg_inv_r1, double neg_inv_r2) {
+    double norm_f = 0.0, norm_g = 0.0;
+    for (int i = 0; i < tri_size; ++i) {
+        const Vec3 g1 = neg_inv_r1 * Hx1.data[i];
+        const Vec3 g2 = neg_inv_r2 * Hx2.data[i];
+        const Vec3 f1 = g1 - D1.data[i];
+        const Vec3 f2 = g2 - D2.data[i];
+        norm_f += f1.squaredNorm() + f2.squaredNorm();
+        norm_g += g1.squaredNorm() + g2.squaredNorm();
+    }
+    return std::sqrt(norm_f) / std::max(1.0, std::sqrt(norm_g));
 }
 
-// --- solve_equilibrium: Anderson-accelerated Picard iteration ---
-//
-// Anderson(m=5) uses the last m residuals to find optimal mixing
-// coefficients, typically reducing iteration count by 2-3x vs Picard.
+static void apply_picard_update(Kernel2D& D1, Kernel2D& D2,
+                                const Kernel2D& Hx1, const Kernel2D& Hx2,
+                                int tri_size,
+                                double neg_inv_r1, double neg_inv_r2,
+                                double relax) {
+    for (int i = 0; i < tri_size; ++i) {
+        D1.data[i] += relax * (neg_inv_r1 * Hx1.data[i] - D1.data[i]);
+        D2.data[i] += relax * (neg_inv_r2 * Hx2.data[i] - D2.data[i]);
+    }
+}
+
+static bool adapt_picard_damping(double err, double& prev_err,
+                                 double& relax,
+                                 Kernel2D& D1, Kernel2D& D2,
+                                 Kernel2D& prev_D1, Kernel2D& prev_D2,
+                                 bool& have_prev,
+                                 bool verbose, const char* prefix) {
+    if (have_prev && err > prev_err * PICARD_RESIDUAL_GROWTH_LIMIT
+        && relax > PICARD_RELAX_MIN) {
+        D1 = prev_D1;
+        D2 = prev_D2;
+        relax = std::max(PICARD_RELAX_MIN, relax * PICARD_RELAX_BACKOFF);
+        if (verbose)
+            std::cout << "  " << prefix << "backtracking Picard step; relax="
+                      << relax << std::endl;
+        return false;
+    }
+
+    if (have_prev && err < prev_err * PICARD_RESIDUAL_DECAY_FOR_GROWTH)
+        relax = std::min(PICARD_RELAX_MAX, relax * PICARD_RELAX_GROWTH);
+
+    prev_D1 = D1;
+    prev_D2 = D2;
+    prev_err = err;
+    have_prev = true;
+    return true;
+}
 
 // Core solver: takes initial D1, D2 (may be zero or warm-started)
 static EquilibriumResult solve_equilibrium_core(
@@ -684,115 +895,63 @@ static EquilibriumResult solve_equilibrium_core(
     auto prec2 = make_constant_prec(p2_val * p2_val);
     EnvironmentResult env;
 
-    // Anderson acceleration (AA) state
-    constexpr int AA_M = 5;
-    constexpr int AA_STORE = AA_M + 1;  // +1 so write slot doesn't collide with reads
-    constexpr double AA_REG = 1e-12;
-    constexpr double AA_BETA = 0.6;
     const int TRI = g_n * (g_n + 1) / 2;
 
-    struct AAEntry { Kernel2D f1, f2, g1, g2; };
-    std::vector<AAEntry> hist(AA_STORE);
-    int stored = 0;
+    // Hoist adjoint buffers out of the Picard loop to avoid repeated
+    // Kernel2D allocation at large N.
+    Kernel2D Hx1, Hx2;
+    Kernel2D prev_D1, prev_D2;
+    double prev_err = std::numeric_limits<double>::infinity();
+    double relax = PICARD_RELAX;
+    bool have_prev = false;
 
     for (int it = 1; it <= MAX_PICARD_ITERS; ++it) {
         forward_environment(D1, D2, p1_val, p2_val, FORWARD_INNER_ITERS,
                             Pi_1, obs_idx_1, Pi_2, obs_idx_2, env);
 
-        Kernel2D Hx1, Hx2;
         #pragma omp parallel sections
         {
             #pragma omp section
-            backward_kernels(env.X, env.Xtilde2, D2, prec2, 0.0, Hx1);
+            backward_kernels(env.X, env.Xtilde2, D2, prec2,
+                             p2_val, obs_idx_2, g_terminal_weight, Hx1);
             #pragma omp section
-            backward_kernels(env.X, env.Xtilde1, D1, prec1, 0.0, Hx2);
+            backward_kernels(env.X, env.Xtilde1, D1, prec1,
+                             p1_val, obs_idx_1, g_terminal_weight, Hx2);
         }
 
         // Compute G = -(1/r_k)*Hx and residual F = G - D
         const double neg_inv_r1 = -(1.0 / g_r1);
         const double neg_inv_r2 = -(1.0 / g_r2);
-        auto& cur = hist[stored % AA_STORE];
-        double norm_f = 0.0, norm_g = 0.0;
-        for (int i = 0; i < TRI; ++i) {
-            cur.g1.data[i] = neg_inv_r1 * Hx1.data[i];
-            cur.g2.data[i] = neg_inv_r2 * Hx2.data[i];
-            cur.f1.data[i] = cur.g1.data[i] - D1.data[i];
-            cur.f2.data[i] = cur.g2.data[i] - D2.data[i];
-            norm_f += cur.f1.data[i].squaredNorm() + cur.f2.data[i].squaredNorm();
-            norm_g += cur.g1.data[i].squaredNorm() + cur.g2.data[i].squaredNorm();
-        }
-
-        double err = std::sqrt(norm_f) / std::max(1.0, std::sqrt(norm_g));
+        double err = best_response_residual(D1, D2, Hx1, Hx2, TRI,
+                                            neg_inv_r1, neg_inv_r2);
         residuals.push_back(err);
         if (!std::isfinite(err)) break;
 
         if (verbose && (it <= 5 || it % 50 == 0))
-            std::cout << "  it=" << it << "  resid=" << err << std::endl;
+            std::cout << "  it=" << it << "  resid=" << err
+                      << "  relax=" << relax << std::endl;
         if (err < PICARD_TOL) {
             if (verbose)
                 std::cout << "  Converged at iteration " << it << std::endl;
             break;
         }
+        if (it == MAX_PICARD_ITERS)
+            break;
 
-        // --- Anderson acceleration ---
-        int m = std::min(stored, AA_M);
+        if (!adapt_picard_damping(err, prev_err, relax, D1, D2,
+                                  prev_D1, prev_D2, have_prev,
+                                  verbose, ""))
+            continue;
 
-        if (m >= 1) {
-            // Build Gram matrix: H[i][j] = <dF_i, dF_j> where dF_i = F_curr - f_hist[i]
-            // Expanded as <F,F> - <F,f_j> - <f_i,F> + <f_i,f_j>
-            Eigen::VectorXd Ffi(m);
-            for (int i = 0; i < m; ++i) {
-                int idx = (stored - 1 - i + AA_STORE) % AA_STORE;
-                Ffi(i) = kernel_dot(cur.f1, cur.f2, hist[idx].f1, hist[idx].f2);
-            }
-
-            Eigen::MatrixXd H(m, m);
-            Eigen::VectorXd rhs(m);
-            for (int i = 0; i < m; ++i) {
-                rhs(i) = norm_f - Ffi(i);
-                for (int j = 0; j <= i; ++j) {
-                    int ii = (stored - 1 - i + AA_STORE) % AA_STORE;
-                    int jj = (stored - 1 - j + AA_STORE) % AA_STORE;
-                    double fifj = kernel_dot(hist[ii].f1, hist[ii].f2, hist[jj].f1, hist[jj].f2);
-                    H(i, j) = H(j, i) = norm_f - Ffi(i) - Ffi(j) + fifj;
-                }
-            }
-            for (int i = 0; i < m; ++i)
-                H(i, i) += AA_REG * (1.0 + H(i, i));
-
-            Eigen::VectorXd gamma = H.ldlt().solve(rhs);
-
-            // Mix: D_aa = G - sum_i gamma_i * (G - g_hist[i]),  D = (1-beta)*D + beta*D_aa
-            std::array<const Vec3*, AA_M> g1p, g2p;
-            std::array<double, AA_M> gam;
-            for (int i = 0; i < m; ++i) {
-                int idx = (stored - 1 - i + AA_STORE) % AA_STORE;
-                g1p[i] = hist[idx].g1.data.data();
-                g2p[i] = hist[idx].g2.data.data();
-                gam[i] = gamma(i);
-            }
-            const Vec3* cg1 = cur.g1.data.data();
-            const Vec3* cg2 = cur.g2.data.data();
-            for (int i = 0; i < TRI; ++i) {
-                Vec3 d1_aa = cg1[i], d2_aa = cg2[i];
-                for (int k = 0; k < m; ++k) {
-                    d1_aa -= gam[k] * (cg1[i] - g1p[k][i]);
-                    d2_aa -= gam[k] * (cg2[i] - g2p[k][i]);
-                }
-                D1.data[i] = (1.0 - AA_BETA) * D1.data[i] + AA_BETA * d1_aa;
-                D2.data[i] = (1.0 - AA_BETA) * D2.data[i] + AA_BETA * d2_aa;
-            }
-        } else {
-            // First iteration: simple Picard relaxation
-            for (int i = 0; i < TRI; ++i) {
-                D1.data[i] += PICARD_RELAX * cur.f1.data[i];
-                D2.data[i] += PICARD_RELAX * cur.f2.data[i];
-            }
-        }
-        stored++;
+        apply_picard_update(D1, D2, Hx1, Hx2, TRI,
+                            neg_inv_r1, neg_inv_r2, relax);
     }
 
-    // Convergence check breaks before Anderson update, so env matches D1/D2
+    // Ensure the returned environment matches the final Picard iterate, including
+    // the non-converged case where the loop exits immediately after an update.
+    forward_environment(D1, D2, p1_val, p2_val, FORWARD_INNER_ITERS,
+                        Pi_1, obs_idx_1, Pi_2, obs_idx_2, env);
+
     Kernel2D calD1, calD2;
     #pragma omp parallel sections
     {
@@ -845,19 +1004,14 @@ EquilibriumResult solve_equilibrium_ce(
     auto prec2 = make_constant_prec(p2_val * p2_val);
     EnvironmentResult env;
 
-    // Anderson acceleration state (same as standard solver)
-    constexpr int AA_M = 5;
-    constexpr int AA_STORE = AA_M + 1;
-    constexpr double AA_REG = 1e-12;
-    constexpr double AA_BETA = 0.6;
     const int TRI = g_n * (g_n + 1) / 2;
-
-    struct AAEntry { Kernel2D f1, f2, g1, g2; };
-    std::vector<AAEntry> hist(AA_STORE);
-    int stored = 0;
 
     // Hx buffers hoisted out of loop (avoids 309KB alloc per iteration at N=160)
     Kernel2D Hx1, Hx2;
+    Kernel2D prev_D1, prev_D2;
+    double prev_err = std::numeric_limits<double>::infinity();
+    double relax = PICARD_RELAX;
+    bool have_prev = false;
 
     for (int it = 1; it <= MAX_PICARD_ITERS; ++it) {
         // Forward pass using discrete CE
@@ -868,87 +1022,45 @@ EquilibriumResult solve_equilibrium_ce(
         #pragma omp parallel sections
         {
             #pragma omp section
-            backward_kernels(env.X, env.Xtilde2, D2, prec2, 0.0, Hx1);
+            backward_kernels(env.X, env.Xtilde2, D2, prec2,
+                             p2_val, obs_idx_2, g_terminal_weight, Hx1);
             #pragma omp section
-            backward_kernels(env.X, env.Xtilde1, D1, prec1, 0.0, Hx2);
+            backward_kernels(env.X, env.Xtilde1, D1, prec1,
+                             p1_val, obs_idx_1, g_terminal_weight, Hx2);
         }
 
-        // Residual and Anderson acceleration (identical to standard solver)
+        // Residual and relaxed Picard update.
         const double neg_inv_r1 = -(1.0 / g_r1);
         const double neg_inv_r2 = -(1.0 / g_r2);
-        auto& cur = hist[stored % AA_STORE];
-        double norm_f = 0.0, norm_g = 0.0;
-        for (int i = 0; i < TRI; ++i) {
-            cur.g1.data[i] = neg_inv_r1 * Hx1.data[i];
-            cur.g2.data[i] = neg_inv_r2 * Hx2.data[i];
-            cur.f1.data[i] = cur.g1.data[i] - D1.data[i];
-            cur.f2.data[i] = cur.g2.data[i] - D2.data[i];
-            norm_f += cur.f1.data[i].squaredNorm() + cur.f2.data[i].squaredNorm();
-            norm_g += cur.g1.data[i].squaredNorm() + cur.g2.data[i].squaredNorm();
-        }
-
-        double err = std::sqrt(norm_f) / std::max(1.0, std::sqrt(norm_g));
+        double err = best_response_residual(D1, D2, Hx1, Hx2, TRI,
+                                            neg_inv_r1, neg_inv_r2);
         residuals.push_back(err);
         if (!std::isfinite(err)) break;
 
         if (verbose && (it <= 5 || it % 50 == 0))
-            std::cout << "  [CE] it=" << it << "  resid=" << err << std::endl;
+            std::cout << "  [CE] it=" << it << "  resid=" << err
+                      << "  relax=" << relax << std::endl;
         if (err < PICARD_TOL) {
             if (verbose)
                 std::cout << "  [CE] Converged at iteration " << it << std::endl;
             break;
         }
+        if (it == MAX_PICARD_ITERS)
+            break;
 
-        int m = std::min(stored, AA_M);
-        if (m >= 1) {
-            Eigen::VectorXd Ffi(m);
-            for (int i = 0; i < m; ++i) {
-                int idx = (stored - 1 - i + AA_STORE) % AA_STORE;
-                Ffi(i) = kernel_dot(cur.f1, cur.f2, hist[idx].f1, hist[idx].f2);
-            }
-            Eigen::MatrixXd H(m, m);
-            Eigen::VectorXd rhs(m);
-            for (int i = 0; i < m; ++i) {
-                rhs(i) = norm_f - Ffi(i);
-                for (int j = 0; j <= i; ++j) {
-                    int ii = (stored - 1 - i + AA_STORE) % AA_STORE;
-                    int jj = (stored - 1 - j + AA_STORE) % AA_STORE;
-                    double fifj = kernel_dot(hist[ii].f1, hist[ii].f2, hist[jj].f1, hist[jj].f2);
-                    H(i, j) = H(j, i) = norm_f - Ffi(i) - Ffi(j) + fifj;
-                }
-            }
-            for (int i = 0; i < m; ++i)
-                H(i, i) += AA_REG * (1.0 + H(i, i));
+        if (!adapt_picard_damping(err, prev_err, relax, D1, D2,
+                                  prev_D1, prev_D2, have_prev,
+                                  verbose, "[CE] "))
+            continue;
 
-            Eigen::VectorXd gamma = H.ldlt().solve(rhs);
-
-            std::array<const Vec3*, AA_M> g1p, g2p;
-            std::array<double, AA_M> gam;
-            for (int i = 0; i < m; ++i) {
-                int idx = (stored - 1 - i + AA_STORE) % AA_STORE;
-                g1p[i] = hist[idx].g1.data.data();
-                g2p[i] = hist[idx].g2.data.data();
-                gam[i] = gamma(i);
-            }
-            const Vec3* cg1 = cur.g1.data.data();
-            const Vec3* cg2 = cur.g2.data.data();
-            for (int i = 0; i < TRI; ++i) {
-                Vec3 d1_aa = cg1[i], d2_aa = cg2[i];
-                for (int k = 0; k < m; ++k) {
-                    d1_aa -= gam[k] * (cg1[i] - g1p[k][i]);
-                    d2_aa -= gam[k] * (cg2[i] - g2p[k][i]);
-                }
-                D1.data[i] = (1.0 - AA_BETA) * D1.data[i] + AA_BETA * d1_aa;
-                D2.data[i] = (1.0 - AA_BETA) * D2.data[i] + AA_BETA * d2_aa;
-            }
-        } else {
-            for (int i = 0; i < TRI; ++i) {
-                D1.data[i] += PICARD_RELAX * cur.f1.data[i];
-                D2.data[i] += PICARD_RELAX * cur.f2.data[i];
-            }
-        }
-        stored++;
+        apply_picard_update(D1, D2, Hx1, Hx2, TRI,
+                            neg_inv_r1, neg_inv_r2, relax);
     }
+
+    // Ensure the returned environment matches the final Picard iterate, including
+    // the non-converged case where the loop exits immediately after an update.
+    forward_environment_ce(D1, D2, p1_val, p2_val, FORWARD_INNER_ITERS,
+                           Pi_1, obs_idx_1, Pi_2, obs_idx_2, env);
 
     // After convergence: populate A_store (for F materialization / API compat)
     // and compute final calD via CE projection, all in parallel.
@@ -996,6 +1108,16 @@ CostPair compute_costs_general(const EnvironmentResult& env,
         double dx2 = bar_sol.barX[j] - b2_val;
         J1 += g_dt * (dx1*dx1 + var_X + r1_val * (bar_sol.barD1[j]*bar_sol.barD1[j] + var_D1));
         J2 += g_dt * (dx2*dx2 + var_X + r2_val * (bar_sol.barD2[j]*bar_sol.barD2[j] + var_D2));
+    }
+    if (g_terminal_weight != 0.0) {
+        const int j = g_n - 1;
+        double var_X_T = 0.0;
+        for (int s = 0; s < j; ++s)
+            var_X_T += g_dt * env.X[j][s].squaredNorm();
+        double dx1_T = bar_sol.barX[j] - b1_val;
+        double dx2_T = bar_sol.barX[j] - b2_val;
+        J1 += g_terminal_weight * (dx1_T * dx1_T + var_X_T);
+        J2 += g_terminal_weight * (dx2_T * dx2_T + var_X_T);
     }
     return {J1, J2};
 }

@@ -183,13 +183,22 @@ The equilibrium is found by a three-level nested iteration:
    G(D) = -(1/rho) H_x, with damping controlled by `PICARD_RELAX`.
 
 2. **Forward environment** (`forward_environment`):
-   given D&#x2081;, D&#x2082;, iterate the coupled filter-control system
-   for `FORWARD_INNER_ITERS` steps to obtain the state kernel X,
-   filter gains X&#x0303;, rank-1 factors A, and primitive control kernels calD.
+   given D&#x2081;, D&#x2082;, one exact causal march over the time index j
+   produces the state kernel X, filter gains X&#x0303;, rank-1 factors A and
+   primitive control kernels calD.  Row j of X depends on calD at earlier
+   times only, row j of the filter on row j of X and earlier filter rows, and
+   row j of calD on filter rows <= j, so the march is the exact fixed point of
+   the state--filter--control system with no relaxation.  The previous
+   scheme, `FORWARD_INNER_ITERS = 2` relaxed sweeps (0.6/0.4 mixing), was not
+   converged: it biased J by 1.8% and the kernels by ~1.5% at every N (the
+   bias does not vanish with refinement, since Anderson then converges to a
+   fixed point of an inexact best-response map).  It is kept for comparison
+   behind `LQG_FORWARD_RELAXED=<sweeps>`; 30 sweeps reproduce the march to
+   all printed digits at 7x the cost.
 
-3. **Rank-1 filter iteration** (inside `compute_filter_kernels`):
-   solve for the filter kernel's A factor via
-   `FILTER_INNER_ITERS` relaxation steps per time index j.
+3. **Filter row** (`filter_row`, used by `compute_filter_kernels`):
+   closed-form Kalman gain per time index j; `FILTER_INNER_ITERS` and
+   `FILTER_RELAX` are no longer used.
 
 After the kernel equilibrium converges, a separate scalar fixed-point
 (`solve_bar_equilibrium`) finds the mean-field trajectory, and backward
@@ -231,9 +240,9 @@ All solver constants are in `lqg_solver.h`:
 | `N_MAX` | 160 | Maximum grid points (compile-time) |
 | `D_W` | 3 | Noise/state dimension |
 | `RHO` | 0.1 | Control cost weight |
-| `FORWARD_INNER_ITERS` | 2 | Filter-control iterations per Picard step |
-| `FILTER_INNER_ITERS` | 6 | Rank-1 filter sub-iterations |
-| `FILTER_RELAX` | 0.55 | Filter relaxation parameter |
+| `FORWARD_INNER_ITERS` | 2 | Relaxed sweeps, only with `LQG_FORWARD_RELAXED` (default: exact march) |
+| `FILTER_INNER_ITERS` | 6 | unused (closed-form gain) |
+| `FILTER_RELAX` | 0.55 | unused |
 | `PICARD_TOL` | 10^-5 | Outer convergence tolerance |
 | `MAX_PICARD_ITERS` | 10000 | Outer iteration cap |
 | `PICARD_RELAX` | 0.15 | Initial Picard step length |
