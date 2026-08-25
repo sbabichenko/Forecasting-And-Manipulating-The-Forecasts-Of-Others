@@ -364,7 +364,7 @@ int main(int argc, char* argv[]) {
 #ifdef _OPENMP
     if (!std::getenv("OMP_NUM_THREADS")) omp_set_num_threads(std::min(8, omp_get_num_procs()));
 #endif
-    if (path.empty()) { for (double e : {0.3, 0.05, 0.01, 0.002}) if (e > eps) path.push_back(e); path.push_back(eps); }
+    if (path.empty()) { for (double e : {0.3, 0.1, 0.05, 0.02, 0.01, 0.005, 0.002}) if (e > eps) path.push_back(e); path.push_back(eps); }   // correlated-value cases need the finer path
     const auto t0 = std::chrono::steady_clock::now();
     Model M(N, L, path.front(), rho, q, gam, SV, SZ);
     Solver S(M); S.verbose = verbose;
