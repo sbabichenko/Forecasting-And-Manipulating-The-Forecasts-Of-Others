@@ -99,68 +99,46 @@ static void filter_row(int j,
     const Kernel2D& X, const Mat3& Pi, int obs_index,
     double obs_gain_val, Kernel2D& Xtilde, Kernel2D& A_store) {
 
-    Mat3 I_minus_Pi = Mat3::Identity() - Pi;
+    const Mat3 I_minus_Pi = Mat3::Identity() - Pi;
+    const double g = obs_gain_val;
+    const double prec = g * g;
+    const double dt2_prec = g_dt * g_dt * prec;
 
-    double g = obs_gain_val;
-    double prec = g * g;
-    double dt2_prec = g_dt * g_dt * prec;
-
-    {
-        if (j == 0) {
-            Xtilde[0][0] = I_minus_Pi * X[0][0];
-            A_store[0][0].setZero();
-            return;
-        }
-
-        // c_k = dot(Xtilde[k][0..k], X[j][0..k]),  partial_c_k = same but excluding u=k
-        std::array<double, N_MAX> c_k, partial_c_k;
-        for (int k = 0; k < j; ++k) {
-            double acc = 0.0;
-            for (int u = 0; u < k; ++u)
-                acc += Xtilde[k][u].dot(X[j][u]);
-            partial_c_k[k] = acc;
-            c_k[k] = acc + Xtilde[k][k].dot(X[j][k]);
-        }
-
-        // coeff_a[z] = g * X[j][z](obs_index)  (for gamma_a accumulation)
-        std::array<double, N_MAX> coeff_a;
-        for (int z = 0; z < j; ++z)
-            coeff_a[z] = g * X[j][z](obs_index);
-
-        // Per-s: accumulate correction in one pass over k
-        std::array<Vec3, N_MAX> correction;
-        for (int s = 0; s < j; ++s) {
-            Vec3 q_upper = Vec3::Zero();
-            Vec3 ga_acc = Vec3::Zero();
-
-            for (int k = s + 1; k < j; ++k) {
-                Vec3 Xtks = Xtilde[k][s];
-                q_upper += c_k[k] * Xtks;
-                ga_acc += coeff_a[k] * Xtks;
-            }
-
-            Vec3 gamma_a_s = g_dt * ga_acc;
-            correction[s] = dt2_prec * (c_k[s] * Xtilde[s][s] + q_upper) + gamma_a_s;
-        }
-
-        // Xtilde = (I-Pi)*X - correction
-        for (int s = 0; s < j; ++s)
-            Xtilde[j][s] = I_minus_Pi * X[j][s] - correction[s];
-        Xtilde[j][j] = I_minus_Pi * X[j][j];
-
-        // --- Closed-form Kalman gain (replaces iterative relaxation) ---
-        double sigma_minus = 0.0;
-        for (int u = 0; u < j; ++u)
-            sigma_minus += g_dt * Xtilde[j][u].squaredNorm();
-
-        double scale = 1.0 / (1.0 + g_dt * prec * sigma_minus);
-        for (int s = 0; s <= j; ++s)
-            Xtilde[j][s] *= scale;
-
-        double dt_prec = g_dt * prec;
-        for (int s = 0; s < j; ++s)
-            A_store[j][s] = dt_prec * Xtilde[j][s];
+    if (j == 0) {
+        Xtilde[0][0] = I_minus_Pi * X[0][0];
+        A_store[0][0].setZero();
+        return;
     }
+    using FlatC = Eigen::Map<const Eigen::VectorXd>;
+    using Flat = Eigen::Map<Eigen::VectorXd>;
+    const double* xj = X[j][0].data();               // row j of X, contiguous (j+1) Vec3
+
+    // c_k = sum_{u <= k} Xtilde[k][u] . X[j][u]   (flat dot over the contiguous row k)
+    std::array<double, N_MAX> c_k;
+    for (int k = 0; k < j; ++k) {
+        const double* xk = Xtilde[k][0].data();
+        c_k[k] = (k > 0 ? FlatC(xk, 3 * k).dot(FlatC(xj, 3 * k)) : 0.0) + Xtilde[k][k].dot(X[j][k]);
+    }
+
+    // correction[s] = dt2_prec c_s Xtilde[s][s] + sum_{s < k < j} alpha_k Xtilde[k][s],
+    // alpha_k = dt2_prec c_k + g_dt g X[j][k](obs): accumulated by rows (axpy over row k)
+    std::array<Vec3, N_MAX> q;
+    Flat qf(q[0].data(), 3 * j); qf.setZero();
+    for (int k = 1; k < j; ++k) {
+        const double alpha = dt2_prec * c_k[k] + g_dt * g * X[j][k](obs_index);
+        qf.head(3 * k) += alpha * FlatC(Xtilde[k][0].data(), 3 * k);
+    }
+    for (int s = 0; s < j; ++s)
+        Xtilde[j][s] = I_minus_Pi * X[j][s] - (dt2_prec * c_k[s] * Xtilde[s][s] + q[s]);
+    Xtilde[j][j] = I_minus_Pi * X[j][j];
+
+    // closed-form Kalman gain
+    const double sigma_minus = g_dt * FlatC(Xtilde[j][0].data(), 3 * j).squaredNorm();
+    const double scale = 1.0 / (1.0 + g_dt * prec * sigma_minus);
+    Flat(Xtilde[j][0].data(), 3 * (j + 1)) *= scale;
+
+    const double dt_prec = g_dt * prec;
+    Flat(A_store[j][0].data(), 3 * j) = dt_prec * FlatC(Xtilde[j][0].data(), 3 * j);
 }
 
 static void compute_filter_kernels(
@@ -186,53 +164,44 @@ static void control_row(int j,
 
     Vec3 e_i = Vec3::Zero();
     e_i(obs_index) = 1.0;
-    double g = obs_gain_val;
-    double DT_g = g_dt * g;
+    const double g = obs_gain_val;
+    const double DT_g = g_dt * g;
 
-    {
-        if (j == 0) {
-            // No observation increment has arrived at the initial grid point,
-            // so there is no primitive-shock feedback on the first point.
-            calD[0][0].setZero();
-            return;
-        }
-
-        // partial_d_k = sum_{u<k} dot(Xtilde[k][u], D[j][u])
-        std::array<double, N_MAX> partial_d_k;
-        partial_d_k[0] = 0.0;
-        for (int k = 1; k <= j; ++k) {
-            double acc = 0.0;
-            for (int u = 0; u < k; ++u)
-                acc += Xtilde[k][u].dot(D[j][u]);
-            partial_d_k[k] = acc;
-        }
-
-        // D_obs[u] = D[j][u](obs_index) for border_gt
-        std::array<double, N_MAX> D_obs;
-        for (int u = 0; u <= j; ++u)
-            D_obs[u] = D[j][u](obs_index);
-
-        for (int s = 0; s < j; ++s) {
-            Vec3 acc = Pi * D[j][s];
-
-            // border_gt + interior merged over k = s+1..j
-            Vec3 bg = Vec3::Zero(), ia = Vec3::Zero();
-            for (int k = s + 1; k <= j; ++k) {
-                bg += D_obs[k] * Xtilde[k][s];
-                ia += partial_d_k[k] * A_store[k][s];
-            }
-            acc += DT_g * bg + g_dt * ia;
-            acc += DT_g * partial_d_k[s] * e_i;  // border_lt
-
-            calD[j][s] = acc;
-        }
-
-        // s = j: only border_lt contributes
-        calD[j][j] = Pi * D[j][j] + DT_g * partial_d_k[j] * e_i;
-
-        // No source-time-zero observation-noise shock is available to controls.
-        calD[j][0](obs_index) = 0.0;
+    if (j == 0) {
+        // No observation increment has arrived at the initial grid point,
+        // so there is no primitive-shock feedback on the first point.
+        calD[0][0].setZero();
+        return;
     }
+    using FlatC = Eigen::Map<const Eigen::VectorXd>;
+    using Flat = Eigen::Map<Eigen::VectorXd>;
+    const double* dj = D[j][0].data();
+
+    // partial_d_k = sum_{u < k} Xtilde[k][u] . D[j][u]
+    std::array<double, N_MAX> partial_d_k;
+    partial_d_k[0] = 0.0;
+    for (int k = 1; k <= j; ++k)
+        partial_d_k[k] = FlatC(Xtilde[k][0].data(), 3 * k).dot(FlatC(dj, 3 * k));
+
+    // q[s] = sum_{s < k <= j} ( DT_g D[j][k](obs) Xtilde[k][s] + g_dt partial_d_k[k] A_store[k][s] ),
+    // accumulated by rows; A_store[k][s] = dt prec Xtilde[k][s] for s < k
+    std::array<Vec3, N_MAX> q;
+    Flat qf(q[0].data(), 3 * j); qf.setZero();
+    const double dt_prec = g_dt * g * g;
+    for (int k = 1; k <= j; ++k) {
+        const double beta = DT_g * D[j][k](obs_index) + g_dt * partial_d_k[k] * dt_prec;
+        const int len = 3 * std::min(k, j);
+        qf.head(len) += beta * FlatC(Xtilde[k][0].data(), len);
+    }
+    for (int s = 0; s < j; ++s)
+        calD[j][s] = Pi * D[j][s] + q[s] + DT_g * partial_d_k[s] * e_i;   // last term: border_lt
+
+    // s = j: only border_lt contributes
+    calD[j][j] = Pi * D[j][j] + DT_g * partial_d_k[j] * e_i;
+
+    // No source-time-zero observation-noise shock is available to controls.
+    calD[j][0](obs_index) = 0.0;
+    (void)A_store;
 }
 
 void primitive_control_kernel(
@@ -583,30 +552,41 @@ void backward_kernels(const Kernel2D& X, const Kernel2D& Xtildek,
     if (static_cast<int>(Mbuf.size()) < n) { Mbuf.resize(n); pbuf.resize(n); }
 
     std::array<Vec3, N_MAX> W;
+    std::array<Vec3, N_MAX> acc, diag;
+    using FlatC = Eigen::Map<const Eigen::VectorXd>;
+    using Flat = Eigen::Map<Eigen::VectorXd>;
     for (int j = n - 2; j >= 0; --j) {
         const int tp = j + 1;  // t+1
         const double Pk = prec_k[tp];
+        const int len = tp + 1;                       // z = 0..tp
 
-        // moments of the later levels against Xtilde[tp][.]
+        // moments of the later levels against Xtilde[tp][.]:
+        //   M_{t2} = sum_{z <= tp} Hx[t2][z] Xtilde[tp][z]^T  (3x3),  p_{t2} = sum_z X[t2][z] . Xtilde[tp][z]
         for (int t2 = tp + 1; t2 < n; ++t2) {
-            Mat3 M = Mat3::Zero(); double pv = 0.0;
-            const Vec3* hxrow = &Hx[t2][0]; const Vec3* xrow = &X[t2][0]; const Vec3* xtrow = &Xtildek[tp][0];
-            for (int z = 0; z <= tp; ++z) { M.noalias() += hxrow[z] * xtrow[z].transpose(); pv += xrow[z].dot(xtrow[z]); }
-            Mbuf[t2] = M; pbuf[t2] = pv;
+            Mat3 M = Mat3::Zero();
+            const Vec3* hxrow = &Hx[t2][0]; const Vec3* xtrow = &Xtildek[tp][0];
+            for (int z = 0; z < len; ++z) M.noalias() += hxrow[z] * xtrow[z].transpose();
+            Mbuf[t2] = M;
+            pbuf[t2] = FlatC(X[t2][0].data(), 3 * len).dot(FlatC(Xtildek[tp][0].data(), 3 * len));
+        }
+        // acc[r] = sum_{t2 > tp} ( M_{t2} Dk[t2][r] - p_{t2} W[t2][r] ),  r <= j
+        // diag[r] = sum_{t2 > tp} ( Hx[t2][tp] Dk[t2][r](obs) - W[t2][r] X[t2][tp](obs) )
+        Flat(acc[0].data(), 3 * len).setZero(); Flat(diag[0].data(), 3 * len).setZero();
+        for (int t2 = tp + 1; t2 < n; ++t2) {
+            const Mat3& M = Mbuf[t2]; const double pv = pbuf[t2];
+            const Vec3& hxd = Hx[t2][tp]; const double xo = X[t2][tp](obs_idx_k);
+            const Vec3* drow = &Dk[t2][0]; const Vec3* wrow = &Whist[t2 * n];
+            for (int r = 0; r <= j; ++r) {
+                acc[r].noalias() += M * drow[r]; acc[r] -= pv * wrow[r];
+                diag[r] += hxd * drow[r](obs_idx_k) - wrow[r] * xo;
+            }
         }
         // W[r] = Gamma^T E Hk[tp][tp][r] + g_dt * Pk * sum_z Hk[tp][z][r]^T * Xtilde[tp][z]
         // Diagonal innovation-birth term: Gamma^T E H^k_t(t, .), from delta w^k_t(t) = E^{k,T} Gamma^k(t) e^k_t.
         for (int r = 0; r <= j; ++r) {
-            Vec3 acc = Vec3::Zero(), diag = Vec3::Zero();
-            for (int t2 = tp + 1; t2 < n; ++t2) {
-                const Vec3& d = Dk[t2][r]; const Vec3& w = Whist[t2 * n + r];
-                acc.noalias() += Mbuf[t2] * d; acc -= pbuf[t2] * w;
-                diag += Hx[t2][tp] * d(obs_idx_k) - w * X[t2][tp](obs_idx_k);
-            }
-            W[r] = obs_gain_k * g_dt * diag + g_dt * Pk * g_dt * acc;
+            W[r] = obs_gain_k * g_dt * diag[r] + g_dt * Pk * g_dt * acc[r];
             Whist[tp * n + r] = W[r];
         }
-
         for (int r = 0; r <= j; ++r)
             Hx[j][r] = Hx[tp][r] + g_dt * (X[tp][r] + W[r]);
     }
@@ -932,21 +912,29 @@ static bool adapt_picard_damping(double err, double& prev_err,
 long g_anderson_fallbacks = 0;   // solves in which acceleration was abandoned (diagnostic)
 struct AndersonState {
     int depth = 5; double beta = 0.6; double first_step = 0.15; double growth = 3.0;   // growth: residual increase tolerated in one accelerated step
-    std::vector<Eigen::VectorXd> xs, fs;     // history, newest last
-    void reset() { xs.clear(); fs.clear(); }
+    // ring of the last `depth` differences dX_i = x_{i+1} - x_i, dF_i = f_{i+1} - f_i (columns), their Gram matrix,
+    // and the previous pair (x, f)
+    Eigen::MatrixXd dX, dF, G; int m = 0, head = 0; bool have_prev = false; Eigen::VectorXd x_prev, f_prev;
+    void reset() { m = 0; head = 0; have_prev = false; }
     // x, f (= g - x) of the current iterate; on return x holds the next iterate
     bool step(Eigen::VectorXd& x, const Eigen::VectorXd& f) {
-        xs.push_back(x); fs.push_back(f);
-        if (static_cast<int>(xs.size()) > depth + 1) { xs.erase(xs.begin()); fs.erase(fs.begin()); }
-        const int m = static_cast<int>(xs.size()) - 1;
+        const int n = static_cast<int>(f.size());
+        if (dX.rows() != n || dX.cols() != depth) { dX.resize(n, depth); dF.resize(n, depth); G.resize(depth, depth); reset(); }
+        if (have_prev) {
+            // append the newest difference (overwriting the oldest when full) and update the Gram matrix column
+            const int c = head; head = (head + 1) % depth; if (m < depth) ++m;
+            dX.col(c) = x - x_prev; dF.col(c) = f - f_prev;
+            for (int i = 0; i < m; ++i) { G(i, c) = dF.col(i).dot(dF.col(c)); G(c, i) = G(i, c); }
+        }
+        x_prev = x; f_prev = f; have_prev = true;
         if (m == 0) { x = x + first_step * f; return true; }   // first move: the safe relaxation, not beta
-        Eigen::MatrixXd dF(f.size(), m), dX(f.size(), m);
-        for (int i = 0; i < m; ++i) { dF.col(i) = fs[i + 1] - fs[i]; dX.col(i) = xs[i + 1] - xs[i]; }
-        const Eigen::MatrixXd G = dF.transpose() * dF;
-        Eigen::LDLT<Eigen::MatrixXd> ldlt(G + 1e-12 * G.trace() * Eigen::MatrixXd::Identity(m, m));
-        const Eigen::VectorXd gamma = ldlt.solve(dF.transpose() * f);
+        // gamma = argmin |f - dF gamma| over the m stored columns (any order: the columns are a set)
+        Eigen::MatrixXd Gm = G.topLeftCorner(m, m);
+        Eigen::VectorXd rhs(m); for (int i = 0; i < m; ++i) rhs[i] = dF.col(i).dot(f);
+        Eigen::LDLT<Eigen::MatrixXd> ldlt(Gm + 1e-12 * Gm.trace() * Eigen::MatrixXd::Identity(m, m));
+        const Eigen::VectorXd gamma = ldlt.solve(rhs);
         if (!gamma.allFinite()) { reset(); return false; }
-        x = x + beta * f - (dX + beta * dF) * gamma;
+        x = x + beta * f - dX.leftCols(m) * gamma - beta * (dF.leftCols(m) * gamma);
         return true;
     }
 };
@@ -988,7 +976,7 @@ static EquilibriumResult solve_equilibrium_core(
     // history cleared, and a Picard step taken from the previous iterate.
     static const AndersonState and_cfg = [] { AndersonState a; if (const char* e = std::getenv("LQG_ANDERSON")) { double d = 5, b = 0.6, g = 3.0; if (std::sscanf(e, "%lf,%lf,%lf", &d, &b, &g) >= 1) { a.depth = static_cast<int>(d); a.beta = b; a.growth = g; } } return a; }();
     AndersonState anderson = and_cfg;
-    constexpr double ANDERSON_START = 0.5; const double ANDERSON_GROWTH = anderson.growth;
+    static const double ANDERSON_START = [] { const char* e = std::getenv("LQG_ANDERSON_START"); return e ? std::atof(e) : 0.5; }(); const double ANDERSON_GROWTH = anderson.growth;
     Eigen::VectorXd xa, fa;
     bool anderson_active = false;
     double best_err = std::numeric_limits<double>::infinity(); int since_best = 0;   // stagnation guard

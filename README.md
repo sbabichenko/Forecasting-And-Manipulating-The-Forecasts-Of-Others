@@ -217,9 +217,16 @@ The equilibrium is found by a three-level nested iteration:
    results agree with Picard to the 1e-5 tolerance across the whole figure
    sweep, with no fallbacks.
 
-Timings for the (3,3) benchmark solve (one core pair): N=40 4 ms, N=160
-0.19 s (was 27 ms and 1.4 s before the exact march, Hk-free adjoints and
-Anderson).  The full figure pipeline at N=40 takes 2 s (was 8 s).
+6. **Vectorized rows**: the per-row sums in the forward march and the moment
+   sums in the backward pass run over contiguous kernel rows as flat vectors
+   (dot products and axpy's of length 3k) with loop order chosen to avoid
+   strided column access; Anderson keeps its difference columns and Gram
+   matrix incrementally.  Bit-identical results.
+
+Timings for the (3,3) benchmark solve (two threads): N=40 3 ms, N=160 60 ms
+(was 27 ms and 1.4 s before the exact march, Hk-free adjoints, Anderson and
+vectorization).  The full figure pipeline at N=40 takes 1.1 s (was 8 s),
+N=157 about 30 s (was 6 min).
 
 After the kernel equilibrium converges, the mean-field trajectory
 (`solve_bar_equilibrium`) is obtained by solving the affine system for the
