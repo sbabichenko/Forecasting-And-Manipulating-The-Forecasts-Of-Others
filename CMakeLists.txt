@@ -79,3 +79,7 @@ target_compile_options(test_ce_picard PRIVATE -O3 -march=native -Wall -Wextra)
 if(OpenMP_CXX_FOUND)
     target_link_libraries(test_ce_picard PRIVATE OpenMP::OpenMP_CXX)
 endif()
+
+add_executable(solve_spectral spectral_solver.cpp)
+target_link_libraries(solve_spectral PRIVATE Eigen3::Eigen)
+target_compile_options(solve_spectral PRIVATE -O3 -march=native -DNDEBUG -std=c++17 -Wall -Wextra)
