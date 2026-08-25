@@ -411,6 +411,8 @@ struct Model {
     double jac_ftol = 1e-13;   // forward tolerance for Jacobian-column evaluations
     double pre_ftol = 1e-13;   // forward tolerance during the damped pre-phase
     Eigen::PartialPivLU<MatrixXd> Jlu;   // persistent chord Jacobian (reused across sweep points)
+    MatrixXd Jinv;                        // inverse Jacobian, updated by Sherman-Morrison on Broyden steps
+    bool broyden = true;
     bool have_J = false;
     void set_params(double p1_, double p2_, double r1_, double r2_) {
         p1 = p1_; p2 = p2_; r1 = r1_; r2 = r2_; g1 = std::sqrt(p1_); g2 = std::sqrt(p2_);
@@ -449,9 +451,9 @@ struct Model {
                     Jm.col(i) = (residual_const(zp, jac_ftol) - r) / eps;
                 }
                 evals += n;
-                Jlu.compute(Jm); have_J = true; ++o.jacobians; last_ratio = 0.0;
+                Jlu.compute(Jm); Jinv = Jlu.inverse(); have_J = true; ++o.jacobians; last_ratio = 0.0;
             }
-            const VectorXd dz = Jlu.solve(-r);
+            const VectorXd dz = -(Jinv * r);
             double lam = 1.0; bool acc = false;
             for (int ls = 0; ls < 8; ++ls) {
                 const VectorXd zt = z + lam * dz;
@@ -459,7 +461,16 @@ struct Model {
                 VectorXd rt = residual(zt, true, ftol_ls);
                 double rtn = rt.cwiseAbs().maxCoeff();
                 if (rtn <= tol && ftol_ls > 1e-13) { rt = residual(zt, true); rtn = rt.cwiseAbs().maxCoeff(); }   // confirm at full accuracy
-                if (std::isfinite(rtn) && rtn < (1.0 - 1e-4 * lam) * rn) { last_ratio = rtn / rn; z = zt; r = rt; rn = rtn; acc = true; break; }
+                if (std::isfinite(rtn) && rtn < (1.0 - 1e-4 * lam) * rn) {
+                    if (broyden) {   // good Broyden update of the inverse (Sherman-Morrison), O(n^2)
+                        const VectorXd sz = zt - z, yr = rt - r;
+                        const VectorXd Jy = Jinv * yr;
+                        const double den = sz.dot(Jy);
+                        if (std::abs(den) > 1e-14 * sz.norm() * Jy.norm())
+                            Jinv.noalias() += ((sz - Jy) * (sz.transpose() * Jinv)) / den;
+                    }
+                    last_ratio = rtn / rn; z = zt; r = rt; rn = rtn; acc = true; break;
+                }
                 lam *= 0.5;
             }
             if (verbose) std::fprintf(stderr, "newton %d: |r| %.3e step %.3g%s\n", step, rn, lam, acc ? "" : " (rejected)");
@@ -479,11 +490,21 @@ struct Summary { double dip, dip_lag, hx_fund_0, hx_fund_m2, hx_fund_p2; VectorX
 Summary summarize(const Model& M, const MatrixXd& d1, const MatrixXd& d2) {
     Summary S;
     // fine grid on the positive panel for the signal-noise minimum
-    const int nf = 20001;
+    // coarse scan then golden-section refinement of the minimum
+    const int nf = 401;
     VectorXd pts(nf); for (int i = 0; i < nf; ++i) pts[i] = M.L * i / (nf - 1);
-    const VectorXd sig = M.bw.T.pos.interp(pts) * M.last_b1.hx.bottomRows(M.N).col(1);
+    const VectorXd hsig = M.last_b1.hx.bottomRows(M.N).col(1);
+    const VectorXd sig = M.bw.T.pos.interp(pts) * hsig;
     int im = 0; sig.minCoeff(&im);
-    S.dip = sig[im]; S.dip_lag = pts[im];
+    auto val = [&](double t) { VectorXd one(1); one << t; return (M.bw.T.pos.interp(one) * hsig)(0); };
+    double a = pts[std::max(0, im - 1)], b = pts[std::min(nf - 1, im + 1)];
+    const double gr = (std::sqrt(5.0) - 1.0) / 2.0;
+    double c = b - gr * (b - a), d = a + gr * (b - a), fc = val(c), fd = val(d);
+    for (int it = 0; it < 40; ++it) {
+        if (fc < fd) { b = d; d = c; fd = fc; c = b - gr * (b - a); fc = val(c); }
+        else         { a = c; c = d; fc = fd; d = a + gr * (b - a); fd = val(d); }
+    }
+    S.dip_lag = 0.5 * (a + b); S.dip = val(S.dip_lag);
     VectorXd q(3); q << 0.0, -2.0, 2.0;
     const VectorXd f = M.bw.T.interp(q) * M.last_b1.hx.col(0);
     S.hx_fund_0 = f[0]; S.hx_fund_m2 = f[1]; S.hx_fund_p2 = f[2];
@@ -512,7 +533,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     const double p1 = std::atof(argv[1]), p2 = std::atof(argv[2]), r1 = std::atof(argv[3]), r2 = std::atof(argv[4]);
-    int N = 24, uniform = 0, pre = 15; double L = 3.0, tol = 1e-12, relax = 0.1, jac_ftol = 1e-9, pre_ftol = 1e-6; bool verbose = false, eval_only = false, sweep_full = false;
+    int N = 24, uniform = 0, pre = 15; double L = 3.0, tol = 1e-12, relax = 0.1, jac_ftol = 1e-9, pre_ftol = 1e-6; bool verbose = false, eval_only = false, sweep_full = false, sweep_extrap = true, M_broyden = true;
     std::string sweep_param; double sweep_lo = 0, sweep_hi = 0; int sweep_n = 0;
     for (int i = 5; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--N") && i + 1 < argc) N = std::atoi(argv[++i]);
@@ -525,6 +546,8 @@ int main(int argc, char* argv[]) {
         else if (!std::strcmp(argv[i], "--eval-only")) eval_only = true;
         else if (!std::strcmp(argv[i], "--sweep") && i + 4 < argc) { sweep_param = argv[++i]; sweep_lo = std::atof(argv[++i]); sweep_hi = std::atof(argv[++i]); sweep_n = std::atoi(argv[++i]); }
         else if (!std::strcmp(argv[i], "--sweep-full")) sweep_full = true;
+        else if (!std::strcmp(argv[i], "--no-extrap")) sweep_extrap = false;
+        else if (!std::strcmp(argv[i], "--no-broyden")) M_broyden = false;
         else if (!std::strcmp(argv[i], "--jac-ftol") && i + 1 < argc) jac_ftol = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "--pre-ftol") && i + 1 < argc) pre_ftol = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "--threads") && i + 1 < argc) { 
@@ -542,7 +565,7 @@ int main(int argc, char* argv[]) {
 #endif
     const auto t0 = std::chrono::steady_clock::now();
     Model M(N, L, p1, p2, r1, r2);
-    M.jac_ftol = jac_ftol; M.pre_ftol = pre_ftol;
+    M.jac_ftol = jac_ftol; M.pre_ftol = pre_ftol; M.broyden = M_broyden;
     const auto t1 = std::chrono::steady_clock::now();
     if (sweep_n > 0) {
         // Sweep one parameter: warm start from the previous point, reuse the
@@ -559,24 +582,32 @@ int main(int argc, char* argv[]) {
         Model::Out ob = M.solve(M.ce_start(), tol, pre, relax, 30, verbose);
         const VectorXd zbase = ob.z;
         VectorXd z = zbase;
+        VectorXd zprev; double vprev = 0.0; bool have_prev = false;   // for secant extrapolation in the parameter
         std::vector<std::string> out(sweep_n);
         struct Kern { MatrixXd x, xt1, xt2, d1, d2, hx1, hx2, w1, w2; };
         std::vector<Kern> kern(sweep_n);
         for (size_t idx = 0; idx < order.size(); ++idx) {
             const int k = order[idx];
-            if (k == k0 - 1) { z = zbase; M.have_J = false; }   // turning downward: restart from the base solution
+            if (k == k0 - 1) { z = zbase; M.have_J = false; have_prev = false; }   // turning downward: restart from the base solution
             const double val = vals[k];
+            // secant extrapolation from the last two converged points
+            VectorXd zstart = z;
+            if (sweep_extrap && have_prev && idx > 0) {
+                const double vcur = vals[order[idx - 1]];
+                if (vcur != vprev) zstart = z + (z - zprev) * ((val - vcur) / (vcur - vprev));
+            }
             double q1 = p1, q2 = p2, s1 = r1, s2 = r2;
             if (sweep_param == "p1") q1 = val; else if (sweep_param == "p2") q2 = val;
             else if (sweep_param == "r1") s1 = val; else s2 = val;
             M.set_params(q1, q2, s1, s2);
             const long evals0 = M.evals;
             const auto ta = std::chrono::steady_clock::now();
-            Model::Out ok = M.solve(z, tol, 0, relax, 30, verbose);
+            Model::Out ok = M.solve(zstart, tol, 0, relax, 30, verbose);
+            if (!ok.ok && sweep_extrap) { M.have_J = false; ok = M.solve(z, tol, 0, relax, 30, verbose); }   // fall back to the plain warm start
             if (!ok.ok) { M.have_J = false; ok = M.solve(z, tol, pre, relax, 30, verbose); }          // retry with a pre-phase
             if (!ok.ok) { M.have_J = false; ok = M.solve(M.ce_start(), tol, pre, relax, 30, verbose); }   // last resort: cold
             const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - ta).count();
-            if (ok.ok) z = ok.z;
+            if (ok.ok) { zprev = z; vprev = idx > 0 ? vals[order[idx - 1]] : base; have_prev = idx > 0; z = ok.z; }
             MatrixXd d1, d2; M.unpack(ok.z, d1, d2);
             M.residual(ok.z, true);
             const Summary S = summarize(M, d1, d2);
@@ -620,6 +651,8 @@ int main(int argc, char* argv[]) {
     const auto t2 = std::chrono::steady_clock::now();
     const double t_setup = std::chrono::duration<double>(t1 - t0).count();
     const double t_solve = std::chrono::duration<double>(t2 - t1).count();
+    if (verbose) std::fprintf(stderr, "setup %.4f s, solve %.4f s, %ld evaluations, %d newton steps, |r| %.2e | forward %.4f s (%.1f its/eval), backward %.4f s\n",
+                              t_setup, t_solve, M.evals, o.newton_steps, o.resid, M.t_fwd, double(M.fwd_iters) / std::max(1L, M.evals), M.t_bwd);
     MatrixXd d1, d2; M.unpack(o.z, d1, d2);
     std::printf("{\"converged\":%s,\"residual\":%.6e,\"N\":%d,\"L\":%.15g,\"p1\":%.15g,\"p2\":%.15g,\"r1\":%.15g,\"r2\":%.15g,"
                 "\"evaluations\":%ld,\"newton_steps\":%d,\"setup_seconds\":%.6f,\"solve_seconds\":%.6f,",
