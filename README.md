@@ -320,9 +320,16 @@ column a row needs in between read lazily from Vbar plus the pending block.
 Each product is one pass over the 600 KB basis (N=160) and is bound by that
 traffic, not by arithmetic, which is why the parallel roles pay off:
 per sweep and thread 0.5 ms (V^T), 0.3-0.65 ms (V), 0.6 ms (flush).
-Solve times, 8 threads (`benchmark`): N=160 65-70 ms exact vs 48 ms with the
-recursion, N=320 0.51 vs 0.39 s, N=40 unchanged (was 107 ms at N=160 before the
-roles and the stored coefficients; the unbatched sweep 129 ms).
+Above N ~ 320 each role is further split over S = threads/4 sub-threads
+(V^T Rm by basis column, V M3 and the row-local updates by row block, the
+flush by column of Vbar; five team barriers per row, which is why it does not
+pay at N=160; `LQG_ADJ_SUB` overrides S).
+Solve times, 8 threads: N=160 65-70 ms exact vs 48 ms with the recursion,
+N=320 0.40 vs 0.39 s, N=640 2.4 vs 1.9 s (3.4 s without the sub-threads),
+N=40 unchanged (was 107 ms at N=160 before the roles and the stored
+coefficients; the unbatched sweep 129 ms).  `LQG_PROF=1` prints the
+forward / adjoint / rest split of the kernel iteration, `LQG_ADJ_PROF=1` the
+per-thread phases of the sweep.
 `LQG_ADJ_REF=1` selects the plain per-player sweep kept for verification
 (results agree to 1e-12).  The figure pipeline at N=157 takes 63 s.
 Note: the cmake `benchmark` target had not been linked against OpenMP, so its

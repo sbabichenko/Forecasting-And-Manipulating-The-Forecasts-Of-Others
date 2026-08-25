@@ -1037,7 +1037,10 @@ static int adjoint_batch() { static const int v = [] { const char* e = std::gete
 // Vbar, W, K).  The roles of one player meet once per row to merge their Gram-Schmidt
 // contributions to Xbar[j] before the state recursion; the team of up to 4 threads runs the
 // roles in lockstep (one barrier per row), any smaller team takes several roles per thread.
-struct AdjRole { Eigen::MatrixXd Vbar, W, K; Eigen::VectorXd hpart[2]; int nb = 0, bA = 0, bR = 0; };
+struct AdjRole {
+    Eigen::MatrixXd Vbar, W, K, Rm, M2;      // Rm = [cb, ubar] (dim x 2), M2 = V^T Rm (n x 2): shared by the role's sub-threads
+    Eigen::VectorXd hpart[2];
+};
 static void exact_adjoint_pair(const EnvironmentResult& env, const Kernel2D& D1, const Kernel2D& D2, double r1, double r2, int obs1, int obs2, double g1, double g2, Kernel2D& Hx1, Kernel2D& Hx2) {
     if (std::getenv("LQG_ADJ_REF")) {
         #pragma omp parallel sections num_threads(2) if (!omp_in_parallel())
@@ -1062,109 +1065,140 @@ static void exact_adjoint_pair(const EnvironmentResult& env, const Kernel2D& D1,
     }
     for (int k = 0; k < 4; ++k) {
         AdjRole& r = R[k];
-        if (r.Vbar.rows() != dim || r.Vbar.cols() != n) r.Vbar.resize(dim, n);
+        if (r.Vbar.rows() != dim || r.Vbar.cols() != n) { r.Vbar.resize(dim, n); r.Rm.resize(dim, 2); r.M2.resize(n, 2); }
         r.Vbar.setZero();
         if (r.W.rows() != dim || r.W.cols() != 4 * m) { r.W.resize(dim, 4 * m); r.K.resize(n, 4 * m); }
         for (int e = 0; e < 2; ++e) if (r.hpart[e].size() != dim) r.hpart[e].resize(dim);
-        r.nb = 0;
     }
     static const bool prof = std::getenv("LQG_ADJ_PROF") != nullptr;
-    #pragma omp parallel num_threads(4) if (!omp_in_parallel())
+    // Team: 4 roles x S sub-threads when at least 4 threads are available (S = T / 4; the products of a
+    // role are split among its sub-threads: V^T Rm by basis column, V M3 and the row-local updates by
+    // row block, the flush by column of Vbar; five team barriers per row).  With fewer threads each
+    // thread takes every fourth role alone.
+    // Sub-threads pay five barriers per row, which only amortizes once the row work is large enough
+    // (N=640 gains 30%, N=320 nothing measurable on an 8-core desktop); LQG_ADJ_SUB fixes the number per role.
+    static const int sub_env = [] { const char* e = std::getenv("LQG_ADJ_SUB"); return e ? std::max(1, std::atoi(e)) : 0; }();
+    const int avail = omp_in_parallel() ? 1 : omp_get_max_threads();
+    const int S = sub_env > 0 ? std::min(sub_env, std::max(1, avail / 4)) : std::max(1, std::min(avail / 4, n / 320)), nthr = avail >= 4 ? 4 * S : avail;
+    #pragma omp parallel num_threads(nthr)
     {
         const int T = omp_get_num_threads(), t = omp_get_thread_num();
-        Eigen::MatrixXd Rm, M2, M3, P; Eigen::VectorXd ubar, vbar, hbar;
-        double tacc[5] = {0, 0, 0, 0, 0}; double t0 = prof ? omp_get_wtime() : 0.0;
+        const int Sx = T >= 4 ? T / 4 : 1;           // sub-threads per role (actual team)
+        const int sub = T >= 4 ? t % Sx : 0;
+        const bool have_role = T >= 4 ? t < 4 * Sx : true;
+        auto roles_of = [&](std::vector<int>& v) { v.clear(); if (!have_role) return; if (T >= 4) v.push_back(t / Sx); else for (int r = t; r < 4; r += T) v.push_back(r); };
+        std::vector<int> my; roles_of(my);
+        int nbl[4] = {0, 0, 0, 0}, bAl[4] = {0, 0, 0, 0}, bRl[4] = {0, 0, 0, 0};   // batch state, private (identical on every thread)
+        Eigen::MatrixXd M3, P; Eigen::VectorXd vbar, hbar;
+        double tacc[6] = {0, 0, 0, 0, 0, 0}; double t0 = prof ? omp_get_wtime() : 0.0;
         auto tick = [&](int k) { if (prof) { const double t1 = omp_get_wtime(); tacc[k] += t1 - t0; t0 = t1; } };
+        using FlatC = Eigen::Map<const Eigen::VectorXd>; using Flat = Eigen::Map<Eigen::VectorXd>;
         for (int j = n - 1; j >= 1; --j) {
             const int active = 3 * (j + 1), par = j & 1;
-            for (int role = t; role < 4; role += T) {
+            // block of Vec3 rows [z0, z1) of this sub-thread
+            const int z0 = static_cast<int>(static_cast<long>(j + 1) * sub / Sx), z1 = static_cast<int>(static_cast<long>(j + 1) * (sub + 1) / Sx);
+            const int i0 = 3 * z0, L = 3 * (z1 - z0);
+            // phase A: Rm = [cb, ubar] rows, W_j columns 0,1 rows, K_j column 0 (sub 0)
+            for (int role : my) {
                 const int a = role >> 1, q = role & 1; AdjRole& r = R[role];
                 const CERowFilter& b = *B[q]; const int r0 = b.rank_after[j - 1];
                 const bool gs = r0 > 0 && b.rank_after[j] > r0;
-                r.hpart[par].head(active).setZero();
+                Flat(r.hpart[par].data() + i0, L).setZero();
                 if (r0 == 0) continue;
-                auto Vact = b.V.topRows(active).leftCols(r0);
-                if (r.nb == 0) { r.bA = active; r.bR = r0; }
-                const int c0 = 4 * r.nb;
+                if (nbl[role] == 0) { bAl[role] = active; bRl[role] = r0; }
+                const int c0 = 4 * nbl[role];
                 auto Wj = r.W.middleCols(c0, 4); auto Kj = r.K.middleCols(c0, 4);
-                Wj.setZero(); Kj.setZero();
-                // W_j = [cb, D[j], -vbar, -h],  K_j = [Vt D[j], Vt cb, Vt h, Vt vbar]; Vt D[j], Vt h and |v|
-                // come from the march, only Vt [cb, ubar] is computed here
-                const int nr = gs ? 2 : 1;
-                Rm.resize(active, nr);
-                for (int z = 0; z <= j; ++z) { Rm.block<3, 1>(3 * z, 0) = cbar[a][q][j][z]; Wj.block<3, 1>(3 * z, 1) = (*D[q])[j][z]; }
-                Rm(obs[q], 0) = 0.0;                                // calD[j][0](obs) is forced to zero
-                Wj.col(0).head(active) = Rm.col(0);
-                Kj.topRows(r0).col(0) = b.cDs.col(j).head(r0);
+                Wj.middleRows(i0, L).setZero();
+                if (sub == 0) { Kj.setZero(); Kj.topRows(r0).col(0) = b.cDs.col(j).head(r0); if (gs) Kj.topRows(r0).col(2) = b.cHs.col(j).head(r0); }
+                for (int z = z0; z < z1; ++z) { r.Rm.block<3, 1>(3 * z, 0) = cbar[a][q][j][z]; Wj.block<3, 1>(3 * z, 1) = (*D[q])[j][z]; }
+                if (z0 == 0) r.Rm(obs[q], 0) = 0.0;                 // calD[j][0](obs) is forced to zero
+                Wj.col(0).segment(i0, L) = r.Rm.col(0).segment(i0, L);
                 if (gs) {
-                    ubar = r.Vbar.col(r0).head(active);
-                    if (r.nb > 0) ubar.noalias() += r.W.topRows(active).leftCols(c0) * r.K.row(r0).head(c0).transpose();
-                    Rm.col(1) = ubar;
-                    Kj.topRows(r0).col(2) = b.cHs.col(j).head(r0);
-                }
-                tick(4);
-                {   // M2 = Vact^T Rm, per basis column one or two vectorized dots (Eigen's narrow GEMM is slower)
-                    M2.resize(r0, nr);
-                    const Eigen::Map<const Eigen::VectorXd> x0(Rm.col(0).data(), active), x1(Rm.col(nr - 1).data(), active);
-                    for (int k = 0; k < r0; ++k) {
-                        const Eigen::Map<const Eigen::VectorXd> vm(b.V.col(k).data(), active);
-                        M2(k, 0) = vm.dot(x0); if (nr == 2) M2(k, 1) = vm.dot(x1);
-                    }
-                }
-                tick(0);
-                Kj.topRows(r0).col(1) = M2.col(0);
-                const double vn = gs ? b.vns[j] : 1.0;
-                if (gs) Kj.topRows(r0).col(3) = M2.col(1) / vn;   // Vt vbar = Vt ubar / |v|  (Vt u = 0)
-                const int nm = (q == a ? 1 : 0) + (gs ? 1 : 0);
-                if (nm > 0) {
-                    M3.resize(r0, nm); int k = 0;
-                    if (q == a) M3.col(k++) = Kj.topRows(r0).col(1);
-                    if (gs) M3.col(k++) = Kj.topRows(r0).col(3);
-                    tick(4);
-                    {   // P = Vact M2, per basis column one or two axpy's
-                        P.resize(active, nm); P.setZero();
-                        Eigen::Map<Eigen::VectorXd> p0(P.col(0).data(), active), p1(P.col(nm - 1).data(), active);
-                        for (int kc = 0; kc < r0; ++kc) {
-                            const Eigen::Map<const Eigen::VectorXd> vm(b.V.col(kc).data(), active);
-                            p0 += M3(kc, 0) * vm; if (nm == 2) p1 += M3(kc, 1) * vm;
-                        }
-                    }
-                    tick(1); int kk = 0;
-                    if (q == a) { for (int z = 0; z <= j; ++z) grad[a][j][z] += P.block<3, 1>(3 * z, kk); ++kk; }
-                    if (gs) {
-                        auto u = b.V.col(r0).head(active);
-                        vbar = (ubar - u * u.dot(ubar)) / vn;
-                        hbar = vbar - P.col(kk);
-                        Wj.col(2).head(active) = -vbar;
-                        for (int z = 0; z <= j; ++z) Wj.block<3, 1>(3 * z, 3) = -gg[q] * g_dt * X[j][z];
-                        Wj(3 * j + obs[q], 3) -= 1.0;
-                        r.hpart[par].head(active) = gg[q] * g_dt * hbar;
-                    }
-                }
-                if (++r.nb == m) {
-                    tick(4);
-                    r.Vbar.topRows(r.bA).leftCols(r.bR).noalias() += r.W.topRows(r.bA).leftCols(4 * r.nb) * r.K.topRows(r.bR).leftCols(4 * r.nb).transpose();
-                    r.nb = 0; tick(3);
+                    Flat ub(r.Rm.col(1).data() + i0, L);
+                    ub = r.Vbar.col(r0).segment(i0, L);
+                    if (c0 > 0) ub.noalias() += r.W.middleRows(i0, L).leftCols(c0) * r.K.row(r0).head(c0).transpose();
                 }
             }
             tick(4);
             #pragma omp barrier
+            // phase B: M2 = V^T Rm over the basis columns [k0, k1) of this sub-thread
+            for (int role : my) {
+                const int q = role & 1; AdjRole& r = R[role];
+                const CERowFilter& b = *B[q]; const int r0 = b.rank_after[j - 1]; if (r0 == 0) continue;
+                const bool gs = b.rank_after[j] > r0;
+                const int k0 = static_cast<int>(static_cast<long>(r0) * sub / Sx), k1 = static_cast<int>(static_cast<long>(r0) * (sub + 1) / Sx);
+                const FlatC x0(r.Rm.col(0).data(), active), x1(r.Rm.col(1).data(), active);
+                for (int k = k0; k < k1; ++k) {
+                    const FlatC vm(b.V.col(k).data(), active);
+                    r.M2(k, 0) = vm.dot(x0); if (gs) r.M2(k, 1) = vm.dot(x1);
+                }
+            }
+            tick(0);
+            #pragma omp barrier
+            // phase C: K_j columns 1,3; P = V M3 on the row block; gradient, vbar, hbar, W_j columns 2,3, hpart rows
+            for (int role : my) {
+                const int a = role >> 1, q = role & 1; AdjRole& r = R[role];
+                const CERowFilter& b = *B[q]; const int r0 = b.rank_after[j - 1]; if (r0 == 0) continue;
+                const bool gs = b.rank_after[j] > r0;
+                const int c0 = 4 * nbl[role]; auto Wj = r.W.middleCols(c0, 4); auto Kj = r.K.middleCols(c0, 4);
+                const double vn = gs ? b.vns[j] : 1.0;
+                if (sub == 0) { Kj.topRows(r0).col(1) = r.M2.col(0).head(r0); if (gs) Kj.topRows(r0).col(3) = r.M2.col(1).head(r0) / vn; }   // V^T vbar = V^T ubar / |v|
+                const int nm = (q == a ? 1 : 0) + (gs ? 1 : 0);
+                if (nm == 0) continue;
+                M3.resize(r0, nm); int k = 0;
+                if (q == a) M3.col(k++) = r.M2.col(0).head(r0);
+                if (gs) M3.col(k++) = r.M2.col(1).head(r0) / vn;
+                P.resize(L, nm); P.setZero();
+                {
+                    Flat p0(P.col(0).data(), L), p1(P.col(nm - 1).data(), L);
+                    for (int kc = 0; kc < r0; ++kc) { const FlatC vm(b.V.col(kc).data() + i0, L); p0 += M3(kc, 0) * vm; if (nm == 2) p1 += M3(kc, 1) * vm; }
+                }
+                int kk = 0;
+                if (q == a) { for (int z = z0; z < z1; ++z) grad[a][j][z] += P.block<3, 1>(3 * (z - z0), kk); ++kk; }
+                if (gs) {
+                    const FlatC u(b.V.col(r0).data(), active), ub(r.Rm.col(1).data(), active);
+                    const double uu = u.dot(ub);
+                    vbar = (ub.segment(i0, L) - uu * u.segment(i0, L)) / vn;
+                    hbar = vbar - P.col(kk);
+                    Wj.col(2).segment(i0, L) = -vbar;
+                    for (int z = z0; z < z1; ++z) Wj.block<3, 1>(3 * z, 3) = -gg[q] * g_dt * X[j][z];
+                    if (z1 == j + 1) Wj(3 * j + obs[q], 3) -= 1.0;
+                    Flat(r.hpart[par].data() + i0, L) = gg[q] * g_dt * hbar;
+                }
+            }
+            tick(1);
+            #pragma omp barrier
+            // flush (every m rows): Vbar += W K^T on this sub-thread's block of columns
+            for (int role : my) {
+                const int q = role & 1; AdjRole& r = R[role];
+                const int r0 = B[q]->rank_after[j - 1]; if (r0 == 0) continue;
+                if (++nbl[role] == m) {
+                    nbl[role] = 0;
+                    const int bA = bAl[role], bR = bRl[role];
+                    const int cA = static_cast<int>(static_cast<long>(bR) * sub / Sx), cB = static_cast<int>(static_cast<long>(bR) * (sub + 1) / Sx);
+                    if (cB > cA) r.Vbar.topRows(bA).middleCols(cA, cB - cA).noalias() += r.W.topRows(bA).leftCols(4 * m) * r.K.middleRows(cA, cB - cA).leftCols(4 * m).transpose();
+                }
+            }
+            tick(3);
+            #pragma omp barrier
             // state recursion X[j][s] = X[j-1][s] + dt (calD_1[j-1][s] + calD_2[j-1][s]): role (a, q) updates
-            // its own cbar[a][q][j-1]; role (a, 0) also carries Xbar[a][j-1]
-            for (int role = t; role < 4; role += T) {
+            // its own cbar[a][q][j-1] on its row block; role (a, 0) also carries Xbar[a][j-1]
+            for (int role : my) {
                 const int a = role >> 1, q = role & 1;
                 const Eigen::VectorXd& h0 = R[2 * a].hpart[par]; const Eigen::VectorXd& h1 = R[2 * a + 1].hpart[par];
-                for (int s = 0; s < j; ++s) {
+                const int s0 = z0, s1 = std::min(z1, j);
+                for (int s = s0; s < s1; ++s) {
                     const Vec3 tot = Xbar[a][j][s] + h0.segment<3>(3 * s) + h1.segment<3>(3 * s);
                     cbar[a][q][j - 1][s] += g_dt * tot;
                     if (q == 0) Xbar[a][j - 1][s] += tot;
                 }
             }
             tick(2);
+            #pragma omp barrier      // the row blocks of the recursion and of the next row's phase A differ
         }
         if (prof) {
             #pragma omp critical
-            std::fprintf(stderr, "adj thread %d: VtR %.2f  VM2 %.2f  recur %.2f  flush %.2f  other %.2f ms\n", t, 1e3 * tacc[0], 1e3 * tacc[1], 1e3 * tacc[2], 1e3 * tacc[3], 1e3 * tacc[4]);
+            std::fprintf(stderr, "adj thread %d: VtR %.2f  VM3 %.2f  recur %.2f  flush %.2f  phaseA %.2f ms\n", t, 1e3 * tacc[0], 1e3 * tacc[1], 1e3 * tacc[2], 1e3 * tacc[3], 1e3 * tacc[4]);
         }
     }
     const double sc = 1.0 / (2.0 * g_dt * g_dt);
@@ -1610,12 +1644,16 @@ static EquilibriumResult solve_equilibrium_core(
     static const int newton_after = [] { const char* e = std::getenv("LQG_NEWTON_AFTER"); return e ? std::atoi(e) : 40; }();   // switch to the Newton-Krylov engine after this many outer iterations (0 = never)
     constexpr int ANDERSON_STALL = 8;
 
+    static const bool prof = std::getenv("LQG_PROF") != nullptr; double tprof[3] = {0, 0, 0}; double tp0 = prof ? omp_get_wtime() : 0.0;
+    auto ptick = [&](int k) { if (prof) { const double t1 = omp_get_wtime(); tprof[k] += t1 - tp0; tp0 = t1; } };
     for (int it = 1; it <= MAX_PICARD_ITERS; ++it) {
+        ptick(2);
         forward_environment(D1, D2, p1_val, p2_val, FORWARD_INNER_ITERS,
                             Pi_1, obs_idx_1, Pi_2, obs_idx_2, env);
-
+        ptick(0);
         if (exact_adjoint_enabled() && env.has_calD && env.basis1) {
             exact_adjoint_pair(env, D1, D2, g_r1, g_r2, obs_idx_1, obs_idx_2, p1_val, p2_val, Hx1, Hx2);
+            ptick(1);
         } else if (lockstep) {
             bp1.Xt = &env.Xtilde2; bp1.Dk = &D2; bp1.prec = &prec2; bp1.gain = p2_val; bp1.obs = obs_idx_2; bp1.Hx = &Hx1;
             bp2.Xt = &env.Xtilde1; bp2.Dk = &D1; bp2.prec = &prec1; bp2.gain = p1_val; bp2.obs = obs_idx_1; bp2.Hx = &Hx2;
@@ -1633,6 +1671,8 @@ static EquilibriumResult solve_equilibrium_core(
         }
         }
 
+        ptick(1);
+        if (prof && it % 5 == 0) std::fprintf(stderr, "prof it %d: forward %.1f  adjoint %.1f  rest %.1f ms\n", it, 1e3 * tprof[0], 1e3 * tprof[1], 1e3 * tprof[2]);
         // Compute G = -(1/r_k)*Hx and residual F = G - D
         const double neg_inv_r1 = -(1.0 / g_r1);
         const double neg_inv_r2 = -(1.0 / g_r2);
