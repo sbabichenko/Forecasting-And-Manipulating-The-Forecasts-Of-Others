@@ -280,8 +280,9 @@ like exp(gain T)).  Three layers now handle this:
   (`LQG_R_CONTINUATION=0` disables).
 
 Result at N=40 with the exact-projection filter: 54/512 failures (169 with
-the Pi-based filter, 235 before the stability layers): T=1 fails only at
-r=0.01 (11/64), T=3 fails 30/64 at r=0.01, 13/64 at r=0.05, 0 otherwise.  The
+the Pi-based filter, 235 before the stability layers): every T=1 case solves,
+including r=0.01; T=3 solves all cases with r >= 0.05 and fails 54/64 at
+r=0.01.  The
 exact filter's closed loop is better damped, so the horizon sensitivity is
 much reduced.  A diagnostic line is printed when a cold start fails and
 continuation is tried; the dissertation's cases (T=1, r >= 0.05) are well
