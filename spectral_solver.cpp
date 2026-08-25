@@ -14,6 +14,7 @@
 // Usage: solve_spectral p1 p2 r1 r2 [--N 24] [--L 3] [--tol 1e-12] [--pre 15]
 //        [--relax 0.1] [--jac-ftol 1e-9] [--pre-ftol 1e-6] [--threads t]
 //        [--uniform n] [--eval-only] [--verbose]
+//        [--sweep {p1|p2|r1|r2} lo hi n [--sweep-full]]
 // Prints one JSON object with nodal values (and optionally values on a
 // uniform lag grid of n points per side for comparison with the FD solver).
 
@@ -24,6 +25,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <chrono>
+#include <limits>
 #include <string>
 #include <vector>
 #ifdef _OPENMP
@@ -405,21 +407,36 @@ struct Model {
     }
     // Newton with finite-difference Jacobian and backtracking; damped
     // pre-phase from the CE start for globalization.
-    struct Out { VectorXd z; double resid; int newton_steps; int pre_steps; bool ok; };
+    struct Out { VectorXd z; double resid; int newton_steps; int pre_steps; bool ok; int jacobians; };
     double jac_ftol = 1e-13;   // forward tolerance for Jacobian-column evaluations
     double pre_ftol = 1e-13;   // forward tolerance during the damped pre-phase
+    Eigen::PartialPivLU<MatrixXd> Jlu;   // persistent chord Jacobian (reused across sweep points)
+    bool have_J = false;
+    void set_params(double p1_, double p2_, double r1_, double r2_) {
+        p1 = p1_; p2 = p2_; r1 = r1_; r2 = r2_; g1 = std::sqrt(p1_); g2 = std::sqrt(p2_);
+    }
     Out solve(VectorXd z, double tol, int pre = 40, double relax = 0.1, int maxnewton = 30, bool verbose = false) {
-        Out o; o.pre_steps = pre; o.ok = false;
-        for (int k = 0; k < pre; ++k) {
-            const VectorXd rk = residual(z, true, pre_ftol);
-            z += relax * rk;
+        Out o; o.pre_steps = pre; o.ok = false; o.jacobians = 0;
+        // Damped pre-phase with monitoring: back off when the residual grows,
+        // stop once inside the Newton basin.
+        {
+            double lam = relax, best = std::numeric_limits<double>::infinity();
+            VectorXd zbest = z;
+            for (int k = 0; k < pre; ++k) {
+                const VectorXd rk = residual(z, true, pre_ftol);
+                const double rkn = rk.cwiseAbs().maxCoeff();
+                if (!std::isfinite(rkn) || rkn > 2.0 * best) { z = zbest; lam *= 0.5; if (lam < 1e-3) break; continue; }
+                if (rkn < best) { best = rkn; zbest = z; }
+                if (rkn < 1e-2) break;
+                z += lam * rk;
+            }
+            z = zbest;
         }
         VectorXd r = residual(z, true);
         double rn = r.cwiseAbs().maxCoeff();
+        const double rn0 = rn;
         const int n = static_cast<int>(z.size());
         int step = 0;
-        Eigen::PartialPivLU<MatrixXd> Jlu;
-        bool have_J = false;
         double last_ratio = 0.0;
         for (; step < maxnewton && rn > tol; ++step) {
             // recompute the Jacobian when there is none or the chord step stalled
@@ -432,7 +449,7 @@ struct Model {
                     Jm.col(i) = (residual_const(zp, jac_ftol) - r) / eps;
                 }
                 evals += n;
-                Jlu.compute(Jm); have_J = true;
+                Jlu.compute(Jm); have_J = true; ++o.jacobians; last_ratio = 0.0;
             }
             const VectorXd dz = Jlu.solve(-r);
             double lam = 1.0; bool acc = false;
@@ -447,12 +464,32 @@ struct Model {
             }
             if (verbose) std::fprintf(stderr, "newton %d: |r| %.3e step %.3g%s\n", step, rn, lam, acc ? "" : " (rejected)");
             if (!acc) { if (last_ratio <= 0.3) { last_ratio = 1.0; continue; } break; }
+            if (!std::isfinite(rn) || rn > 1e6 * std::max(rn0, 1.0)) break;   // diverged
         }
         residual(z, true);   // refresh last_* at the solution
         o.z = z; o.resid = rn; o.newton_steps = step; o.ok = rn <= tol;
         return o;
     }
 };
+
+// ------------------------------------------------------------- summary
+
+struct Summary { double dip, dip_lag, hx_fund_0, hx_fund_m2, hx_fund_p2; VectorXd d1_0, d2_0; };
+
+Summary summarize(const Model& M, const MatrixXd& d1, const MatrixXd& d2) {
+    Summary S;
+    // fine grid on the positive panel for the signal-noise minimum
+    const int nf = 20001;
+    VectorXd pts(nf); for (int i = 0; i < nf; ++i) pts[i] = M.L * i / (nf - 1);
+    const VectorXd sig = M.bw.T.pos.interp(pts) * M.last_b1.hx.bottomRows(M.N).col(1);
+    int im = 0; sig.minCoeff(&im);
+    S.dip = sig[im]; S.dip_lag = pts[im];
+    VectorXd q(3); q << 0.0, -2.0, 2.0;
+    const VectorXd f = M.bw.T.interp(q) * M.last_b1.hx.col(0);
+    S.hx_fund_0 = f[0]; S.hx_fund_m2 = f[1]; S.hx_fund_p2 = f[2];
+    S.d1_0 = d1.row(0).transpose(); S.d2_0 = d2.row(0).transpose();
+    return S;
+}
 
 // ---------------------------------------------------------------- json
 
@@ -475,7 +512,8 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     const double p1 = std::atof(argv[1]), p2 = std::atof(argv[2]), r1 = std::atof(argv[3]), r2 = std::atof(argv[4]);
-    int N = 24, uniform = 0, pre = 15; double L = 3.0, tol = 1e-12, relax = 0.1, jac_ftol = 1e-9, pre_ftol = 1e-6; bool verbose = false, eval_only = false;
+    int N = 24, uniform = 0, pre = 15; double L = 3.0, tol = 1e-12, relax = 0.1, jac_ftol = 1e-9, pre_ftol = 1e-6; bool verbose = false, eval_only = false, sweep_full = false;
+    std::string sweep_param; double sweep_lo = 0, sweep_hi = 0; int sweep_n = 0;
     for (int i = 5; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--N") && i + 1 < argc) N = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--L") && i + 1 < argc) L = std::atof(argv[++i]);
@@ -485,6 +523,8 @@ int main(int argc, char* argv[]) {
         else if (!std::strcmp(argv[i], "--uniform") && i + 1 < argc) uniform = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--verbose")) verbose = true;
         else if (!std::strcmp(argv[i], "--eval-only")) eval_only = true;
+        else if (!std::strcmp(argv[i], "--sweep") && i + 4 < argc) { sweep_param = argv[++i]; sweep_lo = std::atof(argv[++i]); sweep_hi = std::atof(argv[++i]); sweep_n = std::atoi(argv[++i]); }
+        else if (!std::strcmp(argv[i], "--sweep-full")) sweep_full = true;
         else if (!std::strcmp(argv[i], "--jac-ftol") && i + 1 < argc) jac_ftol = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "--pre-ftol") && i + 1 < argc) pre_ftol = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "--threads") && i + 1 < argc) { 
@@ -504,6 +544,71 @@ int main(int argc, char* argv[]) {
     Model M(N, L, p1, p2, r1, r2);
     M.jac_ftol = jac_ftol; M.pre_ftol = pre_ftol;
     const auto t1 = std::chrono::steady_clock::now();
+    if (sweep_n > 0) {
+        // Sweep one parameter: warm start from the previous point, reuse the
+        // chord Jacobian until it stalls.  Prints a JSON array of summaries.
+        std::printf("[");
+        const double base = sweep_param == "p1" ? p1 : sweep_param == "p2" ? p2 : sweep_param == "r1" ? r1 : sweep_param == "r2" ? r2 : 0.0;
+        if (base == 0.0) { std::fprintf(stderr, "unknown sweep parameter %s\n", sweep_param.c_str()); return 1; }
+        std::vector<double> vals(sweep_n);
+        for (int k = 0; k < sweep_n; ++k) vals[k] = sweep_n > 1 ? sweep_lo + (sweep_hi - sweep_lo) * k / (sweep_n - 1) : sweep_lo;
+        // visiting order: from the value nearest the base outward, upward then downward
+        int k0 = 0; for (int k = 1; k < sweep_n; ++k) if (std::abs(vals[k] - base) < std::abs(vals[k0] - base)) k0 = k;
+        std::vector<int> order; for (int k = k0; k < sweep_n; ++k) order.push_back(k); for (int k = k0 - 1; k >= 0; --k) order.push_back(k);
+        // solve the base point first so both directions start warm
+        Model::Out ob = M.solve(M.ce_start(), tol, pre, relax, 30, verbose);
+        const VectorXd zbase = ob.z;
+        VectorXd z = zbase;
+        std::vector<std::string> out(sweep_n);
+        struct Kern { MatrixXd x, xt1, xt2, d1, d2, hx1, hx2, w1, w2; };
+        std::vector<Kern> kern(sweep_n);
+        for (size_t idx = 0; idx < order.size(); ++idx) {
+            const int k = order[idx];
+            if (k == k0 - 1) { z = zbase; M.have_J = false; }   // turning downward: restart from the base solution
+            const double val = vals[k];
+            double q1 = p1, q2 = p2, s1 = r1, s2 = r2;
+            if (sweep_param == "p1") q1 = val; else if (sweep_param == "p2") q2 = val;
+            else if (sweep_param == "r1") s1 = val; else s2 = val;
+            M.set_params(q1, q2, s1, s2);
+            const long evals0 = M.evals;
+            const auto ta = std::chrono::steady_clock::now();
+            Model::Out ok = M.solve(z, tol, 0, relax, 30, verbose);
+            if (!ok.ok) { M.have_J = false; ok = M.solve(z, tol, pre, relax, 30, verbose); }          // retry with a pre-phase
+            if (!ok.ok) { M.have_J = false; ok = M.solve(M.ce_start(), tol, pre, relax, 30, verbose); }   // last resort: cold
+            const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - ta).count();
+            if (ok.ok) z = ok.z;
+            MatrixXd d1, d2; M.unpack(ok.z, d1, d2);
+            M.residual(ok.z, true);
+            const Summary S = summarize(M, d1, d2);
+            char buf[4096];
+            std::snprintf(buf, sizeof buf, "{\"%s\":%.15g,\"p1\":%.15g,\"p2\":%.15g,\"r1\":%.15g,\"r2\":%.15g,\"converged\":%s,\"residual\":%.3e,"
+                        "\"evaluations\":%ld,\"newton_steps\":%d,\"jacobians\":%d,\"seconds\":%.6f,"
+                        "\"dip\":%.15g,\"dip_lag\":%.15g,\"hx1_fund_0\":%.15g,\"hx1_fund_m2\":%.15g,\"hx1_fund_p2\":%.15g,"
+                        "\"d1_0\":[%.15g,%.15g,%.15g],\"d2_0\":[%.15g,%.15g,%.15g]",
+                        sweep_param.c_str(), val, q1, q2, s1, s2, ok.ok ? "true" : "false", ok.resid,
+                        M.evals - evals0, ok.newton_steps, ok.jacobians, dt,
+                        S.dip, S.dip_lag, S.hx_fund_0, S.hx_fund_m2, S.hx_fund_p2,
+                        S.d1_0[0], S.d1_0[1], S.d1_0[2], S.d2_0[0], S.d2_0[1], S.d2_0[2]);
+            out[k] = buf;
+            if (sweep_full) kern[k] = Kern{M.last_f.x, M.last_f.xtilde1, M.last_f.xtilde2, d1, d2, M.last_b1.hx, M.last_b2.hx, M.last_b1.wedge, M.last_b2.wedge};
+            if (!sweep_full) out[k] += "}";
+            if (verbose) std::fprintf(stderr, "sweep %s=%.6g: %s |r| %.1e, %ld evals, %d jacobians, %.4f s\n", sweep_param.c_str(), val, ok.ok ? "ok" : "FAIL", ok.resid, M.evals - evals0, ok.jacobians, dt);
+        }
+        for (int k = 0; k < sweep_n; ++k) {
+            std::printf("%s%s", k ? "," : "", out[k].c_str());
+            if (sweep_full) {
+                std::printf(",");
+                print_vec("lag", M.fw.K.x); print_vec("b_lag", M.bw.T.l);
+                print_kernel("x", kern[k].x); print_kernel("xtilde1", kern[k].xt1); print_kernel("xtilde2", kern[k].xt2);
+                print_kernel("d1", kern[k].d1); print_kernel("d2", kern[k].d2);
+                print_kernel("hx1", kern[k].hx1); print_kernel("hx2", kern[k].hx2);
+                print_kernel("wedge1", kern[k].w1); print_kernel("wedge2", kern[k].w2, true);
+                std::printf("}");
+            }
+        }
+        std::printf("]\n");
+        return 0;
+    }
     Model::Out o;
     if (eval_only) {   // one residual evaluation at the CE start, for cross-checking
         o.z = M.ce_start(); const VectorXd r = M.residual(o.z, true);
@@ -515,9 +620,6 @@ int main(int argc, char* argv[]) {
     const auto t2 = std::chrono::steady_clock::now();
     const double t_setup = std::chrono::duration<double>(t1 - t0).count();
     const double t_solve = std::chrono::duration<double>(t2 - t1).count();
-    if (verbose) std::fprintf(stderr, "setup %.4f s, solve %.4f s, %ld evaluations, %d newton steps, |r| %.2e | forward %.4f s (%.1f its/eval), backward %.4f s\n",
-                              t_setup, t_solve, M.evals, o.newton_steps, o.resid, M.t_fwd, double(M.fwd_iters) / std::max(1L, M.evals), M.t_bwd);
-
     MatrixXd d1, d2; M.unpack(o.z, d1, d2);
     std::printf("{\"converged\":%s,\"residual\":%.6e,\"N\":%d,\"L\":%.15g,\"p1\":%.15g,\"p2\":%.15g,\"r1\":%.15g,\"r2\":%.15g,"
                 "\"evaluations\":%ld,\"newton_steps\":%d,\"setup_seconds\":%.6f,\"solve_seconds\":%.6f,",
