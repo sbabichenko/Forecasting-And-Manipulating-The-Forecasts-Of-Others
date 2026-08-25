@@ -417,6 +417,13 @@ static void compute_ce_filter_and_calD(
 // basis V of the observation space grows by one column per row (Gram-Schmidt
 // on h_j = g dt X[j][.] + e_obs at z = j), then Xtilde[j] = (I - V V^T) X[j] and
 // calD[j] = V V^T D[j].  Same arithmetic as compute_ce_filter_and_calD.
+// Controls are predictable (default): the control over step j is the projection of D[j] onto the
+// observations up to j-1, as for an Euler-Maruyama discretization of an adapted control.  With the
+// step-j observation included (LQG_PREDICTABLE=0, the former game) the control could react to the
+// same-step increments, a one-step anticipation that acts as a cheap noise-injection channel at
+// small effort cost.  Under predictability the diagonal coordinate D(j,j) is inert in every channel.
+static bool predictable_control() { static const bool v = [] { const char* e = std::getenv("LQG_PREDICTABLE"); return !(e && std::atoi(e) == 0); }(); return v; }
+static void enforce_predictable(Kernel2D& D1, Kernel2D& D2) { if (!predictable_control()) return; for (int t = 0; t < g_n; ++t) { D1[t][t].setZero(); D2[t][t].setZero(); } }
 struct CERowFilter {
     int n = 0, rank = 0, obs = 0; double g = 0.0;
     Eigen::MatrixXd V; Eigen::VectorXd h, v, coeff, Xvec, Dvec;
@@ -430,6 +437,15 @@ struct CERowFilter {
         if (j == 0) { Xtilde[0][0] = X[0][0]; calD[0][0].setZero(); return; }
         const int active = 3 * (j + 1);
         auto Vact = V.topRows(active).leftCols(rank);
+        if (predictable_control()) {
+            // Predictable control: the control over step j is decided before the step-j observation,
+            // so it is the projection of D[j] onto the observations up to j-1 (basis V before h_j is
+            // added).  Row j of D at u = j is then inert (E[dW_j | F_{j-1}] = 0).
+            for (int z = 0; z <= j; ++z) Dvec.segment<3>(3 * z) = D[j][z];
+            if (rank > 0) { auto c = coeff.head(rank); c.noalias() = Vact.transpose() * Dvec.head(active); Dvec.head(active).noalias() = Vact * c; } else Dvec.head(active).setZero();
+            for (int z = 0; z <= j; ++z) calD[j][z] = Dvec.segment<3>(3 * z);
+            calD[j][0](obs) = 0.0;
+        }
         h.head(active).setZero();
         for (int z = 0; z <= j; ++z) h.segment<3>(3 * z) = g * g_dt * X[j][z];
         h(3 * j + obs) += 1.0;
@@ -441,10 +457,12 @@ struct CERowFilter {
         for (int z = 0; z <= j; ++z) Xvec.segment<3>(3 * z) = X[j][z];
         if (rank > 0) { c.noalias() = Vr.transpose() * Xvec.head(active); Xvec.head(active).noalias() -= Vr * c; }
         for (int z = 0; z <= j; ++z) Xtilde[j][z] = Xvec.segment<3>(3 * z);
-        for (int z = 0; z <= j; ++z) Dvec.segment<3>(3 * z) = D[j][z];
-        if (rank > 0) { c.noalias() = Vr.transpose() * Dvec.head(active); Dvec.head(active).noalias() = Vr * c; } else Dvec.head(active).setZero();
-        for (int z = 0; z <= j; ++z) calD[j][z] = Dvec.segment<3>(3 * z);
-        calD[j][0](obs) = 0.0;
+        if (!predictable_control()) {
+            for (int z = 0; z <= j; ++z) Dvec.segment<3>(3 * z) = D[j][z];
+            if (rank > 0) { c.noalias() = Vr.transpose() * Dvec.head(active); Dvec.head(active).noalias() = Vr * c; } else Dvec.head(active).setZero();
+            for (int z = 0; z <= j; ++z) calD[j][z] = Dvec.segment<3>(3 * z);
+            calD[j][0](obs) = 0.0;
+        }
     }
 };
 static bool ce_filter_enabled() { static const bool v = [] { const char* e = std::getenv("LQG_FILTER"); return !(e && std::strcmp(e, "pi") == 0); }(); return v; }
@@ -1295,6 +1313,7 @@ static EquilibriumResult solve_equilibrium_core(
     BackwardPlayer bp1, bp2;
     double best_err = std::numeric_limits<double>::infinity(); int since_best = 0;   // stagnation guard
     int nonfinite_recoveries = 0;
+    enforce_predictable(D1, D2);
     static const bool newton_enabled_flag = [] { const char* e = std::getenv("LQG_NEWTON"); return !(e && std::atoi(e) == 0); }();
     static const int newton_after = [] { const char* e = std::getenv("LQG_NEWTON_AFTER"); return e ? std::atoi(e) : 40; }();   // switch to the Newton-Krylov engine after this many outer iterations (0 = never)
     constexpr int ANDERSON_STALL = 8;
@@ -1307,6 +1326,7 @@ static EquilibriumResult solve_equilibrium_core(
             bp1.Xt = &env.Xtilde2; bp1.Dk = &D2; bp1.prec = &prec2; bp1.gain = p2_val; bp1.obs = obs_idx_2; bp1.Hx = &Hx1;
             bp2.Xt = &env.Xtilde1; bp2.Dk = &D1; bp2.prec = &prec1; bp2.gain = p1_val; bp2.obs = obs_idx_1; bp2.Hx = &Hx2;
             backward_kernels_pair(env.X, bp1, bp2, g_terminal_weight);
+            if (predictable_control()) for (int t = 0; t < g_n; ++t) { Hx1[t][t].setZero(); Hx2[t][t].setZero(); }   // inert coordinate
         } else {
         #pragma omp parallel sections num_threads(2)
         {
@@ -1370,7 +1390,7 @@ static EquilibriumResult solve_equilibrium_core(
             } else {
                 pack_kernels(D1, D2, TRI, xa);
                 prev_err = err; have_prev = true; anderson.first_step = relax;
-                if (anderson.step(xa, fa)) { unpack_kernels(xa, TRI, D1, D2); anderson_active = true; continue; }
+                if (anderson.step(xa, fa)) { unpack_kernels(xa, TRI, D1, D2); enforce_predictable(D1, D2); anderson_active = true; continue; }
             }
         }
 
@@ -1381,6 +1401,7 @@ static EquilibriumResult solve_equilibrium_core(
 
         apply_picard_update(D1, D2, Hx1, Hx2, TRI,
                             neg_inv_r1, neg_inv_r2, relax);
+        enforce_predictable(D1, D2);
     }
 
     // ---- Newton-Krylov fallback ----
@@ -1406,6 +1427,7 @@ static EquilibriumResult solve_equilibrium_core(
             bp1.Xt = &env.Xtilde2; bp1.Dk = &Dn2; bp1.prec = &prec2; bp1.gain = p2_val; bp1.obs = obs_idx_2; bp1.Hx = &Hx1;
             bp2.Xt = &env.Xtilde1; bp2.Dk = &Dn1; bp2.prec = &prec1; bp2.gain = p1_val; bp2.obs = obs_idx_1; bp2.Hx = &Hx2;
             backward_kernels_pair(env.X, bp1, bp2, g_terminal_weight);
+            if (predictable_control()) for (int t = 0; t < g_n; ++t) { Hx1[t][t].setZero(); Hx2[t][t].setZero(); }
             return best_response_residual(Dn1, Dn2, Hx1, Hx2, TRI, neg_inv_r1, neg_inv_r2, &Fv);
         };
         double res = evalF(x, F);
@@ -1454,6 +1476,7 @@ static EquilibriumResult solve_equilibrium_core(
             }
             if (!(std::isfinite(res_new) && res_new < res)) { if (verbose) std::cout << "  Newton: no descent; stopping" << std::endl; break; }
             x = xt; F = Ft; res = res_new; residuals.push_back(res);
+            if (predictable_control()) { unpack_kernels(x, TRI, Dn1, Dn2); enforce_predictable(Dn1, Dn2); pack_kernels(Dn1, Dn2, TRI, x); }
             if (verbose) std::cout << "  Newton it=" << nit + 1 << " gmres " << k << (gm_ok ? "" : " (not converged)") << " step " << step << " resid " << res << std::endl;
             if (step < 1e-3) { if (verbose) std::cout << "  Newton: line search collapsed; stopping" << std::endl; break; }
         }

@@ -259,6 +259,21 @@ estimates respond to the player's own observation noise at lag 0 with weight
 the causal filter against a projection built at the final time, i.e. a
 smoother; it is not a discrepancy of the march.
 
+**Predictable control** (2026-08-25).  The control over step j is the projection
+of D[j] onto the observations up to j-1 (`CERowFilter`), as for an
+Euler-Maruyama discretization of an adapted control; the diagonal coordinate
+D(j,j) is inert in every channel and its adjoint entry is zeroed.  The former
+game (`LQG_PREDICTABLE=0`) projected onto the observations up to j, so the
+control could react to the same-step increments -- a one-step anticipation.
+Same Richardson limit on the benchmark (J1 4.0967 vs 4.0968), stationarity
+ratios improve (interior 0.01-0.07, band 0.12), and the mid-horizon agreement
+with the Chapter 3 stationary solver at (3,3), r=0.3, T=5 becomes: state
+kernel within 1% at every lag, |d1| within 3-7%, own-noise error component
+-0.83 vs -0.84.  Two other readings of "predictable" were tried and rejected:
+zeroing the own-noise entry of calD(j,j) after the projection (changes the
+forward map without its adjoint) and zeroing D(j,j)[own] only (removes a
+legitimate density coordinate; wrong equilibrium).
+
 **Stationarity check** (`test_stationarity N p1 p2 r`): finite differences of the
 discrete cost with respect to single entries of player 1's kernel, with player
 2's strategy, both mean controls and player 1's own projection frozen (the
