@@ -239,6 +239,26 @@ array-of-structs lockstep pass (N=160 54 vs 55 ms, N=640 1.83 vs 1.86 s):
 the pass is bound by streaming the later levels' rows, not by the 3x3
 arithmetic, and the moment sums cost the same as nine separate dots.
 
+**Filter** (2026-08-25).  The production filter is now the exact discrete
+conditional expectation: at each row j the orthonormal basis of the player's
+observation space grows by one column (Gram-Schmidt on h_j = g dt X[j][.] +
+e_obs), and Xtilde[j] = (I - V V^T) X[j], calD[j] = V V^T D[j], all inside the
+causal march (`CERowFilter`; same O(N^3) cost).  The former closed-form
+"Pi-based" filter (`LQG_FILTER=pi`) started from Xtilde = (I - Pi) X, i.e. it
+removed the estimation error's component along the player's own observation
+noise outright -- as if the noise path itself were observed -- which is not
+Cov(X_t, dW_u | F^i_t)/du as the chapter defines it.  Evidence: at (3,3),
+r=0.3, T=5 the mid-horizon kernels of the exact-projection march agree with
+the Chapter 3 stationary solver to ~2% at every lag (|d1|: 2.61 vs 2.56 at
+lag 0, 0.70 vs 0.71 at lag 1, 0.098 vs 0.097 at lag 2; state-kernel tail 0.070
+vs 0.073), while the Pi-based filter gave 3.60 / 2.07 / 0.78 and a state tail
+of 0.345 -- a different, less damped closed loop.  On the chapter benchmark
+(T=1, (3,3), r=0.1) J1 extrapolates to 4.097 (was 4.177) and the posterior
+estimates respond to the player's own observation noise at lag 0 with weight
+~ -0.65 (was exactly 0).  `test_exact_ce`'s remaining "gap" (0.30) compares
+the causal filter against a projection built at the final time, i.e. a
+smoother; it is not a discrepancy of the march.
+
 **Robustness** (stress grid: T in {1, 3}, r in {0.01, 0.05, 0.1, 0.5}, p in
 {0.1, 1, 10, 50}^2, sigma in {0.5, 1}, terminal weight in {0, 1}; 512 cases).
 For small effort cost r the best-response map -(1/r) Hx is far from a
@@ -259,11 +279,13 @@ like exp(gain T)).  Three layers now handle this:
   starts, ratio 0.7 per stage, bisecting a failed stage in log r
   (`LQG_R_CONTINUATION=0` disables).
 
-Result at N=40: T=1 with r >= 0.05 solves all 64 cases each (r=0.05 failed 9
-before); r=0.01 at T=1 still fails 21/64, and T=3 with r <= 0.1 mostly fails
--- those are outside the usable region (a diagnostic line is printed when a
-cold start fails and continuation is tried), and the dissertation's cases
-(T=1, r >= 0.05) are well inside it.  The benchmark and the whole figure sweep are
+Result at N=40 with the exact-projection filter: 54/512 failures (169 with
+the Pi-based filter, 235 before the stability layers): T=1 fails only at
+r=0.01 (11/64), T=3 fails 30/64 at r=0.01, 13/64 at r=0.05, 0 otherwise.  The
+exact filter's closed loop is better damped, so the horizon sensitivity is
+much reduced.  A diagnostic line is printed when a cold start fails and
+continuation is tried; the dissertation's cases (T=1, r >= 0.05) are well
+inside the usable region.  The benchmark and the whole figure sweep are
 unchanged by these layers (they converge before any of them engages).
 
 **Memory**: a single solve peaks at 15 MB (N=160), 60 MB (N=320), 173 MB

@@ -183,6 +183,8 @@ struct EnvironmentResult {
     Kernel2D Xtilde1, Xtilde2;
     // The rank-1 filter factor A[k][s] = dt * gain^2 * Xtilde[k][s] (s < k), A[k][k] = 0,
     // is not stored; it is formed from Xtilde where F is materialized.
+    // Primitive control kernels produced by the exact-projection march (calD = M D); valid when has_calD.
+    Kernel2D calD1, calD2; bool has_calD = false;
     // Observation parameters (needed for F materialization)
     double obs_gain1, obs_gain2;
     int obs_idx1, obs_idx2;

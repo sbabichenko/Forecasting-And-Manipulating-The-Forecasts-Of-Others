@@ -100,7 +100,7 @@ void state_kernel_from_calD(const Kernel2D& calD1, const Kernel2D& calD2,
 // the rows can be produced in a single causal march (forward_environment).
 static void filter_row(int j,
     const Kernel2D& X, const Mat3& Pi, int obs_index,
-    double obs_gain_val, Kernel2D& Xtilde) {
+    double obs_gain_val, Kernel2D& Xtilde, double* scale_out = nullptr) {
 
     const Mat3 I_minus_Pi = Mat3::Identity() - Pi;
     const double g = obs_gain_val;
@@ -109,6 +109,7 @@ static void filter_row(int j,
 
     if (j == 0) {
         Xtilde[0][0] = I_minus_Pi * X[0][0];
+        if (scale_out) *scale_out = 1.0;
         return;
     }
     using FlatC = Eigen::Map<const Eigen::VectorXd>;
@@ -138,6 +139,7 @@ static void filter_row(int j,
     const double sigma_minus = g_dt * FlatC(Xtilde[j][0].data(), 3 * j).squaredNorm();
     const double scale = 1.0 / (1.0 + g_dt * prec * sigma_minus);
     Flat(Xtilde[j][0].data(), 3 * (j + 1)) *= scale;
+    if (scale_out) *scale_out = scale;
 
 }
 
@@ -249,7 +251,7 @@ static void compute_filter_kernels(
 // filter kernels.
 static void control_row(int j,
     const Kernel2D& D, const Kernel2D& Xtilde,
-    double obs_gain_val, int obs_index, const Mat3& Pi, Kernel2D& calD) {
+    double obs_gain_val, int obs_index, const Mat3& Pi, Kernel2D& calD, double* beta_out = nullptr) {
 
     Vec3 e_i = Vec3::Zero();
     e_i(obs_index) = 1.0;
@@ -260,6 +262,7 @@ static void control_row(int j,
         // No observation increment has arrived at the initial grid point,
         // so there is no primitive-shock feedback on the first point.
         calD[0][0].setZero();
+        if (beta_out) *beta_out = 0.0;
         return;
     }
     using FlatC = Eigen::Map<const Eigen::VectorXd>;
@@ -281,6 +284,7 @@ static void control_row(int j,
         const double beta = DT_g * D[j][k](obs_index) + g_dt * partial_d_k[k] * dt_prec;
         const int len = 3 * std::min(k, j);
         qf.head(len) += beta * FlatC(Xtilde[k][0].data(), len);
+        if (k == j && beta_out) *beta_out = beta;      // same-time coefficient: calD[j][s] contains beta_j Xtilde[j][s]
     }
     for (int s = 0; s < j; ++s)
         calD[j][s] = Pi * D[j][s] + q[s] + DT_g * partial_d_k[s] * e_i;   // last term: border_lt
@@ -409,6 +413,42 @@ static void compute_ce_filter_and_calD(
     }
 }
 
+// Per-row form of the exact projection, for the causal march: the orthonormal
+// basis V of the observation space grows by one column per row (Gram-Schmidt
+// on h_j = g dt X[j][.] + e_obs at z = j), then Xtilde[j] = (I - V V^T) X[j] and
+// calD[j] = V V^T D[j].  Same arithmetic as compute_ce_filter_and_calD.
+struct CERowFilter {
+    int n = 0, rank = 0, obs = 0; double g = 0.0;
+    Eigen::MatrixXd V; Eigen::VectorXd h, v, coeff, Xvec, Dvec;
+    void reset(int n_, int obs_, double g_) {
+        n = n_; obs = obs_; g = g_; rank = 0;
+        const int dim = 3 * n;
+        if (V.rows() != dim || V.cols() != n) { V.resize(dim, n); h.resize(dim); v.resize(dim); Xvec.resize(dim); Dvec.resize(dim); coeff.resize(n); }
+        V.setZero(); h.setZero(); v.setZero(); Xvec.setZero(); Dvec.setZero();
+    }
+    void row(int j, const Kernel2D& X, const Kernel2D& D, Kernel2D& Xtilde, Kernel2D& calD) {
+        if (j == 0) { Xtilde[0][0] = X[0][0]; calD[0][0].setZero(); return; }
+        const int active = 3 * (j + 1);
+        auto Vact = V.topRows(active).leftCols(rank);
+        h.head(active).setZero();
+        for (int z = 0; z <= j; ++z) h.segment<3>(3 * z) = g * g_dt * X[j][z];
+        h(3 * j + obs) += 1.0;
+        v.head(active) = h.head(active);
+        if (rank > 0) { auto c = coeff.head(rank); c.noalias() = Vact.transpose() * h.head(active); v.head(active).noalias() -= Vact * c; }
+        const double vnorm = v.head(active).norm();
+        if (vnorm > 1e-15) { V.col(rank).head(active) = v.head(active) / vnorm; ++rank; }
+        auto Vr = V.topRows(active).leftCols(rank); auto c = coeff.head(rank);
+        for (int z = 0; z <= j; ++z) Xvec.segment<3>(3 * z) = X[j][z];
+        if (rank > 0) { c.noalias() = Vr.transpose() * Xvec.head(active); Xvec.head(active).noalias() -= Vr * c; }
+        for (int z = 0; z <= j; ++z) Xtilde[j][z] = Xvec.segment<3>(3 * z);
+        for (int z = 0; z <= j; ++z) Dvec.segment<3>(3 * z) = D[j][z];
+        if (rank > 0) { c.noalias() = Vr.transpose() * Dvec.head(active); Dvec.head(active).noalias() = Vr * c; } else Dvec.head(active).setZero();
+        for (int z = 0; z <= j; ++z) calD[j][z] = Dvec.segment<3>(3 * z);
+        calD[j][0](obs) = 0.0;
+    }
+};
+static bool ce_filter_enabled() { static const bool v = [] { const char* e = std::getenv("LQG_FILTER"); return !(e && std::strcmp(e, "pi") == 0); }(); return v; }
+
 // Forward environment using discrete CE projection.
 // Replaces compute_filter_kernels + primitive_control_kernel with
 // the exact discrete conditional expectation at each time step.
@@ -488,6 +528,41 @@ void forward_environment(
     EnvironmentResult& env) {
 
     static const int relaxed_sweeps = [] { const char* e = std::getenv("LQG_FORWARD_RELAXED"); return e ? std::atoi(e) : 0; }();
+    if (ce_filter_enabled()) {
+        // Exact causal march with the exact projection filter (the production filter):
+        // row j of X from the primitive controls at earlier rows; row j of each player's
+        // filter and controls from the projection onto its observations up to j.
+        Kernel2D& X = env.X; X.resize(); X.setZero();
+        env.calD1.resize(); env.calD2.resize(); env.calD1.setZero(); env.calD2.setZero(); env.has_calD = true;
+        Kernel2D& calD1 = env.calD1; Kernel2D& calD2 = env.calD2;
+        const Vec3 sigE0 = g_sigma * E0();
+        // thread-local so that concurrent solves (the figure driver's parallel pre-solve) do not
+        // share buffers; inside the two-thread region below the second thread must use the
+        // calling thread's objects, hence the shared pointers
+        static thread_local CERowFilter F1, F2;
+        F1.reset(g_n, obs_idx_1, obs_gain1); F2.reset(g_n, obs_idx_2, obs_gain2);
+        CERowFilter* pF1 = &F1; CERowFilter* pF2 = &F2;
+        #pragma omp parallel num_threads(2) if (g_n >= 64 && !omp_in_parallel())
+        {
+            const int tid = omp_get_thread_num(), nth = omp_get_num_threads();
+            for (int j = 0; j < g_n; ++j) {
+                #pragma omp single
+                {
+                    X[j][j] = sigE0;
+                    for (int s = 0; s < j; ++s)
+                        X[j][s] = X[j - 1][s] + g_dt * (calD1[j - 1][s] + calD2[j - 1][s]);
+                }   // implicit barrier
+                if (tid == 0) pF1->row(j, X, D1, env.Xtilde1, calD1);
+                if (tid == nth - 1) pF2->row(j, X, D2, env.Xtilde2, calD2);
+                #pragma omp barrier
+            }
+        }
+        (void)Pi_1; (void)Pi_2; (void)inner_iters;
+        env.obs_gain1 = obs_gain1; env.obs_gain2 = obs_gain2;
+        env.obs_idx1 = obs_idx_1; env.obs_idx2 = obs_idx_2;
+        return;
+    }
+    env.has_calD = false;
     if (relaxed_sweeps <= 0) {
         // Exact causal march.  Row j of the state kernel depends on the primitive
         // controls at earlier times only, row j of the filter kernels on row j of X
@@ -498,7 +573,8 @@ void forward_environment(
         X.resize(); X.setZero(); calD1.setZero(); calD2.setZero();
         const Vec3 sigE0 = g_sigma * E0();
         static const bool ws_march = [] { const char* e = std::getenv("LQG_FORWARD_PAIR"); return !(e && std::atoi(e)); }();
-        if (ws_march && g_n >= 400 && !omp_in_parallel() && omp_get_max_threads() > 2) {   // per-row barriers only pay off for large N
+        static const bool implicit_req = [] { const char* e = std::getenv("LQG_FORWARD_IMPLICIT"); return e && std::atoi(e); }();
+        if (ws_march && !implicit_req && g_n >= 400 && !omp_in_parallel() && omp_get_max_threads() > 2) {   // per-row barriers only pay off for large N
             // Worksharing march: all threads work on the same row j of both players.
             static RowScratch sc1, sc2;     // shared scratch per player (one march at a time at top level)
             #pragma omp parallel
@@ -523,6 +599,9 @@ void forward_environment(
         // One two-thread region for the whole march (a region per row would be
         // spawned thousands of times inside the parallel pre-solve); the two
         // players' rows are independent given row j of X.
+        static const bool implicit_march = [] { const char* e = std::getenv("LQG_FORWARD_IMPLICIT"); return e && std::atoi(e); }();
+        static const int implicit_iters = [] { const char* e = std::getenv("LQG_FORWARD_IMPLICIT"); return e ? std::max(1, std::atoi(e)) : 1; }();   // corrector passes
+        double sc_scale[2] = {1.0, 1.0}, sc_beta[2] = {0.0, 0.0};
         #pragma omp parallel num_threads(2) if (g_n >= 64 && !omp_in_parallel())
         {
             const int tid = omp_get_thread_num(), nth = omp_get_num_threads();
@@ -534,14 +613,38 @@ void forward_environment(
                         X[j][s] = X[j - 1][s] + g_dt * (calD1[j - 1][s] + calD2[j - 1][s]);
                 }   // implicit barrier
                 if (tid == 0) {
-                    filter_row(j, X, Pi_1, obs_idx_1, obs_gain1, env.Xtilde1);
-                    control_row(j, D1, env.Xtilde1, obs_gain1, obs_idx_1, Pi_1, calD1);
+                    filter_row(j, X, Pi_1, obs_idx_1, obs_gain1, env.Xtilde1, &sc_scale[0]);
+                    control_row(j, D1, env.Xtilde1, obs_gain1, obs_idx_1, Pi_1, calD1, &sc_beta[0]);
                 }
                 if (tid == nth - 1) {
-                    filter_row(j, X, Pi_2, obs_idx_2, obs_gain2, env.Xtilde2);
-                    control_row(j, D2, env.Xtilde2, obs_gain2, obs_idx_2, Pi_2, calD2);
+                    filter_row(j, X, Pi_2, obs_idx_2, obs_gain2, env.Xtilde2, &sc_scale[1]);
+                    control_row(j, D2, env.Xtilde2, obs_gain2, obs_idx_2, Pi_2, calD2, &sc_beta[1]);
                 }
                 #pragma omp barrier
+                for (int corr = 0; corr < implicit_iters && implicit_march && j > 0; ++corr) {
+                    // Semi-implicit step: the same-time part of calD[j][s] is beta_j Xtilde[j][s] with
+                    // Xtilde[j][s] ~ scale_j (I - Pi) X[j][s]; take that part implicitly (3x3 solve per s,
+                    // both players summed), the cross-s corrections explicitly from the predictor, then
+                    // re-evaluate the row at the corrected X[j].
+                    #pragma omp single
+                    {
+                        const Mat3 A = g_dt * (sc_beta[0] * sc_scale[0] * (Mat3::Identity() - Pi_1) + sc_beta[1] * sc_scale[1] * (Mat3::Identity() - Pi_2));
+                        const Mat3 Minv = (Mat3::Identity() - A).inverse();
+                        for (int s = 0; s < j; ++s) {
+                            const Vec3 rhs = X[j - 1][s] + g_dt * (calD1[j][s] + calD2[j][s]) - A * X[j][s];
+                            X[j][s] = Minv * rhs;
+                        }
+                    }   // implicit barrier
+                    if (tid == 0) {
+                        filter_row(j, X, Pi_1, obs_idx_1, obs_gain1, env.Xtilde1, &sc_scale[0]);
+                        control_row(j, D1, env.Xtilde1, obs_gain1, obs_idx_1, Pi_1, calD1, &sc_beta[0]);
+                    }
+                    if (tid == nth - 1) {
+                        filter_row(j, X, Pi_2, obs_idx_2, obs_gain2, env.Xtilde2, &sc_scale[1]);
+                        control_row(j, D2, env.Xtilde2, obs_gain2, obs_idx_2, Pi_2, calD2, &sc_beta[1]);
+                    }
+                    #pragma omp barrier
+                }
             }
         }
         env.X = X;
@@ -1343,14 +1446,17 @@ static EquilibriumResult solve_equilibrium_core(
                         Pi_1, obs_idx_1, Pi_2, obs_idx_2, env);
 
     Kernel2D calD1, calD2;
-    #pragma omp parallel sections
-    {
-        #pragma omp section
-        primitive_control_kernel(D1, env.Xtilde1,
-                                 p1_val, obs_idx_1, Pi_1, calD1);
-        #pragma omp section
-        primitive_control_kernel(D2, env.Xtilde2,
-                                 p2_val, obs_idx_2, Pi_2, calD2);
+    if (env.has_calD) { calD1 = env.calD1; calD2 = env.calD2; }
+    else {
+        #pragma omp parallel sections
+        {
+            #pragma omp section
+            primitive_control_kernel(D1, env.Xtilde1,
+                                     p1_val, obs_idx_1, Pi_1, calD1);
+            #pragma omp section
+            primitive_control_kernel(D2, env.Xtilde2,
+                                     p2_val, obs_idx_2, Pi_2, calD2);
+        }
     }
 
     return {D1, D2, std::move(env), std::move(calD1), std::move(calD2), residuals};
@@ -1419,85 +1525,9 @@ EquilibriumResult solve_equilibrium_ce(
     double p1_val, double p2_val, bool verbose,
     const Mat3& Pi_1, int obs_idx_1,
     const Mat3& Pi_2, int obs_idx_2) {
-
-    Kernel2D D1, D2;
-    D1.setZero();
-    D2.setZero();
-
-    std::vector<double> residuals;
-    auto prec1 = make_constant_prec(p1_val * p1_val);
-    auto prec2 = make_constant_prec(p2_val * p2_val);
-    EnvironmentResult env;
-
-    const int TRI = g_n * (g_n + 1) / 2;
-
-    // Hx buffers hoisted out of loop (avoids 309KB alloc per iteration at N=160)
-    Kernel2D Hx1, Hx2;
-    Kernel2D prev_D1, prev_D2;
-    double prev_err = std::numeric_limits<double>::infinity();
-    double relax = PICARD_RELAX;
-    bool have_prev = false;
-
-    for (int it = 1; it <= MAX_PICARD_ITERS; ++it) {
-        // Forward pass using discrete CE
-        forward_environment_ce(D1, D2, p1_val, p2_val, FORWARD_INNER_ITERS,
-                               Pi_1, obs_idx_1, Pi_2, obs_idx_2, env);
-
-        // Backward pass (uses Xtilde, same as standard solver)
-        #pragma omp parallel sections
-        {
-            #pragma omp section
-            backward_kernels(env.X, env.Xtilde2, D2, prec2,
-                             p2_val, obs_idx_2, g_terminal_weight, Hx1);
-            #pragma omp section
-            backward_kernels(env.X, env.Xtilde1, D1, prec1,
-                             p1_val, obs_idx_1, g_terminal_weight, Hx2);
-        }
-
-        // Residual and relaxed Picard update.
-        const double neg_inv_r1 = -(1.0 / g_r1);
-        const double neg_inv_r2 = -(1.0 / g_r2);
-        double err = best_response_residual(D1, D2, Hx1, Hx2, TRI,
-                                            neg_inv_r1, neg_inv_r2);
-        residuals.push_back(err);
-        if (!std::isfinite(err)) break;
-
-        if (verbose && (it <= 5 || it % 50 == 0))
-            std::cout << "  [CE] it=" << it << "  resid=" << err
-                      << "  relax=" << relax << std::endl;
-        if (err < PICARD_TOL) {
-            if (verbose)
-                std::cout << "  [CE] Converged at iteration " << it << std::endl;
-            break;
-        }
-        if (it == MAX_PICARD_ITERS)
-            break;
-
-        if (!adapt_picard_damping(err, prev_err, relax, D1, D2,
-                                  prev_D1, prev_D2, have_prev,
-                                  verbose, "[CE] "))
-            continue;
-
-        apply_picard_update(D1, D2, Hx1, Hx2, TRI,
-                            neg_inv_r1, neg_inv_r2, relax);
-    }
-
-    // Ensure the returned environment matches the final Picard iterate, including
-    // the non-converged case where the loop exits immediately after an update.
-    forward_environment_ce(D1, D2, p1_val, p2_val, FORWARD_INNER_ITERS,
-                           Pi_1, obs_idx_1, Pi_2, obs_idx_2, env);
-
-    // After convergence: final calD via CE projection, both players in parallel.
-    Kernel2D calD1, calD2;
-    #pragma omp parallel sections
-    {
-        #pragma omp section
-        compute_ce_filter_and_calD(env.X, D1, obs_idx_1, p1_val, env.Xtilde1, calD1);
-        #pragma omp section
-        compute_ce_filter_and_calD(env.X, D2, obs_idx_2, p2_val, env.Xtilde2, calD2);
-    }
-
-    return {D1, D2, std::move(env), std::move(calD1), std::move(calD2), residuals};
+    // The exact projection is the production filter (LQG_FILTER=pi selects the former
+    // Pi-based closed-form filter); this entry point is kept for API compatibility.
+    return solve_equilibrium(p1_val, p2_val, verbose, Pi_1, obs_idx_1, Pi_2, obs_idx_2);
 }
 
 // --- compute_costs_general ---
