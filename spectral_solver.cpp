@@ -11,12 +11,14 @@
 // system, and the outer equilibrium is Newton with a finite-difference
 // Jacobian and a backtracking line search.
 //
-// Usage: solve_spectral p1 p2 r1 r2 [--N 24] [--L 3] [--tol 1e-12]
-//        [--uniform n] [--verbose]
+// Usage: solve_spectral p1 p2 r1 r2 [--N 24] [--L 3] [--tol 1e-12] [--pre 15]
+//        [--relax 0.1] [--jac-ftol 1e-9] [--pre-ftol 1e-6] [--threads t]
+//        [--uniform n] [--eval-only] [--verbose]
 // Prints one JSON object with nodal values (and optionally values on a
 // uniform lag grid of n points per side for comparison with the FD solver).
 
 #include <Eigen/Dense>
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -24,6 +26,9 @@
 #include <chrono>
 #include <string>
 #include <vector>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 using Eigen::MatrixXd;
 using Eigen::VectorXd;
@@ -365,6 +370,14 @@ struct Model {
         if (keep) { last_f = f; last_b1 = b1; last_b2 = b2; }
         return pack(b1.policy, b2.policy) - z;
     }
+    // Thread-safe evaluation: no warm-start update, no counters.
+    VectorXd residual_const(const VectorXd& z, double ftol) const {
+        MatrixXd d1, d2; unpack(z, d1, d2);
+        Forward::Result f = fw.solve(d1, d2, g1, g2, have_warm ? &x_warm : nullptr, ftol);
+        Backward::Result b1 = bw.solve(f.x, f.xtilde2, d2, g2, 2, p2, r1);
+        Backward::Result b2 = bw.solve(f.x, f.xtilde1, d1, g1, 1, p1, r2);
+        return pack(b1.policy, b2.policy) - z;
+    }
     VectorXd ce_start() const {
         const double inv = 1.0 / r1 + 1.0 / r2, S = std::sqrt(1.0 / inv), Kc = inv * S;
         MatrixXd d1 = MatrixXd::Zero(N, 3), d2 = MatrixXd::Zero(N, 3);
@@ -378,9 +391,13 @@ struct Model {
     // pre-phase from the CE start for globalization.
     struct Out { VectorXd z; double resid; int newton_steps; int pre_steps; bool ok; };
     double jac_ftol = 1e-13;   // forward tolerance for Jacobian-column evaluations
+    double pre_ftol = 1e-13;   // forward tolerance during the damped pre-phase
     Out solve(VectorXd z, double tol, int pre = 40, double relax = 0.1, int maxnewton = 30, bool verbose = false) {
         Out o; o.pre_steps = pre; o.ok = false;
-        for (int k = 0; k < pre; ++k) z += relax * residual(z, true);
+        for (int k = 0; k < pre; ++k) {
+            const VectorXd rk = residual(z, true, pre_ftol);
+            z += relax * rk;
+        }
         VectorXd r = residual(z, true);
         double rn = r.cwiseAbs().maxCoeff();
         const int n = static_cast<int>(z.size());
@@ -393,10 +410,12 @@ struct Model {
             if (!have_J || last_ratio > 0.3) {
                 MatrixXd Jm(n, n);
                 const double eps = 1e-7 * std::max(1.0, z.cwiseAbs().maxCoeff());
+#pragma omp parallel for schedule(dynamic, 4)
                 for (int i = 0; i < n; ++i) {
                     VectorXd zp = z; zp[i] += eps;
-                    Jm.col(i) = (residual(zp, false, jac_ftol) - r) / eps;
+                    Jm.col(i) = (residual_const(zp, jac_ftol) - r) / eps;
                 }
+                evals += n;
                 Jlu.compute(Jm); have_J = true;
             }
             const VectorXd dz = Jlu.solve(-r);
@@ -434,11 +453,11 @@ void print_kernel(const char* name, const MatrixXd& v, bool last = false) {
 
 int main(int argc, char* argv[]) {
     if (argc < 5) {
-        std::fprintf(stderr, "usage: %s p1 p2 r1 r2 [--N 24] [--L 3] [--tol 1e-12] [--pre 40] [--relax 0.1] [--jac-ftol 1e-9] [--uniform n] [--eval-only] [--verbose]\n", argv[0]);
+        std::fprintf(stderr, "usage: %s p1 p2 r1 r2 [--N 24] [--L 3] [--tol 1e-12] [--pre 40] [--relax 0.1] [--pre 15] [--relax 0.1] [--jac-ftol 1e-9] [--pre-ftol 1e-6] [--threads t] [--uniform n] [--eval-only] [--verbose]\n", argv[0]);
         return 1;
     }
     const double p1 = std::atof(argv[1]), p2 = std::atof(argv[2]), r1 = std::atof(argv[3]), r2 = std::atof(argv[4]);
-    int N = 24, uniform = 0, pre = 40; double L = 3.0, tol = 1e-12, relax = 0.1, jac_ftol = 1e-9; bool verbose = false, eval_only = false;
+    int N = 24, uniform = 0, pre = 15; double L = 3.0, tol = 1e-12, relax = 0.1, jac_ftol = 1e-9, pre_ftol = 1e-6; bool verbose = false, eval_only = false;
     for (int i = 5; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--N") && i + 1 < argc) N = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--L") && i + 1 < argc) L = std::atof(argv[++i]);
@@ -449,10 +468,23 @@ int main(int argc, char* argv[]) {
         else if (!std::strcmp(argv[i], "--verbose")) verbose = true;
         else if (!std::strcmp(argv[i], "--eval-only")) eval_only = true;
         else if (!std::strcmp(argv[i], "--jac-ftol") && i + 1 < argc) jac_ftol = std::atof(argv[++i]);
+        else if (!std::strcmp(argv[i], "--pre-ftol") && i + 1 < argc) pre_ftol = std::atof(argv[++i]);
+        else if (!std::strcmp(argv[i], "--threads") && i + 1 < argc) { 
+#ifdef _OPENMP
+            omp_set_num_threads(std::atoi(argv[++i]));
+#else
+            ++i;
+#endif
+        }
     }
+#ifdef _OPENMP
+    // Jacobian columns parallelize; beyond the physical cores the extra
+    // threads only spin.  8 matches the development machine.
+    if (!std::getenv("OMP_NUM_THREADS")) omp_set_num_threads(std::min(8, omp_get_num_procs()));
+#endif
     const auto t0 = std::chrono::steady_clock::now();
     Model M(N, L, p1, p2, r1, r2);
-    M.jac_ftol = jac_ftol;
+    M.jac_ftol = jac_ftol; M.pre_ftol = pre_ftol;
     const auto t1 = std::chrono::steady_clock::now();
     Model::Out o;
     if (eval_only) {   // one residual evaluation at the CE start, for cross-checking
