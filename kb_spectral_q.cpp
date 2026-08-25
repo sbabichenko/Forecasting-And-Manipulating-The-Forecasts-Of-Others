@@ -942,7 +942,7 @@ int main(int argc, char* argv[]) {
     std::vector<VectorXd> gam;
     { std::string s = argv[6]; size_t p = 0; while (p <= s.size()) { size_t e = s.find(';', p); if (e == std::string::npos) e = s.size(); auto v = parse_list(s.substr(p, e - p)); VectorXd g(q); for (int k = 0; k < q; ++k) g[k] = v.size() == 1 ? v[0] : v[k]; gam.push_back(g); p = e + 1; } }
     MatrixXd SV = MatrixXd::Identity(q, q), SZ = MatrixXd::Identity(q, q);
-    double tol = 1e-10, split_b = 0.0, map_alpha = 0.0; int uniform = 0, coarse = 0, n1 = 0; bool verbose = false, eval_only = false, adaptive = true, tangent = true, use_jfnk = true, use_analytic = true, check_jac = false, exact_nt = true, range_nt = false, lagged_nt = true; int gm_max = 12, lag_its = 8, pre_steps = 60, chunk_sz = 48; double min_ratio = 0.25; bool no_batch = true; double gm_tol = 1e-3; std::vector<double> path; std::string init_file;
+    double tol = 1e-10, split_b = 0.0, map_alpha = 0.0; int uniform = 0, coarse = 0, n1 = 0; bool verbose = false, eval_only = false, adaptive = true, tangent = true, use_jfnk = true, use_analytic = true, check_jac = false, exact_nt = true, range_nt = false, lagged_nt = true; int gm_max = 12, lag_its = 8, pre_steps = 60, chunk_sz = 48; double min_ratio = 0.25; int pvar = 0; bool quad_pred = false; bool no_batch = true; double gm_tol = 1e-3; std::vector<double> path; std::string init_file;
     for (int i = 7; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--sigma-v") && i + 1 < argc) { auto v = parse_list(argv[++i]); for (int r = 0; r < q; ++r) for (int c = 0; c < q; ++c) SV(r, c) = v[r * q + c]; }
         else if (!std::strcmp(argv[i], "--sigma-z") && i + 1 < argc) { auto v = parse_list(argv[++i]); for (int r = 0; r < q; ++r) for (int c = 0; c < q; ++c) SZ(r, c) = v[r * q + c]; }
@@ -973,6 +973,9 @@ int main(int argc, char* argv[]) {
         else if (!std::strcmp(argv[i], "--no-tangent")) tangent = false;
         else if (!std::strcmp(argv[i], "--tangent")) tangent = true;
         else if (!std::strcmp(argv[i], "--coarse") && i + 1 < argc) coarse = std::atoi(argv[++i]);
+        else if (!std::strcmp(argv[i], "--pvar") && i + 1 < argc) { ++i; pvar = !std::strcmp(argv[i], "sqrt") ? 1 : !std::strcmp(argv[i], "log") ? 2 : 0; }
+        else if (!std::strcmp(argv[i], "--quad")) quad_pred = true;
+        else if (!std::strcmp(argv[i], "--no-quad")) quad_pred = false;
         else if (!std::strcmp(argv[i], "--init") && i + 1 < argc) init_file = argv[++i];
         else if (!std::strcmp(argv[i], "--threads") && i + 1 < argc) {
 #ifdef _OPENMP
@@ -989,7 +992,10 @@ int main(int argc, char* argv[]) {
     const auto t0 = std::chrono::steady_clock::now();
     // continuation in eps on a given model from a start vector; returns the solution at the target (or the last good one)
     auto continuation = [&](Model& M, Solver& S, VectorXd z, std::vector<double> path, int pre0, bool& ok_out) {
-        VectorXd zprev; double eprev = 0; bool have_prev = false;
+        VectorXd zprev, zprev2; double eprev = 0, eprev2 = 0; bool have_prev = false, have_prev2 = false;
+        // predictor variable: extrapolate in P(eps) = eps, sqrt(eps) or log(eps); the boundary layer scales like eps^{-1/2}, so the path is straighter in sqrt/log
+        auto P = [&](double e) { return pvar == 1 ? std::sqrt(e) : pvar == 2 ? std::log(e) : e; };
+        auto dEdP = [&](double e) { return pvar == 1 ? 2.0 * std::sqrt(e) : pvar == 2 ? e : 1.0; };
         Solver::Out o; o.ok = false;
         int bisections = 0; double factor = std::max(min_ratio, 0.5);                   // adaptive: next eps = factor * current
         for (size_t k = 0; k < path.size(); ++k) {
@@ -998,15 +1004,22 @@ int main(int argc, char* argv[]) {
             if (have_prev) {
                 // candidates: plain warm start, secant extrapolation, tangent predictor (if a Jacobian exists)
                 std::vector<std::pair<double, VectorXd>> cands;
-                const VectorXd zx = z + (z - zprev) * ((path[k] - path[k - 1]) / (path[k - 1] - eprev));
+                const double p0 = P(path[k]), p1 = P(path[k - 1]), p2 = P(eprev);
+                const VectorXd zx = z + (z - zprev) * ((p0 - p1) / (p1 - p2));
                 cands.emplace_back(M.residual(z).cwiseAbs().maxCoeff(), z);
                 cands.emplace_back(M.residual(zx).cwiseAbs().maxCoeff(), zx); S.evals += 2;
+                if (quad_pred && have_prev2) {                                   // three-point (quadratic) extrapolation through (p2,zprev2) (p1,zprev) (p0,z) -- Lagrange form
+                    const double p3 = P(eprev2);
+                    const double l1 = (p0 - p2) * (p0 - p3) / ((p1 - p2) * (p1 - p3)), l2 = (p0 - p1) * (p0 - p3) / ((p2 - p1) * (p2 - p3)), l3 = (p0 - p1) * (p0 - p2) / ((p3 - p1) * (p3 - p2));
+                    const VectorXd zq = l1 * z + l2 * zprev + l3 * zprev2;
+                    cands.emplace_back(M.residual(zq).cwiseAbs().maxCoeff(), zq); ++S.evals;
+                }
                 if (tangent && S.have_J) {
                     const double e1 = path[k - 1], d = 1e-3 * e1;
                     M.eps = e1;       const VectorXd r0 = M.residual(z);
                     M.eps = e1 + d;   const VectorXd r1 = M.residual(z);
                     M.eps = path[k];  S.evals += 2;
-                    const VectorXd zt = z - S.Jinv * ((r1 - r0) / d) * (path[k] - e1);
+                    const VectorXd zt = z - S.Jinv * ((r1 - r0) / d) * (dEdP(e1) * (P(path[k]) - P(e1)));   // dz/dP * dP, with dz/dP = dz/deps * deps/dP
                     cands.emplace_back(M.residual(zt).cwiseAbs().maxCoeff(), zt); ++S.evals;
                 }
                 size_t best = 0; for (size_t c = 1; c < cands.size(); ++c) if (std::isfinite(cands[c].first) && cands[c].first < cands[best].first) best = c;
@@ -1017,10 +1030,10 @@ int main(int argc, char* argv[]) {
             if (!o.ok) { S.have_J = false; o = S.solve(z, tol, k == 0 ? 0 : 30, 0.1); }
             if (verbose) std::fprintf(stderr, "[N=%d] eps=%g: %s |r| %.2e, %d steps, %d jacobians, %ld evals, %.1f s elapsed | FOC solves: preconditioned ok %ld, fallback %ld, full %ld; time full-evals %.2f s, pre-evals %.2f s\n", M.N, path[k], o.ok ? "ok" : "FAIL", o.resid, o.steps, o.jacobians, S.evals, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), g_pre_ok, g_pre_fallback, g_full, g_t_full, g_t_pre);
             if (!o.ok) {
-                if (k > 0 && bisections < 6) { ++bisections; path.insert(path.begin() + k, 0.5 * (path[k - 1] + path[k])); have_prev = false; S.have_J = false; factor = std::sqrt(factor); --k; continue; }
+                if (k > 0 && bisections < 6) { ++bisections; path.insert(path.begin() + k, 0.5 * (path[k - 1] + path[k])); have_prev = false; have_prev2 = false; S.have_J = false; factor = std::sqrt(factor); --k; continue; }
                 break;
             }
-            if (k > 0) { zprev = z; eprev = path[k - 1]; have_prev = true; }
+            if (k > 0) { if (have_prev) { zprev2 = zprev; eprev2 = eprev; have_prev2 = true; } zprev = z; eprev = path[k - 1]; have_prev = true; }
             z = o.z;
             if (adaptive && k + 1 < path.size()) {
                 // replace the rest of the path by one geometric step, sized by how easy this step was:
