@@ -232,6 +232,13 @@ The equilibrium is found by a three-level nested iteration:
    `LQG_BACKWARD_SECTIONS=1` / `LQG_FORWARD_PAIR=1` select the two-thread
    variants.
 
+Tried and rejected: a struct-of-arrays layout for the backward pass (three
+planes per kernel, accumulation over r as full-row axpy's with per-thread
+partials).  Two variants were bit-for-bit correct and exactly as fast as the
+array-of-structs lockstep pass (N=160 54 vs 55 ms, N=640 1.83 vs 1.86 s):
+the pass is bound by streaming the later levels' rows, not by the 3x3
+arithmetic, and the moment sums cost the same as nine separate dots.
+
 Timings for the (3,3) benchmark solve, 8 threads: N=40 3 ms, N=160 55 ms,
 N=320 0.4 s, N=640 1.9 s (N=160 was 1.4 s before the exact march, Hk-free
 adjoints, Anderson, vectorization and threading; N > 160 was not possible).
