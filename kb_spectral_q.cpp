@@ -744,8 +744,9 @@ struct Model {
 struct Solver {
     Model& M; bool have_J = false; long evals = 0; bool verbose = false; double refresh_ratio = 0.8; int max_jacobians = 3;
     // inverse Jacobian as an LU plus Broyden rank-one corrections: Jinv r = LU^{-1} r + sum_k u_k (v_k . r)
-    MatrixXd Jstore; Eigen::PartialPivLU<Eigen::Ref<MatrixXd>> Jlu{Jstore}; std::vector<VectorXd> bu, bv;
-    VectorXd apply_Jinv(const VectorXd& r) const { VectorXd x = Jlu.solve(r); for (size_t k = 0; k < bu.size(); ++k) x += bu[k] * bv[k].dot(r); return x; }
+    Eigen::MatrixXf Jstore; Eigen::PartialPivLU<Eigen::Ref<Eigen::MatrixXf>> Jlu{Jstore}; std::vector<VectorXd> bu, bv;
+    bool single_prec = true;
+    VectorXd apply_Jinv(const VectorXd& r) const { VectorXd x = Jlu.solve(r.cast<float>()).cast<double>(); for (size_t k = 0; k < bu.size(); ++k) x += bu[k] * bv[k].dot(r); return x; }
     struct JinvOp { const Solver* S; VectorXd operator*(const VectorXd& r) const { return S->apply_Jinv(r); } };
     JinvOp Jinv{this};
     bool jfnk = true; int gmres_max = 12; double gmres_tol = 1e-3; bool analytic = true; bool batched = false; int chunk = 48; bool krylov_stalled = false; bool exact_newton = false; bool range_newton = false; bool lagged = false; int lag_max_its = 6;
@@ -774,7 +775,7 @@ struct Solver {
             if (step == 20 && rn > 0.3 * rn_at10) break;      // not making progress: hand back for eps bisection
             const bool need_refactor = lagged ? (!have_J || last_gmres > lag_max_its) : (exact_newton || !have_J || (last_ratio > refresh_ratio && o.jacobians < (use_krylov ? 1 : max_jacobians)));
             if (!range_newton && need_refactor) {   // under JFNK the Broyden-updated inverse is only a preconditioner: refresh at most once per solve
-                Jstore.resize(n, n); MatrixXd& Jm = Jstore; const double eps_fd = 1e-7 * std::max(1.0, z.cwiseAbs().maxCoeff());
+                Jstore.resize(n, n); const double eps_fd = 1e-7 * std::max(1.0, z.cwiseAbs().maxCoeff());   // columns cast straight into the single-precision store
                 Model::Diag& base = cur; const VectorXd rb = r;   // factorizations at z precondition the columns
                 if (analytic && batched) {
                     const Model::LinBase LB = M.linbase(base);
@@ -783,17 +784,17 @@ struct Solver {
                     for (int cidx = 0; cidx < nchunks; ++cidx) {
                         const int c0 = cidx * chunk, nc = std::min(chunk, n - c0);
                         MatrixXd D = MatrixXd::Zero(n, nc); for (int c = 0; c < nc; ++c) D(c0 + c, c) = 1.0;
-                        Jm.block(0, c0, n, nc) = M.dphi_batch(base, LB, D) - D;
+                        Jstore.block(0, c0, n, nc) = (M.dphi_batch(base, LB, D) - D).cast<float>();
                     }
                 } else if (analytic) {
                     const Model::LinBase LB = M.linbase(base);
 #pragma omp parallel for schedule(dynamic, 8)
-                    for (int i = 0; i < n; ++i) { VectorXd e = VectorXd::Zero(n); e[i] = 1.0; Jm.col(i) = M.pack(M.dphi_fast(base, LB, M.unpack(e))) - e; }
+                    for (int i = 0; i < n; ++i) { VectorXd e = VectorXd::Zero(n); e[i] = 1.0; Jstore.col(i) = (M.pack(M.dphi_fast(base, LB, M.unpack(e))) - e).cast<float>(); }
                 } else {
 #pragma omp parallel for schedule(dynamic, 4)
-                    for (int i = 0; i < n; ++i) { VectorXd zp = z; zp[i] += eps_fd; Jm.col(i) = (M.residual(zp, nullptr, &base) - rb) / eps_fd; }
+                    for (int i = 0; i < n; ++i) { VectorXd zp = z; zp[i] += eps_fd; Jstore.col(i) = ((M.residual(zp, nullptr, &base) - rb) / eps_fd).cast<float>(); }
                     evals += n;
-                } new (&Jlu) Eigen::PartialPivLU<Eigen::Ref<MatrixXd>>(Jstore); bu.clear(); bv.clear(); have_J = true; ++o.jacobians; last_ratio = 0.0; fresh = true; last_gmres = 0;   // factors in place
+                } new (&Jlu) Eigen::PartialPivLU<Eigen::Ref<Eigen::MatrixXf>>(Jstore); bu.clear(); bv.clear(); have_J = true; ++o.jacobians; last_ratio = 0.0; fresh = true; last_gmres = 0;   // single-precision factorization in place
             } else fresh = false;
             VectorXd dz;
             if (range_newton) {
@@ -829,7 +830,7 @@ struct Solver {
                 const VectorXd dw = Jr.partialPivLu().solve(-rr);
                 dz = M.pack(expand(dw));
                 fresh = true;
-            } else if (lagged && !fresh) {
+            } else if (lagged || fresh) {
                 // inexact Newton with the lagged exact LU as right preconditioner and exact Jacobian actions
                 const Model::LinBase LB = M.linbase(cur);
                 auto Jv = [&](const VectorXd& v) { std::vector<MatrixXd> d = M.dphi_fast(cur, LB, M.unpack(v)); return VectorXd(M.pack(d) - v); };
@@ -887,9 +888,13 @@ struct Solver {
                 const VectorXd rt = with_diag ? M.residual(zt, &nd) : M.residual(zt, nullptr, &cur); ++evals; const double rtn = rt.cwiseAbs().maxCoeff();
                 if (std::isfinite(rtn) && rtn < (1.0 - 1e-4 * lam) * rn) {
                     const VectorXd sz = zt - z, yr = rt - r; const VectorXd Jy = (exact_newton || range_newton) ? VectorXd(VectorXd::Zero(sz.size())) : apply_Jinv(yr); const double den = sz.dot(Jy);
-                    if (!exact_newton && !range_newton && std::abs(den) > 1e-14 * sz.norm() * Jy.norm()) {
-                        // good Broyden update of the inverse: Jinv += (sz - Jy) (sz^T Jinv) / den  ->  u = (sz - Jy)/den, v = Jinv^T sz
-                        VectorXd vT = Jlu.transpose().solve(sz); for (size_t k = 0; k < bu.size(); ++k) vT += bv[k] * bu[k].dot(sz);
+                    if (!exact_newton && !range_newton && !lagged && std::abs(den) > 1e-14 * sz.norm() * Jy.norm()) {
+                        // good Broyden update of the inverse (hybrid mode only): Jinv += (sz - Jy) (sz^T Jinv) / den
+                        // transpose solve through the stored factors: (P^T L U)^T x = sz  ->  U^T L^T P x = sz
+                        const auto& LUm = Jlu.matrixLU();
+                        Eigen::VectorXf t = LUm.template triangularView<Eigen::Upper>().transpose().solve(sz.cast<float>());
+                        t = LUm.template triangularView<Eigen::UnitLower>().transpose().solve(t);
+                        VectorXd vT = (Jlu.permutationP().transpose() * t).cast<double>(); for (size_t k = 0; k < bu.size(); ++k) vT += bv[k] * bu[k].dot(sz);
                         bu.push_back((sz - Jy) / den); bv.push_back(vT);
                     }
                     last_ratio = rtn / rn; z = zt; r = rt; rn = rtn; acc = true;
