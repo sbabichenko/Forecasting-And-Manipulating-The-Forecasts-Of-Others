@@ -494,38 +494,38 @@ struct CERowFilter {
     // per row; both players' subgroups must call this with the same j so the barriers match.
     std::vector<double> part, part2;
     void row_ws(int j, const Kernel2D& X, const Kernel2D& D, Kernel2D& Xtilde, Kernel2D& calD, int t, int S) {
-        const int active = 3 * (j + 1); const int r0 = rank;            // basis of observations up to j-1 (rank is
-        using FlatC = Eigen::Map<const Eigen::VectorXd>; using Flat = Eigen::Map<Eigen::VectorXd>;   // updated after the last barrier of the row)
-        // private copies of the row vectors: no barrier needed before the dot pass
+        // One barrier per row: after the column (dot) pass every thread has c_h, c_D, c_X, and the
+        // two reductions the row pass needs follow algebraically,
+        //   v^T X = h^T X - c_h . c_X,   |v|^2 = |h|^2 - |c_h|^2,
+        // the latter without cancellation because v keeps the unit entry on the new observation
+        // coordinate (row (j, obs) is zero in every earlier basis column), so |v| >= 1.
+        const int active = 3 * (j + 1); const int r0 = rank;
+        using FlatC = Eigen::Map<const Eigen::VectorXd>; using Flat = Eigen::Map<Eigen::VectorXd>;
         static thread_local Eigen::VectorXd xl, dl, hl;
-        if (xl.size() < active) { xl.resize(3 * n); dl.resize(3 * n); hl.resize(3 * n); }
+        if (xl.size() < 3 * n) { xl.resize(3 * n); dl.resize(3 * n); hl.resize(3 * n); }
         for (int z = 0; z <= j; ++z) { xl.segment<3>(3 * z) = X[j][z]; dl.segment<3>(3 * z) = D[j][z]; }
         hl.head(active) = g * g_dt * xl.head(active); hl(3 * j + obs) += 1.0;
-        if (t == 0 && static_cast<int>(part.size()) < S) { part.resize(S); part2.resize(S); }
         {   // pass 1: columns [k0, k1)
             const int k0 = static_cast<int>(static_cast<long>(r0) * t / S), k1 = static_cast<int>(static_cast<long>(r0) * (t + 1) / S);
             const FlatC xm(xl.data(), active), dm(dl.data(), active); const int row_obs = 3 * j + obs;
             for (int k = k0; k < k1; ++k) { const double* vk = V.col(k).data(); const FlatC vm(vk, active); const double sx = vm.dot(xm), sd = vm.dot(dm); cX[k] = sx; cD[k] = sd; cH[k] = g * g_dt * sx + vk[row_obs]; }
         }
         #pragma omp barrier
+        const FlatC chv(cH.data(), r0), cxv(cX.data(), r0);
+        const double hX = FlatC(hl.data(), active).dot(FlatC(xl.data(), active)), hh = FlatC(hl.data(), active).squaredNorm();
+        const double vX = hX - chv.dot(cxv), vn2 = hh - chv.squaredNorm();
+        const double vnorm = std::sqrt(std::max(vn2, 0.0)); const bool added = vnorm > 1e-15;
         const int z0 = static_cast<int>(static_cast<long>(j + 1) * t / S), z1 = static_cast<int>(static_cast<long>(j + 1) * (t + 1) / S);
         const int i0 = 3 * z0, L = 3 * (z1 - z0);
-        {   // pass 2: rows [i0, i0+L)
+        {   // row pass on rows [i0, i0+L): v, the control and Xtilde, then the new basis column
             Flat vv(v.data() + i0, L), pv(Pd.data() + i0, L), xv(Xvec.data() + i0, L);
             vv = FlatC(hl.data() + i0, L); pv.setZero(); xv = FlatC(xl.data() + i0, L);
             for (int k = 0; k < r0; ++k) { const FlatC vm(V.col(k).data() + i0, L); vv -= cH[k] * vm; pv += cD[k] * vm; xv -= cX[k] * vm; }
-            part[t] = vv.squaredNorm();
-            for (int z = z0; z < z1; ++z) calD[j][z] = Pd.segment<3>(3 * z);
+            if (added) { Flat vc(V.col(r0).data() + i0, L); vc = vv / vnorm; xv -= (vX / vnorm) * vc; }
+            for (int z = z0; z < z1; ++z) { calD[j][z] = Pd.segment<3>(3 * z); Xtilde[j][z] = Xvec.segment<3>(3 * z); }
         }
-        #pragma omp barrier
-        double vn2 = 0.0; for (int q = 0; q < S; ++q) vn2 += part[q];
-        const double vnorm = std::sqrt(vn2); const bool added = vnorm > 1e-15;
-        if (added) { Flat vc(V.col(r0).data() + i0, L); vc = FlatC(v.data() + i0, L) / vnorm; part2[t] = vc.dot(FlatC(Xvec.data() + i0, L)); }
-        else part2[t] = 0.0;
-        #pragma omp barrier
-        if (added) { double dx = 0.0; for (int q = 0; q < S; ++q) dx += part2[q]; Flat xv(Xvec.data() + i0, L); xv -= dx * FlatC(V.col(r0).data() + i0, L); }
-        for (int z = z0; z < z1; ++z) Xtilde[j][z] = Xvec.segment<3>(3 * z);
-        if (t == 0) { calD[j][0](obs) = 0.0; if (added) ++rank; }   // visible to all after the next row's barrier
+        if (t == 0) { calD[j][0](obs) = 0.0; if (added) ++rank; }
+        #pragma omp barrier            // the next X row needs every thread's calD[j]; `single` has no entry barrier
     }
 };
 
