@@ -1,6 +1,7 @@
 # Spectral-in-time solver for the Chapter 1 finite-horizon game (prototype, JAX)
 
-`spec_ch1.py` — kernels on the triangle 0 <= s <= t <= T in Duffy coordinates (t, theta = s/t),
+`spec_ch1.cpp` (C++/Eigen, `g++ -O3 -march=native -fopenmp spec_ch1.cpp`; usage in the header) and
+`spec_ch1.py` (JAX prototype) — kernels on the triangle 0 <= s <= t <= T in Duffy coordinates (t, theta = s/t),
 Chebyshev-Lobatto nodes in both, barycentric interpolation, Clenshaw-Curtis / Gauss-Legendre
 quadrature.  Player i's control is parametrized by its coefficient on the player's own
 observation increments, g^i_t(u), so the primitive-noise control is
@@ -38,3 +39,13 @@ Not done: mean part (bar system), asymmetric parameters, a penalty acting on hig
 (the smooth part would then be unbiased), Newton-Krylov instead of the dense Jacobian, and the
 relation to the discrete game's predictable control (the spectral solver solves the continuous
 game; the FD approximates its dt -> 0 limit).
+
+C++ port (`spec_ch1.cpp`): same grids and conventions; the gradient of J_i is a hand-written
+reverse sweep through the three stages (operator assembly, linear solve with the transposed LU,
+control quadrature), checked against central differences (max relative difference 2e-6, the FD
+accuracy); `SPEC_GRADCHECK=1` runs the check.  Newton with a finite-difference Jacobian, columns
+in parallel.  At 16x24, m = 16, lambda = 1e-7 it reproduces the JAX result to every printed digit
+(J1 = 0.3968879, own-noise profile at t = 0.5: -1.5889 -1.4868 -1.3069 -0.9610 -0.4878 -0.2034
+-0.0585) in 90 s on 8 threads (the JAX/GPU version: 14 s); the cost is the FD Jacobian (720
+gradient evaluations per Newton step, ~24 s), so Newton-Krylov or a semi-analytic Hessian is the
+next step if the C++ path is the one to develop.
