@@ -339,6 +339,21 @@ N against a cubic x2.7) shows the march dominated by per-row fixed costs at
 these sizes, not by bandwidth, so packing the basis into its triangular
 support (which would let a role's working set fit L2) was not pursued;
 `OMP_PROC_BIND` / `OMP_WAIT_POLICY` / `GOMP_SPINCOUNT` change nothing or hurt.
+**Per-row overhead of the march** (2026-08-25).  Each thread now carries its
+own copy of the current X row, advanced from the shared calD rows of the
+previous step, so the serial X update and its team-wide barrier are gone; the
+D row is read in place (rows of a Kernel2D are contiguous), and h is never
+materialized (h.x and |h|^2 follow from |x|^2 and x_obs).  The two remaining
+syncs per row are spin barriers (`SpinBarrier`, count and generation on
+separate cache lines -- on one line the arrivals invalidate what the spinners
+poll and N=640 got 30% slower): one per player half after the column pass, one
+team-wide at the end of the row (row j's X needs both players' calD[j-1]).
+The sweep uses the same barrier.  The march team is 4 threads below N ~ 240
+and 8 above.  N=160 solve 49 -> 42-44 ms (march 17 -> 14, sweep 24 -> 24),
+N=320 0.27 s, N=640 1.39 -> 1.26 s.  Not done: the lazy form of the basis
+adjoint (reading the pending W K^T instead of flushing into Vbar) -- the flush
+is compute-bound (its time is independent of the batch size m = 4..32) and the
+lazy form has the same multiply-add count, so there is nothing to gain.
 Above N ~ 320 each role is further split over S = threads/4 sub-threads
 (V^T Rm by basis column, V M3 and the row-local updates by row block, the
 flush by column of Vbar; five team barriers per row, which is why it does not

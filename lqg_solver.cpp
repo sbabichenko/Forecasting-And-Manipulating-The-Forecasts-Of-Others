@@ -18,6 +18,7 @@ static inline int omp_get_max_threads() { return 1; }
 #endif
 #include "lqg_solver.h"
 #include <algorithm>
+#include <atomic>
 #include <limits>
 
 // Runtime grid parameters
@@ -424,6 +425,21 @@ static void compute_ce_filter_and_calD(
 // small effort cost.  Under predictability the diagonal coordinate D(j,j) is inert in every channel.
 static bool predictable_control() { static const bool v = [] { const char* e = std::getenv("LQG_PREDICTABLE"); return !(e && std::atoi(e) == 0); }(); return v; }
 static void enforce_predictable(Kernel2D& D1, Kernel2D& D2) { if (!predictable_control()) return; for (int t = 0; t < g_n; ++t) { D1[t][t].setZero(); D2[t][t].setZero(); } }
+// Spin barrier for a fixed group of threads (the march uses one per player half for the mid-row
+// sync and one team-wide for the end of the row): cheaper than the OpenMP barrier.
+struct SpinBarrier {
+    alignas(64) std::atomic<int> count{0}; alignas(64) std::atomic<int> gen{0}; int n = 1;   // separate lines: arrivals must not invalidate the spinners' line
+    void wait() {
+        const int g = gen.load(std::memory_order_acquire);
+        if (count.fetch_add(1, std::memory_order_acq_rel) + 1 == n) { count.store(0, std::memory_order_relaxed); gen.store(g + 1, std::memory_order_release); }
+        else { while (gen.load(std::memory_order_acquire) == g) { spin_pause(); } }
+    }
+    static void spin_pause() {
+#if defined(__x86_64__) || defined(__i386__)
+        __builtin_ia32_pause();
+#endif
+    }
+};
 struct CERowFilter {
     int n = 0, rank = 0, obs = 0; double g = 0.0;
     Eigen::MatrixXd V; Eigen::VectorXd h, v, coeff, Xvec, Dvec, Pd, cH, cD, cX;
@@ -511,7 +527,8 @@ struct CERowFilter {
     // subgroup (sub-thread index `t`) inside one parallel region.  Pass 1 splits the basis columns,
     // pass 2 splits the rows (Vec3 units).  One team-wide barrier
     // per row; both players' subgroups must call this with the same j so the barriers match.
-    void row_ws(int j, const Kernel2D& X, const Kernel2D& D, Kernel2D& Xtilde, Kernel2D& calD, int t, int S) {
+    // xrow: this thread's copy of row j of X (3 (j+1) entries); the D row is read in place.
+    void row_ws(int j, const double* xrow, const Kernel2D& D, Kernel2D& Xtilde, Kernel2D& calD, int t, int S, SpinBarrier& bar_half, SpinBarrier& bar_all) {
         // One barrier per row: after the column (dot) pass every thread has c_h, c_D, c_X, and the
         // two reductions the row pass needs follow algebraically,
         //   v^T X = h^T X - c_h . c_X,   |v|^2 = |h|^2 - |c_h|^2,
@@ -519,32 +536,32 @@ struct CERowFilter {
         // coordinate (row (j, obs) is zero in every earlier basis column), so |v| >= 1.
         const int active = 3 * (j + 1); const int r0 = rank;
         using FlatC = Eigen::Map<const Eigen::VectorXd>; using Flat = Eigen::Map<Eigen::VectorXd>;
-        static thread_local Eigen::VectorXd xl, dl, hl;
-        if (xl.size() < 3 * n) { xl.resize(3 * n); dl.resize(3 * n); hl.resize(3 * n); }
-        for (int z = 0; z <= j; ++z) { xl.segment<3>(3 * z) = X[j][z]; dl.segment<3>(3 * z) = D[j][z]; }
-        hl.head(active) = g * g_dt * xl.head(active); hl(3 * j + obs) += 1.0;
+        const double* xl = xrow; const double* dl = D[j][0].data();   // rows of a Kernel2D are contiguous Vec3's
+        const int row_obs = 3 * j + obs; const double xo = xl[row_obs];
         {   // pass 1: columns [k0, k1)
             const int k0 = col_split(r0, t, S), k1 = col_split(r0, t + 1, S);
-            const int row_obs = 3 * j + obs;
-            for (int k = k0; k < k1; ++k) { const int lk = col_len[k]; const double* vk = V.col(k).data(); const FlatC vm(vk, lk); const double sx = vm.dot(FlatC(xl.data(), lk)), sd = vm.dot(FlatC(dl.data(), lk)); cX[k] = sx; cD[k] = sd; cH[k] = g * g_dt * sx + (lk > row_obs ? vk[row_obs] : 0.0); cHs(k, j) = cH[k]; cDs(k, j) = sd; }
+            for (int k = k0; k < k1; ++k) { const int lk = col_len[k]; const double* vk = V.col(k).data(); const FlatC vm(vk, lk); const double sx = vm.dot(FlatC(xl, lk)), sd = vm.dot(FlatC(dl, lk)); cX[k] = sx; cD[k] = sd; cH[k] = g * g_dt * sx + (lk > row_obs ? vk[row_obs] : 0.0); cHs(k, j) = cH[k]; cDs(k, j) = sd; }
         }
-        #pragma omp barrier
+        bar_half.wait();               // this player's coefficients are complete
         const FlatC chv(cH.data(), r0), cxv(cX.data(), r0);
-        const double hX = FlatC(hl.data(), active).dot(FlatC(xl.data(), active)), hh = FlatC(hl.data(), active).squaredNorm();
+        // h = g dt x + e_(j,obs):  h.x = g dt |x|^2 + x_obs,  |h|^2 = g^2 dt^2 |x|^2 + 2 g dt x_obs + 1
+        const double xx = FlatC(xl, active).squaredNorm(), gd = g * g_dt;
+        const double hX = gd * xx + xo, hh = gd * gd * xx + 2.0 * gd * xo + 1.0;
         const double vX = hX - chv.dot(cxv), vn2 = hh - chv.squaredNorm();
         const double vnorm = std::sqrt(std::max(vn2, 0.0)); const bool added = vnorm > 1e-15;
         const int z0 = row_split(j + 1, t, S), z1 = row_split(j + 1, t + 1, S);
         const int i0 = 3 * z0, L = 3 * (z1 - z0);
         {   // row pass on rows [i0, i0+L): v, the control and Xtilde, then the new basis column
             Flat vv(v.data() + i0, L), pv(Pd.data() + i0, L), xv(Xvec.data() + i0, L);
-            vv = FlatC(hl.data() + i0, L); pv.setZero(); xv = FlatC(xl.data() + i0, L);
+            vv = gd * FlatC(xl + i0, L); if (row_obs >= i0 && row_obs < i0 + L) vv(row_obs - i0) += 1.0;
+            pv.setZero(); xv = FlatC(xl + i0, L);
             int kb = 0; while (kb < r0 && col_len[kb] <= i0) ++kb;              // columns reaching this row block
             for (int k = kb; k < r0; ++k) { const int len = std::min(col_len[k], i0 + L) - i0; const FlatC vm(V.col(k).data() + i0, len); Flat(v.data() + i0, len) -= cH[k] * vm; Flat(Pd.data() + i0, len) += cD[k] * vm; Flat(Xvec.data() + i0, len) -= cX[k] * vm; }
             if (added) { Flat vc(V.col(r0).data() + i0, L); vc = vv / vnorm; xv -= (vX / vnorm) * vc; }
             for (int z = z0; z < z1; ++z) { calD[j][z] = Pd.segment<3>(3 * z); Xtilde[j][z] = Xvec.segment<3>(3 * z); }
         }
         if (t == 0) { calD[j][0](obs) = 0.0; vns[j] = vnorm; if (added) { col_len[rank] = active; ++rank; } rank_after[j] = rank; }
-        #pragma omp barrier            // the next X row needs every thread's calD[j]; `single` has no entry barrier
+        bar_all.wait();                // the next X row needs both players' calD[j]: team-wide
     }
 };
 
@@ -645,23 +662,32 @@ void forward_environment(
         CERowFilter* pF1 = &F1; CERowFilter* pF2 = &F2;
         env.basis1 = &F1; env.basis2 = &F2;
         static const bool ws_ce = [] { const char* e = std::getenv("LQG_FORWARD_WS"); return !(e && std::atoi(e) == 0); }();
-        const int team = std::min(8, omp_get_max_threads());
+        // team size: 4 threads below N ~ 240 (per-row sync costs outweigh the extra bandwidth), 8 above
+        const int team = std::min(std::min(8, omp_get_max_threads()), g_n < 240 ? 4 : 8);
         if (ws_ce && predictable_control() && g_n >= 64 && !omp_in_parallel() && team >= 4) {
             // Split-pass march: half the team per player, the basis passes shared within each half.
             const int half = team / 2;
+            SpinBarrier bar1, bar2, bar_all; bar1.n = half; bar2.n = half; bar_all.n = 2 * half;
             #pragma omp parallel num_threads(2 * half)
             {
                 const int tid = omp_get_thread_num(); const int player = tid < half ? 0 : 1; const int st = tid - player * half;
-                for (int j = 0; j < g_n; ++j) {
-                    #pragma omp single
-                    {
-                        X[j][j] = sigE0;
-                        for (int s = 0; s < j; ++s) X[j][s] = X[j - 1][s] + g_dt * (calD1[j - 1][s] + calD2[j - 1][s]);
-                        if (j == 0) { pF1->row(0, X, D1, env.Xtilde1, calD1); pF2->row(0, X, D2, env.Xtilde2, calD2); }
-                    }   // implicit barrier
-                    if (j == 0) continue;
-                    if (player == 0) pF1->row_ws(j, X, D1, env.Xtilde1, calD1, st, half);
-                    else             pF2->row_ws(j, X, D2, env.Xtilde2, calD2, st, half);
+                // Every thread carries its own copy of the current X row, advanced from the shared calD
+                // rows of the previous step (complete after that row's end barrier); thread 0 also writes
+                // it to env.X.  This removes the serial X update and its barrier from every row.
+                static thread_local Eigen::VectorXd xrow; if (xrow.size() < 3 * g_n) xrow.resize(3 * g_n);
+                #pragma omp single
+                {
+                    X[0][0] = sigE0;
+                    pF1->row(0, X, D1, env.Xtilde1, calD1); pF2->row(0, X, D2, env.Xtilde2, calD2);
+                }   // implicit barrier
+                xrow.segment<3>(0) = sigE0;
+                for (int j = 1; j < g_n; ++j) {
+                    const Vec3* c1 = &calD1[j - 1][0]; const Vec3* c2 = &calD2[j - 1][0];
+                    for (int s = 0; s < j; ++s) xrow.segment<3>(3 * s) += g_dt * (c1[s] + c2[s]);
+                    xrow.segment<3>(3 * j) = sigE0;
+                    if (tid == 0) for (int s = 0; s <= j; ++s) X[j][s] = xrow.segment<3>(3 * s);
+                    if (player == 0) pF1->row_ws(j, xrow.data(), D1, env.Xtilde1, calD1, st, half, bar1, bar_all);
+                    else             pF2->row_ws(j, xrow.data(), D2, env.Xtilde2, calD2, st, half, bar2, bar_all);
                 }
             }
             env.obs_gain1 = obs_gain1; env.obs_gain2 = obs_gain2;
@@ -1096,9 +1122,12 @@ static void exact_adjoint_pair(const EnvironmentResult& env, const Kernel2D& D1,
     static const int sub_env = [] { const char* e = std::getenv("LQG_ADJ_SUB"); return e ? std::max(1, std::atoi(e)) : 0; }();
     const int avail = omp_in_parallel() ? 1 : omp_get_max_threads();
     const int S = sub_env > 0 ? std::min(sub_env, std::max(1, avail / 4)) : std::max(1, std::min(avail / 4, n / 320)), nthr = avail >= 4 ? 4 * S : avail;
+    SpinBarrier sbar;
     #pragma omp parallel num_threads(nthr)
     {
         const int T = omp_get_num_threads(), t = omp_get_thread_num();
+        #pragma omp single
+        sbar.n = T;                                   // implicit barrier: every thread sees n before the first wait
         const int Sx = T >= 4 ? T / 4 : 1;           // sub-threads per role (actual team)
         const int sub = T >= 4 ? t % Sx : 0;
         const bool have_role = T >= 4 ? t < 4 * Sx : true;
@@ -1153,9 +1182,7 @@ static void exact_adjoint_pair(const EnvironmentResult& env, const Kernel2D& D1,
                 }
             }
             tick(4);
-            if (Sx > 1) {
-                #pragma omp barrier
-            }
+            if (Sx > 1) sbar.wait();
             // phase B: M2 = V^T Rm over the basis columns [k0, k1) of this sub-thread
             for (int role : my) {
                 const int q = role & 1; AdjRole& r = R[role];
@@ -1169,9 +1196,7 @@ static void exact_adjoint_pair(const EnvironmentResult& env, const Kernel2D& D1,
                 }
             }
             tick(0);
-            if (Sx > 1) {
-                #pragma omp barrier
-            }
+            if (Sx > 1) sbar.wait();
             // phase C: K_j columns 1,3; P = V M3 on the row block; gradient, vbar, hbar, W_j columns 2,3, hpart rows
             for (int role : my) {
                 const int a = role >> 1, q = role & 1; AdjRole& r = R[role];
@@ -1205,9 +1230,7 @@ static void exact_adjoint_pair(const EnvironmentResult& env, const Kernel2D& D1,
                 }
             }
             tick(1);
-            if (Sx > 1) {
-                #pragma omp barrier
-            }
+            if (Sx > 1) sbar.wait();
             // flush (every m rows): Vbar += W K^T on this sub-thread's block of columns
             for (int role = 0; role < 4; ++role) {
                 const int q = role & 1; AdjRole& r = R[role];
@@ -1226,7 +1249,7 @@ static void exact_adjoint_pair(const EnvironmentResult& env, const Kernel2D& D1,
                 }
             }
             tick(3);
-            #pragma omp barrier
+            sbar.wait();
             // state recursion X[j][s] = X[j-1][s] + dt (calD_1[j-1][s] + calD_2[j-1][s]): role (a, q) updates
             // its own cbar[a][q][j-1] on its row block; role (a, 0) also carries Xbar[a][j-1]
             for (int role : my) {
@@ -1241,7 +1264,7 @@ static void exact_adjoint_pair(const EnvironmentResult& env, const Kernel2D& D1,
             }
             tick(2);
             for (int role = 0; role < 4; ++role) c0prev[role] = c0cur[role];
-            #pragma omp barrier      // the row blocks of the recursion and of the next row's phase A differ
+            sbar.wait();             // the row blocks of the recursion and of the next row's phase A differ
         }
         for (int role : my) { const int a = role >> 1, q = role & 1; if (q != a) grad_pass(q, 1, c0prev[3 * q]); }
         if (prof) {
