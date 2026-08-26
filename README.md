@@ -339,6 +339,20 @@ N against a cubic x2.7) shows the march dominated by per-row fixed costs at
 these sizes, not by bandwidth, so packing the basis into its triangular
 support (which would let a role's working set fit L2) was not pursued;
 `OMP_PROC_BIND` / `OMP_WAIT_POLICY` / `GOMP_SPINCOUNT` change nothing or hurt.
+**Coarse-to-fine start** (2026-08-25, `LQG_COARSE=0` disables, `LQG_COARSE_MIN`
+= 64).  A solve at N first solves the nested grid (N+1)/2 (recursively), and
+starts from the interpolated kernels: bilinear in (t, s) away from the
+diagonal, the first `LQG_COARSE_LAGS` = 2 index lags carried at the same lag
+(the discrete band beside the diagonal is not a smooth field; carrying it by
+time lag leaves a start residual of 0.13, by index lag 0.05; Richardson
+extrapolation of the two coarsest levels changes nothing, `LQG_COARSE_NORICH`).
+Iterations 15 -> 10, but the wall time only improves at larger N (N=160 46 ->
+47 ms, N=320 284 -> 250 ms): the first iterations after any warm start reduce
+the residual slowly because Anderson has no history, so a good guess is worth
+only ~5 iterations, about what the coarse chain costs at N=160.  Kept on: it
+pays above N ~ 250 and is neutral below.  A Newton step would be the way to
+exploit a good start, at the cost of GMRES inner solves.
+
 **Per-row overhead of the march** (2026-08-25).  Each thread now carries its
 own copy of the current X row, advanced from the shared calD rows of the
 previous step, so the serial X update and its team-wide barrier are gone; the

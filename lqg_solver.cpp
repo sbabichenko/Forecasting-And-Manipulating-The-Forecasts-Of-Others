@@ -1919,6 +1919,36 @@ static bool eq_converged(const EquilibriumResult& eq) {
     return !eq.residuals.empty() && std::isfinite(eq.residuals.back()) && eq.residuals.back() < PICARD_TOL;
 }
 
+// Coarse-to-fine start (LQG_COARSE=0 disables; LQG_COARSE_MIN, default 64, the smallest N that
+// recurses): the equilibrium on the grid N_c = (N + 1) / 2 -- itself started the same way -- is
+// interpolated bilinearly in (t, s) to the fine grid (values at or above the diagonal clamp to
+// the diagonal) and handed to the warm-started solve.  A coarse solve costs about 1/8 of the
+// fine one and the fine solve then converges in about half the iterations.
+static bool coarse_enabled() { static const bool v = [] { const char* e = std::getenv("LQG_COARSE"); return !(e && std::atoi(e) == 0); }(); return v; }
+static int coarse_min() { static const int v = [] { const char* e = std::getenv("LQG_COARSE_MIN"); return e ? std::atoi(e) : 64; }(); return v; }
+// The two coarsest levels of the recursion are Richardson-extrapolated (2 D_{N/2} - D_{N/4}, the
+// scheme being first order) before interpolation, so the start error is O(dt^2); each level
+// stashes its own solution for its parent.
+struct CoarseStash { int n = 0; std::vector<Vec3> d1, d2; };
+static thread_local CoarseStash g_coarse_stash;
+static void interpolate_kernel(const std::vector<Vec3>& coarse, int nc, Kernel2D& fine, int n = g_n) {
+    auto C = [&](int i, int k) -> const Vec3& { i = std::min(i, nc - 1); k = std::min(k, i); return coarse[static_cast<size_t>(i) * (i + 1) / 2 + k]; };
+    const double sc = static_cast<double>(nc - 1) / (n - 1);
+    for (int j = 0; j < n; ++j) {
+        const double u = j * sc; const int i0 = std::min(static_cast<int>(u), nc - 1); const double fu = u - i0;
+        for (int l = 0; l <= j; ++l) {
+            const double w = l * sc; const int k0 = std::min(static_cast<int>(w), nc - 1); const double fw = w - k0;
+            fine[j][l] = (1 - fu) * ((1 - fw) * C(i0, k0) + fw * C(i0, k0 + 1)) + fu * ((1 - fw) * C(i0 + 1, k0) + fw * C(i0 + 1, k0 + 1));
+        }
+        // the first LAGS index lags carry the discrete band structure: take them at the same index
+        // lag from the coarse grid (interpolated along t only)
+        static const int LAGS = [] { const char* e = std::getenv("LQG_COARSE_LAGS"); return e ? std::atoi(e) : 2; }();
+        for (int k = 0; k <= std::min(LAGS, j); ++k) {
+            auto Ck = [&](int i) -> Vec3 { i = std::min(std::max(i, k), nc - 1); return coarse[static_cast<size_t>(i) * (i + 1) / 2 + (i - k)]; };
+            fine[j][j - k] = (1 - fu) * Ck(i0) + fu * Ck(i0 + 1);
+        }
+    }
+}
 EquilibriumResult solve_equilibrium(
     double p1_val, double p2_val, bool verbose,
     const Mat3& Pi_1, int obs_idx_1,
@@ -1926,6 +1956,31 @@ EquilibriumResult solve_equilibrium(
     Kernel2D D1, D2;
     D1.setZero();
     D2.setZero();
+    if (coarse_enabled() && g_n >= coarse_min()) {
+        std::vector<Vec3> c1, c2; int nc = (g_n + 1) / 2; bool ok = false;
+        {
+            SolverContext ctx = SolverContext::capture_current(); ctx.n = nc;
+            ScopedSolverContext guard(ctx);
+            g_coarse_stash.n = 0;
+            EquilibriumResult ec = solve_equilibrium(p1_val, p2_val, false, Pi_1, obs_idx_1, Pi_2, obs_idx_2);
+            ok = eq_converged(ec);
+            if (ok) {
+                c1 = ec.D1.data; c2 = ec.D2.data;
+                if (g_coarse_stash.n > 0 && !std::getenv("LQG_COARSE_NORICH")) {   // Richardson with the level below: 2 D_nc - I(D_ncc)
+                    Kernel2D t1, t2; interpolate_kernel(g_coarse_stash.d1, g_coarse_stash.n, t1, nc); interpolate_kernel(g_coarse_stash.d2, g_coarse_stash.n, t2, nc);
+                    for (size_t i = 0; i < c1.size(); ++i) { c1[i] = 2.0 * c1[i] - t1.data[i]; c2[i] = 2.0 * c2[i] - t2.data[i]; }
+                }
+            }
+        }
+        if (ok) {
+            g_coarse_stash.n = nc; g_coarse_stash.d1 = c1; g_coarse_stash.d2 = c2;   // (extrapolated) level-nc solution for the parent
+            interpolate_kernel(c1, nc, D1); interpolate_kernel(c2, nc, D2);
+            EquilibriumResult eq = solve_equilibrium_core(p1_val, p2_val, D1, D2, verbose, Pi_1, obs_idx_1, Pi_2, obs_idx_2);
+            if (eq_converged(eq)) return eq;
+            if (verbose) std::cout << "  coarse-to-fine start did not converge; cold start" << std::endl;
+            D1.setZero(); D2.setZero();
+        }
+    }
     EquilibriumResult eq = solve_equilibrium_core(p1_val, p2_val, D1, D2, verbose, Pi_1, obs_idx_1, Pi_2, obs_idx_2);
     if (eq_converged(eq)) return eq;
     // Diagnostic: the stiff regime is small effort cost over a long horizon (the map's
