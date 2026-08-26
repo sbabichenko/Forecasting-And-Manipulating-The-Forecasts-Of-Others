@@ -158,6 +158,15 @@ static std::pair<double, double> mean_wedge_component_maxima(
 }
 
 // ---------- main ----------
+// Predictor for a warm-started parameter sweep: linear extrapolation from the two previous
+// points (2 K_prev - K_prev2) when both exist, otherwise the previous point.
+static Kernel2D sweep_predict(const Kernel2D& prev, const Kernel2D* prev2) {
+    if (!prev2) return prev;
+    Kernel2D out = prev;
+    for (size_t i = 0; i < out.data.size(); ++i) out.data[i] = 2.0 * prev.data[i] - prev2->data[i];
+    return out;
+}
+
 int main(int argc, char** argv) {
     // Grid size and output directory from the command line (defaults N=40, data/); the
     // scheme is first order in 1/N, so the figures are built from Richardson
@@ -532,17 +541,19 @@ int main(int argc, char** argv) {
         eq_results[mid] = solve_equilibrium(
             std::sqrt(p1_sweep[mid]), std::sqrt(p2_sweep[mid]), false);
 
-        // Sweep rightward from mid
+        // Sweep rightward from mid (linear predictor from the two previous points)
         for (int i = mid + 1; i < N_SWEEP; ++i) {
+            const EquilibriumResult* pp = i - 2 >= mid ? &eq_results[i - 2] : nullptr;
             eq_results[i] = solve_equilibrium_warm(
                 std::sqrt(p1_sweep[i]), std::sqrt(p2_sweep[i]),
-                eq_results[i - 1].D1, eq_results[i - 1].D2, false);
+                sweep_predict(eq_results[i - 1].D1, pp ? &pp->D1 : nullptr), sweep_predict(eq_results[i - 1].D2, pp ? &pp->D2 : nullptr), false);
         }
         // Sweep leftward from mid
         for (int i = mid - 1; i >= 0; --i) {
+            const EquilibriumResult* pp = i + 2 <= mid ? &eq_results[i + 2] : nullptr;
             eq_results[i] = solve_equilibrium_warm(
                 std::sqrt(p1_sweep[i]), std::sqrt(p2_sweep[i]),
-                eq_results[i + 1].D1, eq_results[i + 1].D2, false);
+                sweep_predict(eq_results[i + 1].D1, pp ? &pp->D1 : nullptr), sweep_predict(eq_results[i + 1].D2, pp ? &pp->D2 : nullptr), false);
         }
 
         // Insert into cache
@@ -620,14 +631,18 @@ int main(int argc, char** argv) {
                 std::vector<EquilibriumResult> eq_results(N_SWEEP);
                 eq_results[mid] = solve_equilibrium(
                     std::sqrt(p1_sweep[mid]), std::sqrt(p2_sweep[mid]), false);
-                for (int i = mid + 1; i < N_SWEEP; ++i)
+                for (int i = mid + 1; i < N_SWEEP; ++i) {
+                    const EquilibriumResult* pp = i - 2 >= mid ? &eq_results[i - 2] : nullptr;
                     eq_results[i] = solve_equilibrium_warm(
                         std::sqrt(p1_sweep[i]), std::sqrt(p2_sweep[i]),
-                        eq_results[i - 1].D1, eq_results[i - 1].D2, false);
-                for (int i = mid - 1; i >= 0; --i)
+                        sweep_predict(eq_results[i - 1].D1, pp ? &pp->D1 : nullptr), sweep_predict(eq_results[i - 1].D2, pp ? &pp->D2 : nullptr), false);
+                }
+                for (int i = mid - 1; i >= 0; --i) {
+                    const EquilibriumResult* pp = i + 2 <= mid ? &eq_results[i + 2] : nullptr;
                     eq_results[i] = solve_equilibrium_warm(
                         std::sqrt(p1_sweep[i]), std::sqrt(p2_sweep[i]),
-                        eq_results[i + 1].D1, eq_results[i + 1].D2, false);
+                        sweep_predict(eq_results[i + 1].D1, pp ? &pp->D1 : nullptr), sweep_predict(eq_results[i + 1].D2, pp ? &pp->D2 : nullptr), false);
+                }
                 for (int i = 0; i < N_SWEEP; ++i) {
                     auto key = make_eq_key(p1_sweep[i], p2_sweep[i], 1, 2);
                     eq_cache.emplace(key, std::move(eq_results[i]));

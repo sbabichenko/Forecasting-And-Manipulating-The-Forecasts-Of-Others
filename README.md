@@ -331,7 +331,15 @@ coefficients; the unbatched sweep 129 ms).  `LQG_PROF=1` prints the
 forward / adjoint / rest split of the kernel iteration, `LQG_ADJ_PROF=1` the
 per-thread phases of the sweep.
 `LQG_ADJ_REF=1` selects the plain per-player sweep kept for verification
-(results agree to 1e-12).  The figure pipeline at N=157 takes 63 s.
+(results agree to 1e-12).  The sweep's scratch is per calling thread (the
+figure pipeline solves several equilibria concurrently, each sweep then
+running single-threaded); a first version with shared static buffers
+corrupted concurrent solves silently -- fig12's costs came out constant across
+p2 with NaN pooled costs, non-reproducibly -- so the figure data is now checked
+for run-to-run reproducibility and against the pre-optimization commit.
+The figure sweeps warm-start from a linear predictor (2 K_prev - K_prev2)
+along the parameter grid, which cuts the solves needing >= 10 iterations from
+309 to 92 of 444; the pipeline at N=157 takes 35 s.
 Note: the cmake `benchmark` target had not been linked against OpenMP, so its
 earlier printed timings were single-threaded; fixed.
 

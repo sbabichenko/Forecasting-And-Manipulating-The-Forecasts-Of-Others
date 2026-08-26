@@ -1056,8 +1056,13 @@ static void exact_adjoint_pair(const EnvironmentResult& env, const Kernel2D& D1,
     const CERowFilter* B[2] = {static_cast<const CERowFilter*>(env.basis1), static_cast<const CERowFilter*>(env.basis2)};
     const Kernel2D* D[2] = {&D1, &D2}; const Kernel2D* C[2] = {&env.calD1, &env.calD2}; const int obs[2] = {obs1, obs2}; const double gg[2] = {g1, g2}, rr[2] = {r1, r2};
     const Kernel2D& X = env.X;
-    static Kernel2D Xbar[2], cbar[2][2], grad[2];
-    static AdjRole R[4];
+    // Scratch is per calling thread: the figure pipeline solves several equilibria concurrently,
+    // each solve then runs its sweep on one thread (omp_in_parallel) with its own buffers.
+    static thread_local Kernel2D Xbar_tl[2], cbar_tl[2][2], grad_tl[2];
+    static thread_local AdjRole R_tl[4];
+    // pointers to the calling thread's buffers: inside the parallel region a thread_local name would
+    // denote each worker's own instance
+    Kernel2D* Xbar = Xbar_tl; Kernel2D (*cbar)[2] = cbar_tl; Kernel2D* grad = grad_tl; AdjRole* R = R_tl;
     for (int a = 0; a < 2; ++a) {
         Xbar[a].resize(); grad[a].resize(); grad[a].setZero(); cbar[a][0].resize(); cbar[a][1].resize();
         for (int j = 0; j < n; ++j) for (int s = 0; s <= j; ++s) { Xbar[a][j][s] = 2.0 * g_dt * g_dt * X[j][s]; cbar[a][a][j][s] = 2.0 * rr[a] * g_dt * g_dt * (*C[a])[j][s]; cbar[a][1 - a][j][s].setZero(); }
