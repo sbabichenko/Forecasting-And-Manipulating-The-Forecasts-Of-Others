@@ -431,9 +431,17 @@ struct CERowFilter {
     // Per-row coefficients kept for the exact adjoint: column j of cHs / cDs holds V_{j-1}^T h_j and
     // V_{j-1}^T D[j] (first rank_after[j-1] entries), vns[j] the norm of the new column's residual.
     Eigen::MatrixXd cHs, cDs; std::vector<double> vns;
+    // Column k of V is the residual of h at the row that added it, so it is nonzero only on its
+    // first col_len[k] = 3 (row + 1) rows: the basis is triangular, and every pass over it runs
+    // over that support only (half the traffic of the full active block).
+    std::vector<int> col_len;
+    // work-balanced splits: columns (work ~ col_len ~ k) and rows (work ~ number of columns reaching the row)
+    static int col_split(int r0, int t, int S) { return t >= S ? r0 : static_cast<int>(r0 * std::sqrt(static_cast<double>(t) / S)); }
+    static int row_split(int nz, int t, int S) { return t >= S ? nz : static_cast<int>(nz * (1.0 - std::sqrt(1.0 - static_cast<double>(t) / S))); }
     void reset(int n_, int obs_, double g_) {
         n = n_; obs = obs_; g = g_; rank = 0;
         const int dim = 3 * n;
+        col_len.assign(n, 0);
         if (cHs.rows() != n) { cHs.resize(n, n); cDs.resize(n, n); }
         vns.assign(n, 0.0);
         if (V.rows() != dim || V.cols() != n) { V.resize(dim, n); h.resize(dim); v.resize(dim); Xvec.resize(dim); Dvec.resize(dim); Pd.resize(dim); coeff.resize(n); cH.resize(n); cD.resize(n); cX.resize(n); }
@@ -455,10 +463,11 @@ struct CERowFilter {
             using FlatC = Eigen::Map<const Eigen::VectorXd>;
             const FlatC xm(xp, active), dm(dp, active);
             for (int k = 0; k < rank; ++k) {            // vectorized reductions (a plain loop does not vectorize without -ffast-math)
-                const double* vk = V.col(k).data(); const FlatC vm(vk, active);
-                const double sx = vm.dot(xm), sd = vm.dot(dm);
-                cX[k] = sx; cD[k] = sd; cH[k] = g * g_dt * sx + vk[row_obs];
+                const int lk = col_len[k]; const double* vk = V.col(k).data(); const FlatC vm(vk, lk);
+                const double sx = vm.dot(FlatC(xp, lk)), sd = vm.dot(FlatC(dp, lk));
+                cX[k] = sx; cD[k] = sd; cH[k] = g * g_dt * sx + (lk > row_obs ? vk[row_obs] : 0.0);
             }
+            (void)xm; (void)dm;
             for (int k = 0; k < rank; ++k) { cHs(k, j) = cH[k]; cDs(k, j) = cD[k]; }
             // pass 2: per basis column, three axpy's into v (= h - V c_h), the control (V c_D) and Xtilde (X - V c_X)
             v.head(active) = h.head(active); Pd.head(active).setZero();
@@ -466,9 +475,10 @@ struct CERowFilter {
             using Flat = Eigen::Map<Eigen::VectorXd>;
             Flat vv(vp, active), pv(pd, active), xv(xw, active);
             for (int k = 0; k < rank; ++k) {
-                const double* vk = V.col(k).data(); const FlatC vm(vk, active); const double a = cH[k], b = cD[k], c = cX[k];
-                vv -= a * vm; pv += b * vm; xv -= c * vm;
+                const int lk = col_len[k]; const double* vk = V.col(k).data(); const FlatC vm(vk, lk); const double a = cH[k], b = cD[k], c = cX[k];
+                Flat(vp, lk) -= a * vm; Flat(pd, lk) += b * vm; Flat(xw, lk) -= c * vm;
             }
+            (void)vv; (void)pv; (void)xv;
             if (predictable_control()) { for (int z = 0; z <= j; ++z) calD[j][z] = Pd.segment<3>(3 * z); }
         } else {
             v.head(active) = h.head(active);
@@ -477,7 +487,7 @@ struct CERowFilter {
         // new basis column from the step-j observation
         const double vnorm = v.head(active).norm(); vns[j] = vnorm;
         bool added = false;
-        if (vnorm > 1e-15) { V.col(rank).head(active) = v.head(active) / vnorm; ++rank; added = true; }
+        if (vnorm > 1e-15) { V.col(rank).head(active) = v.head(active) / vnorm; col_len[rank] = active; ++rank; added = true; }
         if (added) {   // rank-1 corrections with the new column
             auto vn = V.col(rank - 1).head(active);
             Xvec.head(active) -= vn * vn.dot(Xvec.head(active));
@@ -514,25 +524,26 @@ struct CERowFilter {
         for (int z = 0; z <= j; ++z) { xl.segment<3>(3 * z) = X[j][z]; dl.segment<3>(3 * z) = D[j][z]; }
         hl.head(active) = g * g_dt * xl.head(active); hl(3 * j + obs) += 1.0;
         {   // pass 1: columns [k0, k1)
-            const int k0 = static_cast<int>(static_cast<long>(r0) * t / S), k1 = static_cast<int>(static_cast<long>(r0) * (t + 1) / S);
-            const FlatC xm(xl.data(), active), dm(dl.data(), active); const int row_obs = 3 * j + obs;
-            for (int k = k0; k < k1; ++k) { const double* vk = V.col(k).data(); const FlatC vm(vk, active); const double sx = vm.dot(xm), sd = vm.dot(dm); cX[k] = sx; cD[k] = sd; cH[k] = g * g_dt * sx + vk[row_obs]; cHs(k, j) = cH[k]; cDs(k, j) = sd; }
+            const int k0 = col_split(r0, t, S), k1 = col_split(r0, t + 1, S);
+            const int row_obs = 3 * j + obs;
+            for (int k = k0; k < k1; ++k) { const int lk = col_len[k]; const double* vk = V.col(k).data(); const FlatC vm(vk, lk); const double sx = vm.dot(FlatC(xl.data(), lk)), sd = vm.dot(FlatC(dl.data(), lk)); cX[k] = sx; cD[k] = sd; cH[k] = g * g_dt * sx + (lk > row_obs ? vk[row_obs] : 0.0); cHs(k, j) = cH[k]; cDs(k, j) = sd; }
         }
         #pragma omp barrier
         const FlatC chv(cH.data(), r0), cxv(cX.data(), r0);
         const double hX = FlatC(hl.data(), active).dot(FlatC(xl.data(), active)), hh = FlatC(hl.data(), active).squaredNorm();
         const double vX = hX - chv.dot(cxv), vn2 = hh - chv.squaredNorm();
         const double vnorm = std::sqrt(std::max(vn2, 0.0)); const bool added = vnorm > 1e-15;
-        const int z0 = static_cast<int>(static_cast<long>(j + 1) * t / S), z1 = static_cast<int>(static_cast<long>(j + 1) * (t + 1) / S);
+        const int z0 = row_split(j + 1, t, S), z1 = row_split(j + 1, t + 1, S);
         const int i0 = 3 * z0, L = 3 * (z1 - z0);
         {   // row pass on rows [i0, i0+L): v, the control and Xtilde, then the new basis column
             Flat vv(v.data() + i0, L), pv(Pd.data() + i0, L), xv(Xvec.data() + i0, L);
             vv = FlatC(hl.data() + i0, L); pv.setZero(); xv = FlatC(xl.data() + i0, L);
-            for (int k = 0; k < r0; ++k) { const FlatC vm(V.col(k).data() + i0, L); vv -= cH[k] * vm; pv += cD[k] * vm; xv -= cX[k] * vm; }
+            int kb = 0; while (kb < r0 && col_len[kb] <= i0) ++kb;              // columns reaching this row block
+            for (int k = kb; k < r0; ++k) { const int len = std::min(col_len[k], i0 + L) - i0; const FlatC vm(V.col(k).data() + i0, len); Flat(v.data() + i0, len) -= cH[k] * vm; Flat(Pd.data() + i0, len) += cD[k] * vm; Flat(Xvec.data() + i0, len) -= cX[k] * vm; }
             if (added) { Flat vc(V.col(r0).data() + i0, L); vc = vv / vnorm; xv -= (vX / vnorm) * vc; }
             for (int z = z0; z < z1; ++z) { calD[j][z] = Pd.segment<3>(3 * z); Xtilde[j][z] = Xvec.segment<3>(3 * z); }
         }
-        if (t == 0) { calD[j][0](obs) = 0.0; vns[j] = vnorm; if (added) ++rank; rank_after[j] = rank; }
+        if (t == 0) { calD[j][0](obs) = 0.0; vns[j] = vnorm; if (added) { col_len[rank] = active; ++rank; } rank_after[j] = rank; }
         #pragma omp barrier            // the next X row needs every thread's calD[j]; `single` has no entry barrier
     }
 };
@@ -1078,7 +1089,7 @@ static void exact_adjoint_pair(const EnvironmentResult& env, const Kernel2D& D1,
     static const bool prof = std::getenv("LQG_ADJ_PROF") != nullptr;
     // Team: 4 roles x S sub-threads when at least 4 threads are available (S = T / 4; the products of a
     // role are split among its sub-threads: V^T Rm by basis column, V M3 and the row-local updates by
-    // row block, the flush by column of Vbar; five team barriers per row).  With fewer threads each
+    // row block, the flush by column of Vbar; five team barriers per row, two without the split).  With fewer threads each
     // thread takes every fourth role alone.
     // Sub-threads pay five barriers per row, which only amortizes once the row work is large enough
     // (N=640 gains 30%, N=320 nothing measurable on an 8-core desktop); LQG_ADJ_SUB fixes the number per role.
@@ -1093,17 +1104,34 @@ static void exact_adjoint_pair(const EnvironmentResult& env, const Kernel2D& D1,
         const bool have_role = T >= 4 ? t < 4 * Sx : true;
         auto roles_of = [&](std::vector<int>& v) { v.clear(); if (!have_role) return; if (T >= 4) v.push_back(t / Sx); else for (int r = t; r < 4; r += T) v.push_back(r); };
         std::vector<int> my; roles_of(my);
-        int nbl[4] = {0, 0, 0, 0}, bAl[4] = {0, 0, 0, 0}, bRl[4] = {0, 0, 0, 0};   // batch state, private (identical on every thread)
+        using FlatC = Eigen::Map<const Eigen::VectorXd>; using Flat = Eigen::Map<Eigen::VectorXd>;
         Eigen::MatrixXd M3, P; Eigen::VectorXd vbar, hbar;
+        int nbl[4] = {0, 0, 0, 0}, bAl[4] = {0, 0, 0, 0}, bRl[4] = {0, 0, 0, 0};   // batch state of every role, private (identical on every thread)
+        int c0prev[4] = {-1, -1, -1, -1};                                       // column block used by each role at the previous row (-1: none)
+        // The gradient of player q at row jp, grad_q[jp] = V_q (V_q^T cb_q[jp]), is computed one row later by
+        // the light role (1-q, q) -- the role that streams basis q for the other player's adjoint -- from the
+        // coefficients V_q^T cb_q that role (q, q) stored in its K block (column 1) at row jp.
+        auto grad_pass = [&](int q, int jp, int c0q) {
+            const CERowFilter& b = *B[q]; const int r0 = b.rank_after[jp - 1]; if (r0 == 0 || c0q < 0) return;
+            const int za = CERowFilter::row_split(jp + 1, sub, Sx), zb = CERowFilter::row_split(jp + 1, sub + 1, Sx);
+            const int ia = 3 * za, La = 3 * (zb - za); if (La <= 0) return;
+            P.resize(La, 1); P.setZero();
+            const Eigen::MatrixXd& Kq = R[3 * q].K;
+            int kb = 0; while (kb < r0 && b.col_len[kb] <= ia) ++kb;
+            for (int kc = kb; kc < r0; ++kc) { const int len = std::min(b.col_len[kc], ia + La) - ia; Flat(P.col(0).data(), len) += Kq(kc, c0q + 1) * FlatC(b.V.col(kc).data() + ia, len); }
+            for (int z = za; z < zb; ++z) grad[q][jp][z] += P.block<3, 1>(3 * (z - za), 0);
+        };
         double tacc[6] = {0, 0, 0, 0, 0, 0}; double t0 = prof ? omp_get_wtime() : 0.0;
         auto tick = [&](int k) { if (prof) { const double t1 = omp_get_wtime(); tacc[k] += t1 - t0; t0 = t1; } };
-        using FlatC = Eigen::Map<const Eigen::VectorXd>; using Flat = Eigen::Map<Eigen::VectorXd>;
         for (int j = n - 1; j >= 1; --j) {
             const int active = 3 * (j + 1), par = j & 1;
             // block of Vec3 rows [z0, z1) of this sub-thread
-            const int z0 = static_cast<int>(static_cast<long>(j + 1) * sub / Sx), z1 = static_cast<int>(static_cast<long>(j + 1) * (sub + 1) / Sx);
+            const int z0 = CERowFilter::row_split(j + 1, sub, Sx), z1 = CERowFilter::row_split(j + 1, sub + 1, Sx);
             const int i0 = 3 * z0, L = 3 * (z1 - z0);
+            // deferred gradient of the previous row (light roles), then
             // phase A: Rm = [cb, ubar] rows, W_j columns 0,1 rows, K_j column 0 (sub 0)
+            for (int role : my) { const int a = role >> 1, q = role & 1; if (q != a) grad_pass(q, j + 1, c0prev[3 * q]); }
+            int c0cur[4]; for (int role = 0; role < 4; ++role) { const int q = role & 1; c0cur[role] = B[q]->rank_after[j - 1] > 0 ? 4 * nbl[role] : -1; }
             for (int role : my) {
                 const int a = role >> 1, q = role & 1; AdjRole& r = R[role];
                 const CERowFilter& b = *B[q]; const int r0 = b.rank_after[j - 1];
@@ -1125,21 +1153,25 @@ static void exact_adjoint_pair(const EnvironmentResult& env, const Kernel2D& D1,
                 }
             }
             tick(4);
-            #pragma omp barrier
+            if (Sx > 1) {
+                #pragma omp barrier
+            }
             // phase B: M2 = V^T Rm over the basis columns [k0, k1) of this sub-thread
             for (int role : my) {
                 const int q = role & 1; AdjRole& r = R[role];
                 const CERowFilter& b = *B[q]; const int r0 = b.rank_after[j - 1]; if (r0 == 0) continue;
                 const bool gs = b.rank_after[j] > r0;
-                const int k0 = static_cast<int>(static_cast<long>(r0) * sub / Sx), k1 = static_cast<int>(static_cast<long>(r0) * (sub + 1) / Sx);
-                const FlatC x0(r.Rm.col(0).data(), active), x1(r.Rm.col(1).data(), active);
+                const int k0 = CERowFilter::col_split(r0, sub, Sx), k1 = CERowFilter::col_split(r0, sub + 1, Sx);
+                const double* x0 = r.Rm.col(0).data(); const double* x1 = r.Rm.col(1).data();
                 for (int k = k0; k < k1; ++k) {
-                    const FlatC vm(b.V.col(k).data(), active);
-                    r.M2(k, 0) = vm.dot(x0); if (gs) r.M2(k, 1) = vm.dot(x1);
+                    const int lk = b.col_len[k]; const FlatC vm(b.V.col(k).data(), lk);
+                    r.M2(k, 0) = vm.dot(FlatC(x0, lk)); if (gs) r.M2(k, 1) = vm.dot(FlatC(x1, lk));
                 }
             }
             tick(0);
-            #pragma omp barrier
+            if (Sx > 1) {
+                #pragma omp barrier
+            }
             // phase C: K_j columns 1,3; P = V M3 on the row block; gradient, vbar, hbar, W_j columns 2,3, hpart rows
             for (int role : my) {
                 const int a = role >> 1, q = role & 1; AdjRole& r = R[role];
@@ -1148,18 +1180,19 @@ static void exact_adjoint_pair(const EnvironmentResult& env, const Kernel2D& D1,
                 const int c0 = 4 * nbl[role]; auto Wj = r.W.middleCols(c0, 4); auto Kj = r.K.middleCols(c0, 4);
                 const double vn = gs ? b.vns[j] : 1.0;
                 if (sub == 0) { Kj.topRows(r0).col(1) = r.M2.col(0).head(r0); if (gs) Kj.topRows(r0).col(3) = r.M2.col(1).head(r0) / vn; }   // V^T vbar = V^T ubar / |v|
-                const int nm = (q == a ? 1 : 0) + (gs ? 1 : 0);
+                (void)a;
+                const int nm = gs ? 1 : 0;
                 if (nm == 0) continue;
                 M3.resize(r0, nm); int k = 0;
-                if (q == a) M3.col(k++) = r.M2.col(0).head(r0);
                 if (gs) M3.col(k++) = r.M2.col(1).head(r0) / vn;
                 P.resize(L, nm); P.setZero();
                 {
                     Flat p0(P.col(0).data(), L), p1(P.col(nm - 1).data(), L);
-                    for (int kc = 0; kc < r0; ++kc) { const FlatC vm(b.V.col(kc).data() + i0, L); p0 += M3(kc, 0) * vm; if (nm == 2) p1 += M3(kc, 1) * vm; }
+                    int kb = 0; while (kb < r0 && b.col_len[kb] <= i0) ++kb;
+                    for (int kc = kb; kc < r0; ++kc) { const int len = std::min(b.col_len[kc], i0 + L) - i0; const FlatC vm(b.V.col(kc).data() + i0, len); Flat(P.col(0).data(), len) += M3(kc, 0) * vm; if (nm == 2) Flat(P.col(nm - 1).data(), len) += M3(kc, 1) * vm; }
+                    (void)p0; (void)p1;
                 }
                 int kk = 0;
-                if (q == a) { for (int z = z0; z < z1; ++z) grad[a][j][z] += P.block<3, 1>(3 * (z - z0), kk); ++kk; }
                 if (gs) {
                     const FlatC u(b.V.col(r0).data(), active), ub(r.Rm.col(1).data(), active);
                     const double uu = u.dot(ub);
@@ -1172,16 +1205,24 @@ static void exact_adjoint_pair(const EnvironmentResult& env, const Kernel2D& D1,
                 }
             }
             tick(1);
-            #pragma omp barrier
+            if (Sx > 1) {
+                #pragma omp barrier
+            }
             // flush (every m rows): Vbar += W K^T on this sub-thread's block of columns
-            for (int role : my) {
+            for (int role = 0; role < 4; ++role) {
                 const int q = role & 1; AdjRole& r = R[role];
                 const int r0 = B[q]->rank_after[j - 1]; if (r0 == 0) continue;
+                const bool mine = std::find(my.begin(), my.end(), role) != my.end();
                 if (++nbl[role] == m) {
                     nbl[role] = 0;
+                    if (!mine) continue;
                     const int bA = bAl[role], bR = bRl[role];
-                    const int cA = static_cast<int>(static_cast<long>(bR) * sub / Sx), cB = static_cast<int>(static_cast<long>(bR) * (sub + 1) / Sx);
-                    if (cB > cA) r.Vbar.topRows(bA).middleCols(cA, cB - cA).noalias() += r.W.topRows(bA).leftCols(4 * m) * r.K.middleRows(cA, cB - cA).leftCols(4 * m).transpose();
+                    const int cA = CERowFilter::col_split(bR, sub, Sx), cB = CERowFilter::col_split(bR, sub + 1, Sx);
+                    // column chunks with their own row bound (Vbar column k is only ever read on the support of V column k)
+                    for (int c = cA; c < cB; c += 16) {
+                        const int w = std::min(16, cB - c), rows = std::min(bA, B[q]->col_len[c + w - 1]);
+                        r.Vbar.topRows(rows).middleCols(c, w).noalias() += r.W.topRows(rows).leftCols(4 * m) * r.K.middleRows(c, w).leftCols(4 * m).transpose();
+                    }
                 }
             }
             tick(3);
@@ -1199,8 +1240,10 @@ static void exact_adjoint_pair(const EnvironmentResult& env, const Kernel2D& D1,
                 }
             }
             tick(2);
+            for (int role = 0; role < 4; ++role) c0prev[role] = c0cur[role];
             #pragma omp barrier      // the row blocks of the recursion and of the next row's phase A differ
         }
+        for (int role : my) { const int a = role >> 1, q = role & 1; if (q != a) grad_pass(q, 1, c0prev[3 * q]); }
         if (prof) {
             #pragma omp critical
             std::fprintf(stderr, "adj thread %d: VtR %.2f  VM3 %.2f  recur %.2f  flush %.2f  phaseA %.2f ms\n", t, 1e3 * tacc[0], 1e3 * tacc[1], 1e3 * tacc[2], 1e3 * tacc[3], 1e3 * tacc[4]);

@@ -320,12 +320,32 @@ column a row needs in between read lazily from Vbar plus the pending block.
 Each product is one pass over the 600 KB basis (N=160) and is bound by that
 traffic, not by arithmetic, which is why the parallel roles pay off:
 per sweep and thread 0.5 ms (V^T), 0.3-0.65 ms (V), 0.6 ms (flush).
+**Triangular basis** (2026-08-25).  Column k of the projection basis is the
+residual of h at the row that added it, so it is nonzero only on its first
+3 (row + 1) entries; every pass over the basis (the march's dots and axpy's,
+the sweep's two products, the flush) now runs over that support only, with
+work-balanced thread splits (columns ~ sqrt, rows ~ 1 - sqrt).  Half the
+traffic: N=160 solve 65 -> 52 ms, N=320 0.40 -> 0.28 s, N=640 2.4 -> 1.4 s.
+The three intra-row barriers of the sub-thread split are skipped when a role
+runs on one thread (each barrier exposed the role imbalance separately):
+sweep 32 -> 24 ms per solve at N=160.  The gradient product of row j is
+computed one row later by the light role of the same basis from the stored
+coefficients V^T cbar, which balances the four roles (VM3 0.48/0.27 ->
+0.27/0.27 ms); the sweep is then bound by its own traffic, per thread and
+sweep 0.26 ms (V^T), 0.27 (V), 0.41 (flush), 0.16 (row setup): N=160 solve
+49 ms (march 17, sweep 24, rest 3.5 ms), N=320 0.27 s.
+Scaling between N = 80, 112, 160, 224 (forward x1.6, x2.0, x1.95 per x1.4 in
+N against a cubic x2.7) shows the march dominated by per-row fixed costs at
+these sizes, not by bandwidth, so packing the basis into its triangular
+support (which would let a role's working set fit L2) was not pursued;
+`OMP_PROC_BIND` / `OMP_WAIT_POLICY` / `GOMP_SPINCOUNT` change nothing or hurt.
 Above N ~ 320 each role is further split over S = threads/4 sub-threads
 (V^T Rm by basis column, V M3 and the row-local updates by row block, the
 flush by column of Vbar; five team barriers per row, which is why it does not
 pay at N=160; `LQG_ADJ_SUB` overrides S).
-Solve times, 8 threads: N=160 65-70 ms exact vs 48 ms with the recursion,
-N=320 0.40 vs 0.39 s, N=640 2.4 vs 1.9 s (3.4 s without the sub-threads),
+Solve times, 8 threads, before the triangular passes: N=160 65-70 ms exact vs
+48 ms with the recursion, N=320 0.40 vs 0.39 s, N=640 2.4 vs 1.9 s (3.4 s
+without the sub-threads),
 N=40 unchanged (was 107 ms at N=160 before the roles and the stored
 coefficients; the unbatched sweep 129 ms).  `LQG_PROF=1` prints the
 forward / adjoint / rest split of the kernel iteration, `LQG_ADJ_PROF=1` the
