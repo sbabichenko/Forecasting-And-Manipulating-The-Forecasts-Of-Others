@@ -35,7 +35,7 @@ Findings (2026-08-25, benchmark p = (3, 3), r = 0.1, T = 1, sigma = 1, variance 
 * Cost: 16x24 (768 unknowns) 14 s, 24x32 99 s on the RTX 5070, almost all of it the chunked
   Jacobian (60 batched jvp's of the map); Newton converges quadratically in 4-5 steps.
 
-Not done: mean part (bar system), asymmetric parameters, a penalty acting on high modes only
+Not done: asymmetric parameters, a penalty acting on high modes only
 (the smooth part would then be unbiased), Newton-Krylov instead of the dense Jacobian, and the
 relation to the discrete game's predictable control (the spectral solver solves the continuous
 game; the FD approximates its dt -> 0 limit).
@@ -49,3 +49,47 @@ in parallel.  At 16x24, m = 16, lambda = 1e-7 it reproduces the JAX result to ev
 -0.0585) in 90 s on 8 threads (the JAX/GPU version: 14 s); the cost is the FD Jacobian (720
 gradient evaluations per Newton step, ~24 s), so Newton-Krylov or a semi-analytic Hessian is the
 next step if the C++ path is the one to develop.
+
+Mean part (2026-08-27, C++ only).  Given the equilibrium kernels, the mean paths solve a deterministic
+LQ game with a Volterra feedback: player i chooses its mean control freely, the opponent reacts to the
+mean state through its kernel on raw observations, delta Dbar^j_t = sqrt(p_j) int_0^t g^j_t(u) Xbar_u du
+(the naive response, i.e. the information wedge acting on the mean).  Pontryagin gives
+Xbar' = Dbar^1 + Dbar^2, Dbar^i = lambda^i/(2 r_i),
+lambda^i'(u) = 2 (Xbar_u - b_i) - sqrt(p_j) int_u^T lambda^i_t g^j_t(u) dt, lambda^i(T) = 0,
+solved as one 3 Nt dense system on the Lobatto t-nodes (integration operators from the differentiation
+matrix with a boundary row; the Volterra kernel by Gauss quadrature in t with barycentric interpolation
+of g).  `--b1 --b2 --x0` set the targets and initial state, `--out-mean file` writes t, Xbar, Dbar1,
+Dbar2 and the closed-loop perfect-information Dbar1 (coupled Riccati + target ODE, RK4) on a uniform
+grid.  Benchmark p = (3, 3): Dbar1(0) = 8.8306 (12x16) against 8.805 from the first-order FD solver at
+N = 79; the perfect-information (feedback Nash) value is 4.647.  See mean_sweep results below.
+
+Precision sweep of the mean control (12x16, m = 12; 16x24 changes Dbar1(0) by 0.03%), r = 0.1, T = 1,
+b = (1, -1), x0 = 0, both players at precision p:
+
+    p        0.1    0.3    1      2      3      5      10     30     100    300    1000   3000
+    Dbar1(0) 9.937  9.819  9.477  9.110  8.831  8.419  7.798  6.826  5.981  5.459  5.116  4.983
+
+The limits are the two Nash concepts of the deterministic game.  p -> 0: the kernels scale like sqrt(p),
+the wedge vanishes, and Dbar1(0) -> 10.000, the OPEN-LOOP Nash path Dbar1_t = (T - t)/r (Xbar = 0 by
+symmetry, lambda' = -2 b_1), reached to 4 digits at p = 1e-3.  p -> infinity: Dbar1(0) -> 4.647, the
+CLOSED-LOOP (feedback) Nash of the perfect-information game (coupled Riccati + target ODE), approached
+like p^{-0.3}.  The partial-information mean control moves monotonically from the open-loop to the
+closed-loop value as the opponent's signal improves; this is the mean-path form of the separation
+failure of Chapter 1 (Figure 1.3).  Data and plot: mean_sweep_2026-08-27/.
+
+Pooled signals and the cost figure (2026-08-27).  `--pooled` puts both players on one common
+observation (noise channel 1 for both, precisions p1 = p2 = the pooled precision); the gradient check
+passes (rel. 1e-8) and the pooled (6,6) total cost 3.936 is within 0.5% of the FD Richardson value
+3.917.  `fig12_sweep.py` produces dissertation Figure 1.4 (private p = (3, p2) vs pooled p1 + p2,
+competitive (1,-1) and common (0,0) targets, total cost = variance part + mean part) on a log grid
+p2 = 0.1 .. 1000, ten per decade, 12x16 m = 12, ~10 s per p2; output data/fig12_costs_spectral.csv,
+which plot_figures.py prefers over the FD table when present.  All curves are monotone decreasing in
+p2 up to 1000; under the common target player 1's private cost meets the pooled cost at large p2
+(0.185 vs 0.183), under opposing targets it does not (3.17 vs 2.44).
+Note on the FD pipeline: generate_figures crashes for N >= ~65 with more than one thread (heap
+corruption in exact_adjoint_pair when the per-equilibrium parallel loop nests with the sweep's own
+parallel region; OMP_NUM_THREADS=1 works).  Not fixed.
+Figure 1.4 is now three panels: competitive (1,-1), hypercompetitive (5,-5), cooperative (0,0), all from the
+same sweep (data/fig12_costs_spectral_parts.csv holds the variance and mean parts; total at (k,-k) is
+Jvar + k^2 Jbar).  At (5,-5) pooling stops helping player 2 above p2 ~ 250 (-0.9 at p2 = 1000, player 1 +18);
+at (3,-3) the crossing is at p2 ~ 320; at (1,-1) there is none up to 1000.

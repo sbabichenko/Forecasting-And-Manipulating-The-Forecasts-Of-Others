@@ -1,0 +1,14 @@
+# precision sweep at 12x16 m=12 (Dbar1(0) converged to 0.03% vs 16x24)
+p=0.1 : J1 = 0.4937068  J2 = 0.4937068  (4.9s) mean: Dbar1(0) = 9.936882  Dbar1(T/2) = 4.981026  Dbar2(0) = -9.936882  Xbar(T/2) = -5.602e-14  Jbar1 = 4.295799  Jbar2 = 4.295799  | perfect-info (closed-loop) Dbar1(0) = 4.646924 
+p=0.3 : J1 = 0.4822249  J2 = 0.4822249  (3.6s) mean: Dbar1(0) = 9.819289  Dbar1(T/2) = 4.946398  Dbar2(0) = -9.819289  Xbar(T/2) = 1.011e-13  Jbar1 = 4.226900  Jbar2 = 4.226900  | perfect-info (closed-loop) Dbar1(0) = 4.646924 
+p=1 : J1 = 0.4505205  J2 = 0.4505205  (6.2s) mean: Dbar1(0) = 9.477083  Dbar1(T/2) = 4.850592  Dbar2(0) = -9.477083  Xbar(T/2) = 1.219e-14  Jbar1 = 4.033810  Jbar2 = 4.033810  | perfect-info (closed-loop) Dbar1(0) = 4.646924 
+p=2 : J1 = 0.4191532  J2 = 0.4191532  (4.9s) mean: Dbar1(0) = 9.110448  Dbar1(T/2) = 4.755045  Dbar2(0) = -9.110448  Xbar(T/2) = -2.243e-14  Jbar1 = 3.838622  Jbar2 = 3.838622  | perfect-info (closed-loop) Dbar1(0) = 4.646924 
+p=3 : J1 = 0.3968470  J2 = 0.3968470  (4.1s) mean: Dbar1(0) = 8.830569  Dbar1(T/2) = 4.686007  Dbar2(0) = -8.830569  Xbar(T/2) = -1.727e-13  Jbar1 = 3.697268  Jbar2 = 3.697268  | perfect-info (closed-loop) Dbar1(0) = 4.646924 
+p=5 : J1 = 0.3663727  J2 = 0.3663727  (6.4s) mean: Dbar1(0) = 8.419284  Dbar1(T/2) = 4.588664  Dbar2(0) = -8.419284  Xbar(T/2) = -3.107e-15  Jbar1 = 3.500681  Jbar2 = 3.500681  | perfect-info (closed-loop) Dbar1(0) = 4.646924 
+p=10 : J1 = 0.3248025  J2 = 0.3248025  (4.9s) mean: Dbar1(0) = 7.797607  Dbar1(T/2) = 4.444278  Dbar2(0) = -7.797607  Xbar(T/2) = -3.648e-14  Jbar1 = 3.226008  Jbar2 = 3.226008  | perfect-info (closed-loop) Dbar1(0) = 4.646924 
+p=30 : J1 = 0.2681611  J2 = 0.2681611  (7.2s) mean: Dbar1(0) = 6.825636  Dbar1(T/2) = 4.198764  Dbar2(0) = -6.825636  Xbar(T/2) = -6.008e-14  Jbar1 = 2.840296  Jbar2 = 2.840296  | perfect-info (closed-loop) Dbar1(0) = 4.646924 
+p=100 : J1 = 0.2244711  J2 = 0.2244711  (7.7s) mean: Dbar1(0) = 5.981174  Dbar1(T/2) = 3.937315  Dbar2(0) = -5.981174  Xbar(T/2) = -1.129e-14  Jbar1 = 2.537043  Jbar2 = 2.537043  | perfect-info (closed-loop) Dbar1(0) = 4.646924 
+p=300 : J1 = 0.1989781  J2 = 0.1989781  (7.2s) mean: Dbar1(0) = 5.459134  Dbar1(T/2) = 3.746880  Dbar2(0) = -5.459134  Xbar(T/2) = -1.049e-12  Jbar1 = 2.362095  Jbar2 = 2.362095  | perfect-info (closed-loop) Dbar1(0) = 4.646924 
+p=1000 : J1 = 0.1819964  J2 = 0.1819964  (10.8s) mean: Dbar1(0) = 5.116303  Dbar1(T/2) = 3.607183  Dbar2(0) = -5.116303  Xbar(T/2) = -4.234e-13  Jbar1 = 2.250005  Jbar2 = 2.250005  | perfect-info (closed-loop) Dbar1(0) = 4.646924 
+p=3000 : J1 = 0.1730404  J2 = 0.1730404  (12.8s) mean: Dbar1(0) = 4.982669  Dbar1(T/2) = 3.533304  Dbar2(0) = -4.982669  Xbar(T/2) = -7.644e-12  Jbar1 = 2.195634  Jbar2 = 2.195634  | perfect-info (closed-loop) Dbar1(0) = 4.646924 
+DONE

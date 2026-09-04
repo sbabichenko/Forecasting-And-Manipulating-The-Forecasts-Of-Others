@@ -181,6 +181,9 @@ int main(int argc, char** argv) {
     std::vector<int> p_values = {1, 2, 3, 5, 10};
     int p1_fixed = 3;
     std::vector<int> p2_values = {1, 2, 3, 5, 10, 20};
+    // Fig 12: dense p2 grid, 0.5 to 12 in steps of 0.25 (the solver is fast enough)
+    std::vector<double> p2_dense;
+    for (int k = 2; k <= 48; ++k) p2_dense.push_back(0.25 * k);
 
     // ============================================================
     // Pre-solve all unique equilibria in parallel
@@ -206,8 +209,9 @@ int main(int argc, char** argv) {
     // Fig 10/11: asymmetric p1=3, p2 varies
     for (int p2v : p2_values)
         add_spec(p1_fixed, p2v, Pi1(), 1, Pi2(), 2);
-    // Fig 12: pooled info
-    for (int p2v : p_values) {
+    // Fig 12: private (p1_fixed, p2) and pooled (p1_fixed + p2) on the dense grid
+    for (double p2v : p2_dense) {
+        add_spec(p1_fixed, p2v, Pi1(), 1, Pi2(), 2);
         double p_common = p1_fixed + p2v;
         add_spec(p_common, p_common, Pi1(), 1, Pi1(), 1);
     }
@@ -296,20 +300,34 @@ int main(int argc, char** argv) {
     // ============================================================
     std::cout << "Figure 8: Mean control vs precision ...\n";
 
-    // Perfect-info benchmark
-    std::array<double, N_MAX> S_pi;
-    S_pi.fill(0.0);
-    S_pi[g_n - 1] = g_terminal_weight;
-    for (int j = g_n - 2; j >= 0; --j)
-        S_pi[j] = S_pi[j + 1] + g_dt * (1.0 - (2.0 / RHO) * S_pi[j + 1] * S_pi[j + 1]);
+    // Perfect-info benchmark: closed-loop (feedback) Nash equilibrium of the two-player
+    // game with full observation, the same coupled Riccati + target ODE used for the
+    // full-information costs below.  Value V_i = S_i X^2 + Q_i X + c_i, control
+    // D_i = -(S_i/r_i) X - Q_i/(2 r_i).
+    //   -dS_i/dt = 1 - S_i^2/r_i - 2 S_i S_j/r_j,           S_i(T) = terminal weight
+    //    dQ_i/dt = 2 b_i + S_i Q_j/r_j + Q_i (S_i/r_i + S_j/r_j),   Q_i(T) = -2 w b_i
+    // (The earlier version used -dS/dt = 1 - 2 S^2/r with D = -(S/r)(X - b), which is the
+    //  open-loop Nash path and, with opposite targets, not the feedback equilibrium.)
+    std::array<double, N_MAX> S_pi1{}, S_pi2{}, Q_pi1{}, Q_pi2{};
+    S_pi1[g_n - 1] = g_terminal_weight;
+    S_pi2[g_n - 1] = g_terminal_weight;
+    Q_pi1[g_n - 1] = -2.0 * g_terminal_weight * B1_DEFAULT;
+    Q_pi2[g_n - 1] = -2.0 * g_terminal_weight * B2_DEFAULT;
+    for (int j = g_n - 2; j >= 0; --j) {
+        const double s1 = S_pi1[j + 1], s2 = S_pi2[j + 1], q1 = Q_pi1[j + 1], q2 = Q_pi2[j + 1];
+        S_pi1[j] = s1 + g_dt * (1.0 - s1 * s1 / RHO - 2.0 * s1 * s2 / RHO);
+        S_pi2[j] = s2 + g_dt * (1.0 - s2 * s2 / RHO - 2.0 * s1 * s2 / RHO);
+        Q_pi1[j] = q1 - g_dt * (2.0 * B1_DEFAULT + s1 * q2 / RHO + q1 * (s1 / RHO + s2 / RHO));
+        Q_pi2[j] = q2 - g_dt * (2.0 * B2_DEFAULT + s2 * q1 / RHO + q2 * (s2 / RHO + s1 / RHO));
+    }
 
     std::array<double, N_MAX> barD1_pi, barX_pi;
     barD1_pi.fill(0.0);
     barX_pi.fill(0.0);
     barX_pi[0] = g_x0;
     for (int j = 0; j < g_n; ++j) {
-        barD1_pi[j] = -(1.0 / RHO) * S_pi[j] * (barX_pi[j] - B1_DEFAULT);
-        double barD2_pi_j = -(1.0 / RHO) * S_pi[j] * (barX_pi[j] - B2_DEFAULT);
+        barD1_pi[j] = -(S_pi1[j] / RHO) * barX_pi[j] - Q_pi1[j] / (2.0 * RHO);
+        const double barD2_pi_j = -(S_pi2[j] / RHO) * barX_pi[j] - Q_pi2[j] / (2.0 * RHO);
         if (j < g_n - 1)
             barX_pi[j + 1] = barX_pi[j] + g_dt * (barD1_pi[j] + barD2_pi_j);
     }
@@ -462,7 +480,7 @@ int main(int argc, char** argv) {
             g_b1 = cfg.b1;
             g_b2 = cfg.b2;
 
-            for (int p2v : p_values) {
+            for (double p2v : p2_dense) {
                 // Private
                 std::cout << "    Private: p2=" << p2v << " ...\n";
                 auto& eq_a = find_eq(p1_fixed, p2v);

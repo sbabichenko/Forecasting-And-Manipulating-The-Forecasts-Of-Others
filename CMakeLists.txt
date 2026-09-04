@@ -97,6 +97,14 @@ if(OpenMP_CXX_FOUND)
     target_link_libraries(kb_spectral PRIVATE OpenMP::OpenMP_CXX)
 endif()
 
+
+add_executable(kb_spectral_blas kb_spectral.cpp)
+target_link_libraries(kb_spectral_blas PRIVATE Eigen3::Eigen openblas lapacke)
+target_compile_options(kb_spectral_blas PRIVATE -O3 -march=native -DNDEBUG -std=c++17 -DEIGEN_USE_BLAS -DEIGEN_USE_LAPACKE)
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(kb_spectral_blas PRIVATE OpenMP::OpenMP_CXX)
+endif()
+
 add_executable(kb_spectral_q kb_spectral_q.cpp)
 target_link_libraries(kb_spectral_q PRIVATE Eigen3::Eigen)
 target_compile_options(kb_spectral_q PRIVATE -O3 -march=native -DNDEBUG -std=c++17 -Wall -Wextra)

@@ -1,0 +1,228 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,mathtools}
+\usepackage{enumitem}
+\usepackage{microtype}
+
+\title{Two Neural Approaches to the Stationary Kyle--Back Lag System}
+\author{}
+\date{\today}
+
+\newcommand{\Dt}{\widetilde{\mathcal D}}
+\newcommand{\Vt}{\widetilde V}
+\newcommand{\calD}{\mathcal D}
+\newcommand{\dd}{\,d}
+
+\begin{document}
+\maketitle
+
+\section*{Purpose}
+
+There are two numerically different ways to use a neural network in the
+stationary Kyle--Back system.  They are easy to confuse because both are
+``PINN''-like, both work on stationary lags, and both use the same direct
+observation geometry.  The difference is where the transport and birth
+structure is enforced.
+
+The current full PINN asks the network to learn the observer-specific unresolved
+kernels
+\[
+  \Vt^a(\ell), \qquad \Dt^{\mathrm{tot},a}(\ell),
+\]
+the policy/readout kernels, and sometimes adjoints, then penalizes the filter,
+projection, and first-order-condition residuals.  The lag-reduced approach fixes
+the candidate policy/filter environment and learns only a few scalar residual
+readouts.  It reconstructs the two-lag noise-state response analytically from
+the stationary transport equation and its diagonal birth traces.
+
+\section*{Common observation geometry}
+
+Use primitive Brownian coordinates
+\[
+  W=(W^V,W^Z,W^{Y1},W^{Y2}).
+\]
+The market maker directly observes the public order-flow noise subspace
+\[
+  \Pi^0=E^{Z,\top}E^Z,
+\]
+while trader \(i\) directly observes order-flow noise plus their own private
+signal noise,
+\[
+  \Pi^1=E^{Z,\top}E^Z+E^{Y1,\top}E^{Y1},\qquad
+  \Pi^2=E^{Z,\top}E^Z+E^{Y2,\top}E^{Y2}.
+\]
+There is no direct birth term for the fundamental-value Brownian coordinate
+\(W^V\).  At zero lag, indirect old-history terms vanish; only the appropriate
+directly observed innovation row can appear through the birth trace.
+
+\section*{Approach A: full unresolved-kernel PINN}
+
+The full solver represents the unresolved kernels directly.  For observer
+\(a\), the order-flow and value residuals are written as
+\[
+  \Dt^{\mathrm{tot},a}_t(u)
+  =
+  \calD^{\mathrm{tot}}_t(u)(I-\Pi^a)
+  -
+  \int_{-\infty}^t
+    \calD^{\mathrm{tot}}_t(r)F^a_t(r,u)\dd r,
+\]
+\[
+  \Vt^a_t(u)
+  =
+  \Sigma_V^{1/2}E^V(I-\Pi^a)
+  -
+  \int_{-\infty}^t
+    \Sigma_V^{1/2}E^V F^a_t(r,u)\dd r .
+\]
+The normalized unresolved observation rows are then
+\[
+  \widetilde C^0(u)=\Sigma_Z^{-1/2}\Dt^{\mathrm{tot},0}(u),
+\]
+\[
+  \widetilde C^i(u)=
+  \begin{pmatrix}
+    \Sigma_Z^{-1/2}\Dt^{\mathrm{tot},i}(u)\\
+    \Sigma_{Y,i}^{-1/2}\Gamma_i\Vt^i(u)
+  \end{pmatrix}.
+\]
+The filter kernel \(F^a\) is built from these rows by the characteristic
+formula with side births:
+\[
+  F^a(\ell,m)
+  =
+  \mathbf 1_{\ell>m}\,\widetilde C^a(\ell-m)^\top E^a
+  +
+  \mathbf 1_{m>\ell}\,E^{a,\top}\widetilde C^a(m-\ell)
+  +
+  \int_0^{\min(\ell,m)}
+    \widetilde C^a(\ell-\tau)^\top
+    \widetilde C^a(m-\tau)\dd\tau .
+\]
+The network is penalized for failing the closure identities above, for failing
+projection identities such as \(P^a K=K\Pi^a+\int K F^a\), and, in the coupled
+version, for failing the weak stationary first-order condition.
+
+This formulation is closest to the chapter equations.  Its weakness is that a
+large neural network can satisfy collocation points while producing high
+frequency oscillations in weakly identified rows.  In particular, the
+transport/birth geometry is represented only through residual penalties, so
+endpoint leakage or insufficient randomization can produce spurious wiggles.
+
+\section*{Approach B: lag-reduced forward IRF PINN}
+
+The lag-reduced approach starts from a fixed candidate environment:
+policy kernels \(D^1,D^2\) and unresolved observation rows
+\[
+  c^0,\qquad c^{j,Z},\qquad c^{j,Y}.
+\]
+For a unit deviation/spike by trader \(i\), let \(j\neq i\).  The network does
+not learn a full two-lag kernel.  It learns only three scalar residual readouts
+as functions of future lag \(s\):
+\[
+  r_i(s)=\bigl(r_0(s),r_Z(s),r_Y(s)\bigr).
+\]
+These are the coefficients feeding the market-maker order-flow residual row,
+the opponent's order-flow row, and the opponent's private-signal row.
+
+Given \(r_i\), the old-history density for future lag \(s\) and age \(a\) is
+constructed explicitly.  Schematically,
+\[
+\begin{aligned}
+U_0(s,a)
+={}&
+\mathbf 1_{a\ge s}\,\frac{c^0(a-s)}{\sigma_Z}
++
+\mathbf 1_{a<s}\,r_0(s-a)E^Z\\
+&+
+\int_{\max(0,s-a)}^s
+  r_0(u)c^0(a-s+u)\dd u ,
+\end{aligned}
+\]
+and for the opponent observer,
+\[
+\begin{aligned}
+U_j(s,a)
+={}&
+\mathbf 1_{a\ge s}\,\frac{c^{j,Z}(a-s)}{\sigma_Z}
++
+\mathbf 1_{a<s}
+  \{r_Z(s-a)E^Z+r_Y(s-a)\sigma_{Y,j}E^{Yj}\}\\
+&+
+\int_{\max(0,s-a)}^s
+  \{r_Z(u)c^{j,Z}(a-s+u)
+    +r_Y(u)c^{j,Y}(a-s+u)\}\dd u .
+\end{aligned}
+\]
+The diagonal atom is also reconstructed from the same residuals, for example
+\[
+ A_0(s)
+ =
+ \frac{E^Z}{\sigma_Z}
+ +
+ \int_0^s r_0(u)c^0(s-u)\dd u,
+\]
+\[
+ A_j(s)
+ =
+ \frac{E^Z}{\sigma_Z}
+ +
+ \int_0^s
+ \{r_Z(u)c^{j,Z}(s-u)+r_Y(u)c^{j,Y}(s-u)\}\dd u .
+\]
+The zero-lag structure is therefore hard coded: there is no value-noise birth,
+trader 1 never receives a \(Y2\) birth, and trader 2 never receives a \(Y1\)
+birth.
+
+The loss then asks the learned residual readout to be self-consistent.  If
+\(\Delta D_j(s)\) is the induced opponent-demand response,
+\[
+  \Delta D_j(s)
+  =
+  \int U_j(s,a)\cdot D^j(a)\dd a
+  +
+  A_j(s)\cdot D^j(s),
+\]
+and the self projections from the market-maker and opponent observation rows
+are
+\[
+  S_0(s)=
+  \int U_0(s,a)\cdot c^0(a)\dd a + A_0(s)\cdot c^0(s),
+\]
+\[
+  S_Z(s)=
+  \int U_j(s,a)\cdot c^{j,Z}(a)\dd a + A_j(s)\cdot c^{j,Z}(s),
+\]
+\[
+  S_Y(s)=
+  \int U_j(s,a)\cdot c^{j,Y}(a)\dd a + A_j(s)\cdot c^{j,Y}(s),
+\]
+then the target residual is
+\[
+  r_0(s)=\frac{\Delta D_j(s)}{\sigma_Z}-S_0(s),\qquad
+  r_Z(s)=\frac{\Delta D_j(s)}{\sigma_Z}-S_Z(s),\qquad
+  r_Y(s)=-S_Y(s).
+\]
+
+\section*{Practical consequences}
+
+\begin{itemize}[leftmargin=*]
+\item The full unresolved-kernel PINN is a candidate equilibrium solver.  It can
+move filters, policies, and adjoints together, but it is high-dimensional and
+more vulnerable to oscillatory weak solutions.
+\item The lag-reduced PINN is a forward IRF solver for a fixed environment.  It
+is lower-dimensional and enforces the transport and birth equations by
+construction, so it should be much less prone to artificial two-lag
+oscillation.
+\item The lag-reduced solver is not, by itself, a complete equilibrium solver.
+To turn it into one, it should be embedded in an outer loop that updates the
+candidate policy/filter environment and retrains or resolves the residual
+readouts.
+\item For the current debugging problem, the lag-reduced version is the cleaner
+diagnostic.  If it still oscillates, the issue is probably in the candidate
+equations or readout target.  If it does not oscillate while the full PINN does,
+the issue is likely representation/identification in the full unresolved-kernel
+network.
+\end{itemize}
+
+\end{document}

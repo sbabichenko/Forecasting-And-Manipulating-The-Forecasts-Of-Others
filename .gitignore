@@ -1,7 +1,19 @@
 build/
 data/
+.venv/
 __pycache__/
 *.pyc
 solver.js
 solver.wasm
 test_ce_picard
+# local run outputs and binaries (2026-09-03 cleanup)
+data_N*/
+interactive_picard.html
+spectral_ch1/spec_ch1
+spectral_ch1/*.log
+*.bak_prepool
+main.pdf
+*_preview_v*.pdf
+*_memo.pdf
+kyle_back_pinn_approaches.pdf
+pinn_stationary_lag_system.pdf

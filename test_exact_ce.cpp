@@ -186,6 +186,38 @@ static void test_convergence(double gain) {
     std::printf("\n");
 }
 
+static bool test_initial_control_boundary() {
+    std::printf("--- Initial observation-noise control boundary ---\n");
+    SolverContext run_ctx = SolverContext::capture_current();
+    run_ctx.n = 24;
+    run_ctx.T = 1.0;
+    run_ctx.b1 = B1_DEFAULT;
+    run_ctx.b2 = B2_DEFAULT;
+    run_ctx.r1 = RHO;
+    run_ctx.r2 = RHO;
+    run_ctx.sigma = 1.0;
+    ScopedSolverContext guard(run_ctx);
+
+    auto check = [](const char* label, const EquilibriumResult& eq) {
+        double max_p1 = 0.0, max_p2 = 0.0;
+        for (int j = 0; j < g_n; ++j) {
+            max_p1 = std::max(max_p1, std::abs(eq.calD1[j][0](1)));
+            max_p2 = std::max(max_p2, std::abs(eq.calD2[j][0](2)));
+        }
+        double row0 = std::max(eq.calD1[0][0].norm(), eq.calD2[0][0].norm());
+        bool ok = max_p1 < 1e-14 && max_p2 < 1e-14 && row0 < 1e-14;
+        std::printf("  %s: max |calD1(t,0)[W1]|=%.2e, max |calD2(t,0)[W2]|=%.2e, row0=%.2e %s\n",
+                    label, max_p1, max_p2, row0, ok ? "OK" : "FAIL");
+        return ok;
+    };
+
+    bool pass = true;
+    pass = check("standard", solve_equilibrium(3.0, 2.0, false)) && pass;
+    pass = check("CE", solve_equilibrium_ce(3.0, 2.0, false)) && pass;
+    std::printf("\n");
+    return pass;
+}
+
 int main() {
     int passed = 0, total = 0;
 
@@ -204,6 +236,9 @@ int main() {
 
     // Test 3: Convergence
     test_convergence(3.0);
+
+    ++total;
+    if (test_initial_control_boundary()) ++passed;
 
     std::printf("=== %d / %d tests passed ===\n", passed, total);
     return (passed == total) ? 0 : 1;

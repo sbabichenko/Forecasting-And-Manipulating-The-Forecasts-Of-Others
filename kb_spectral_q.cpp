@@ -942,7 +942,7 @@ int main(int argc, char* argv[]) {
     std::vector<VectorXd> gam;
     { std::string s = argv[6]; size_t p = 0; while (p <= s.size()) { size_t e = s.find(';', p); if (e == std::string::npos) e = s.size(); auto v = parse_list(s.substr(p, e - p)); VectorXd g(q); for (int k = 0; k < q; ++k) g[k] = v.size() == 1 ? v[0] : v[k]; gam.push_back(g); p = e + 1; } }
     MatrixXd SV = MatrixXd::Identity(q, q), SZ = MatrixXd::Identity(q, q);
-    double tol = 1e-10, split_b = 0.0, map_alpha = 0.0; int uniform = 0, coarse = 0, n1 = 0; bool verbose = false, eval_only = false, adaptive = true, tangent = true, use_jfnk = true, use_analytic = true, check_jac = false, exact_nt = true, range_nt = false, lagged_nt = true; int gm_max = 12, lag_its = 8, pre_steps = 60, chunk_sz = 48; double min_ratio = 0.25; int pvar = 0; bool quad_pred = false; bool no_batch = true; double gm_tol = 1e-3; std::vector<double> path; std::string init_file;
+    double tol = 1e-10, split_b = 0.0, map_alpha = 0.0; int uniform = 0, coarse = 0, n1 = 0; bool verbose = false, eval_only = false, adaptive = true, tangent = true, use_jfnk = true, use_analytic = true, check_jac = false, exact_nt = true, range_nt = false, lagged_nt = true; int gm_max = 12, lag_its = 8, pre_steps = 60, chunk_sz = 48; double min_ratio = 0.25; int pvar = 0; bool quad_pred = false; bool no_batch = true; double gm_tol = 1e-3; std::vector<double> path; std::string init_file; std::string dump_jac;
     for (int i = 7; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--sigma-v") && i + 1 < argc) { auto v = parse_list(argv[++i]); for (int r = 0; r < q; ++r) for (int c = 0; c < q; ++c) SV(r, c) = v[r * q + c]; }
         else if (!std::strcmp(argv[i], "--sigma-z") && i + 1 < argc) { auto v = parse_list(argv[++i]); for (int r = 0; r < q; ++r) for (int c = 0; c < q; ++c) SZ(r, c) = v[r * q + c]; }
@@ -977,6 +977,7 @@ int main(int argc, char* argv[]) {
         else if (!std::strcmp(argv[i], "--quad")) quad_pred = true;
         else if (!std::strcmp(argv[i], "--no-quad")) quad_pred = false;
         else if (!std::strcmp(argv[i], "--init") && i + 1 < argc) init_file = argv[++i];
+        else if (!std::strcmp(argv[i], "--dump-jacobian") && i + 1 < argc) dump_jac = argv[++i];
         else if (!std::strcmp(argv[i], "--threads") && i + 1 < argc) {
 #ifdef _OPENMP
             omp_set_num_threads(std::atoi(argv[++i])); threads_set = true;
@@ -1113,6 +1114,14 @@ int main(int argc, char* argv[]) {
     const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     S.release();                                                              // drop the stored Jacobian before the certificate
     Model::Diag dg; dg.want_cert = true; const std::vector<MatrixXd> cs = M.unpack(z); M.residual(z, &dg);
+    if (!dump_jac.empty()) {   // exact Jacobian of Phi at the converged profile (without the -I), column-major doubles after an int64 dimension
+        const Model::LinBase LB = M.linbase(dg); const int n = M.dim() * M.NT, chunk = 48; MatrixXd J(n, n);
+        const int nchunks = (n + chunk - 1) / chunk;
+#pragma omp parallel for schedule(dynamic)
+        for (int cidx = 0; cidx < nchunks; ++cidx) { const int c0 = cidx * chunk, nc = std::min(chunk, n - c0); MatrixXd D = MatrixXd::Zero(n, nc); for (int c = 0; c < nc; ++c) D(c0 + c, c) = 1.0; J.block(0, c0, n, nc) = M.dphi_batch(dg, LB, D); }
+        std::FILE* jf = std::fopen(dump_jac.c_str(), "wb"); const long long nn = n; std::fwrite(&nn, sizeof nn, 1, jf); std::fwrite(J.data(), sizeof(double), static_cast<size_t>(n) * n, jf); std::fclose(jf);
+        std::fprintf(stderr, "dumped %d x %d Jacobian of Phi to %s\n", n, n, dump_jac.c_str());
+    }
     std::printf("{\"converged\":%s,\"residual\":%.3e,\"map_alpha\":%.15g,\"split_b\":%.15g,\"N1\":%d,\"N\":%d,\"L\":%.15g,\"eps\":%.15g,\"rho\":%.15g,\"q\":%d,\"NT\":%d,\"NC\":%d,\"seconds\":%.3f,\"evaluations\":%ld,\"gmres_iterations\":%ld,",
                 o.ok ? "true" : "false", o.resid, map_alpha, split_b, n1, N, L, M.eps, rho, q, M.NT, M.NC, secs, S.evals, S.gmres_its);
     std::printf("\"lambda\":"); print_mat(dg.lam); std::printf(",");

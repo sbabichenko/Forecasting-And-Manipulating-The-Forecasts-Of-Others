@@ -161,19 +161,19 @@ df = pd.read_csv(f'{DATA_DIR}/fig8_barD1.csv')
 p_values = [1, 2, 3, 5, 10]
 
 fig, ax = plt.subplots(1, 1, figsize=(8, 5))
-cmap_p = cm.plasma
-norm_p = Normalize(vmin=min(p_values), vmax=max(p_values))
+# distinct, print-safe colours: viridis with the pale yellow end removed
+cols_p = cm.viridis(np.linspace(0.05, 0.8, len(p_values)))
 
-for p in p_values:
-    color = cmap_p(norm_p(p))
-    ax.plot(df['t'], df[f'p{p}'], lw=2, color=color, label=f'$p={p}$')
+for p, color in zip(p_values, cols_p):
+    ax.plot(df['t'], df[f'p{p}'], lw=2.2, color=color, label=f'$p={p}$')
+    ax.text(-0.012, df[f'p{p}'].iloc[0], f'{p}', ha='right', va='center', fontsize=9, color=color)
 
-ax.plot(df['t'], df['perfect_info'], lw=2, ls='--', color='gray', alpha=0.7, label='Perfect info')
+ax.plot(df['t'], df['perfect_info'], lw=2.4, ls='--', color='black', label='perfect information')
 ax.set_xlabel(r'$t$')
-ax.set_ylabel(r'$\bar{D}^1(t)$')
-ax.set_title(r'Player 1 mean control path $\bar{D}^1(t)$ vs perfect info (color $= p$)')
-ax.legend(loc='upper right')
-ax.grid(alpha=0.3)
+ax.set_ylabel(r'$\bar{D}^1_t$')
+ax.set_xlim(-0.03, 1.0)
+ax.legend(loc='upper right', frameon=False)
+ax.grid(alpha=0.25)
 fig.tight_layout()
 fig.savefig(f'{FIGDIR}/fig8_barD1_vs_p.pdf')
 plt.close(fig)
@@ -265,7 +265,7 @@ for p2v in p2_values:
     effort = np.abs(df.loc[mask, 'barD1'].values) + np.abs(df.loc[mask, 'barD2'].values)
     ax.plot(df.loc[mask, 't'], effort, color=c, lw=1.8)
 effort_pi = 2 * np.abs(df_pi['barD1_pi'].values)
-ax.plot(df_pi['t'], effort_pi, lw=1.5, ls='--', color='gray', alpha=0.7, label='Perfect info')
+ax.plot(df_pi['t'], effort_pi, lw=1.8, ls='--', color='black', label='perfect information')
 ax.set_xlabel(r'$t$'); ax.set_ylabel(r'$|\bar{D}^1|+|\bar{D}^2|$')
 ax.set_title('Aggregate mean effort')
 ax.legend(fontsize=9)
@@ -360,27 +360,27 @@ plt.close(fig)
 # FIGURE 12: Player costs — private vs pooled
 # ============================================================
 print("Figure 12: Player costs, private vs pooled ...")
-df = pd.read_csv(f'{DATA_DIR}/fig12_costs.csv')
-
-configs = [
-    ('competitive', r'Competitive ($\theta=\pm 1$)'),
-    ('cooperative', r'Cooperative ($\theta=0,0$)'),
-]
-
-fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-for ax, (cfg_key, label) in zip(axes, configs):
-    sub = df[df['config'] == cfg_key].sort_values('p2')
-    ax.plot(sub['p2'], sub['J1_priv'], 'o--', lw=2, ms=7, color='C0', label=r'$J^1$ private')
-    ax.plot(sub['p2'], sub['J1_pool'], 's-', lw=2, ms=7, color='C0', alpha=0.7, label=r'$J^1$ pooled')
-    ax.plot(sub['p2'], sub['J2_priv'], 'o--', lw=2, ms=7, color='C3', label=r'$J^2$ private')
-    ax.plot(sub['p2'], sub['J2_pool'], 's-', lw=2, ms=7, color='C3', alpha=0.7, label=r'$J^2$ pooled')
+# Spectral-solver sweep (spectral_ch1/fig12_sweep.py): variance and mean parts at theta = (1, -1);
+# the total at theta = (k, -k) is Jvar + k^2 Jbar, and the common target (0, 0) has no mean part.
+dp = pd.read_csv(f'{DATA_DIR}/fig12_costs_spectral_parts.csv').sort_values('p2')
+panels = [(1, r'Competitive ($\theta=\pm 1$)'), (5, r'Hypercompetitive ($\theta=\pm 5$)'), (0, r'Cooperative ($\theta=0,0$)')]
+fig, axes = plt.subplots(1, 3, figsize=(15, 4.6))
+for ax, (k, label) in zip(axes, panels):
+    J1p = dp['Jvar1_priv'] + k * k * dp['Jbar1_priv']
+    J2p = dp['Jvar2_priv'] + k * k * dp['Jbar2_priv']
+    Jpool = dp['Jvar_pool'] + k * k * dp['Jbar_pool']
+    ax.plot(dp['p2'], J1p, '--', lw=2, color='C0', label=r'$J^1$ private')
+    ax.plot(dp['p2'], J2p, '--', lw=2, color='C3', label=r'$J^2$ private')
+    ax.plot(dp['p2'], Jpool, '-', lw=2, color='0.3', label=r'$J^1=J^2$ pooled')
+    ax.axvline(3, color='0.6', lw=0.8, ls=':')
+    ax.set_xscale('log')
     ax.set_xlabel(r'$p_2$', fontsize=13)
     ax.set_ylabel(r'Cost', fontsize=13)
     ax.set_title(label, fontsize=12)
     ax.legend(fontsize=9)
     ax.grid(alpha=0.3)
 
-fig.suptitle(r'Equilibrium costs: private vs pooled ($p_1=3$, $r=0.1$)', fontsize=14, y=1.01)
+fig.suptitle(r'Equilibrium costs: private vs pooled ($p_1=3$, $r=0.1$, spectral solution)', fontsize=14, y=1.01)
 fig.tight_layout()
 fig.savefig(f'{FIGDIR}/fig12_costs_private_vs_pooled.pdf')
 plt.close(fig)

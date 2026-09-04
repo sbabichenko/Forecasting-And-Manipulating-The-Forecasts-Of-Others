@@ -1,22 +1,34 @@
 // CLI tool for the interactive Dash app.
 //
 // Modes:
-//   solve_interactive single <p1> <p2> <b1> <b2>
+//   solve_interactive single <p1> <p2> <b1> <b2> <r1> <r2> [qT] [--ce] [--N <N>] [--T <T>]
 //     → JSON with kernels, bar solution, wedges, costs for one (p1, p2)
 //
-//   solve_interactive sweep <p1> <b1> <b2> <p2_0> <p2_1> ... <p2_n>
+//   solve_interactive sweep <p1> <b1> <b2> <r1> <r2> [--qT <qT>] [--ce] [--N <N>] [--T <T>] <p2_0> ...
 //     → JSON array: for each p2, private and pooled costs + barD1 curves
+//
+//   solve_interactive check <p1> <p2> <r1> <r2> <qT> [--ce] [--N <N>] [--T <T>]
+//     → compact JSON convergence diagnostic for parameter sweeps
 
 #include "lqg_solver.h"
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 
 static void print_array(const char* name, const double* arr, int n) {
     printf("\"%s\":[", name);
     for (int i = 0; i < n; ++i)
         printf("%s%.12g", i ? "," : "", arr[i]);
     printf("]");
+}
+
+static void print_val(double v) {
+    if (std::isfinite(v))
+        printf("%.12g", v);
+    else
+        printf("null");
 }
 
 static void print_kernel2d(const char* name, const Kernel2D& K) {
@@ -40,6 +52,33 @@ static void print_kernel2d(const char* name, const Kernel2D& K) {
     printf("}");
 }
 
+static double final_residual(const std::vector<double>& residuals) {
+    return residuals.empty() ? std::numeric_limits<double>::quiet_NaN() : residuals.back();
+}
+
+static bool residual_converged(const std::vector<double>& residuals) {
+    double r = final_residual(residuals);
+    return std::isfinite(r) && r < PICARD_TOL;
+}
+
+static int parse_optional_flags(int argc, char* argv[], int start,
+                                bool& use_ce, int& n, double& T) {
+    int consumed = 0;
+    for (int i = start; i < argc; ++i) {
+        if (strcmp(argv[i], "--ce") == 0) {
+            use_ce = true;
+            ++consumed;
+        } else if (strcmp(argv[i], "--N") == 0 && i + 1 < argc) {
+            n = atoi(argv[++i]);
+            consumed += 2;
+        } else if (strcmp(argv[i], "--T") == 0 && i + 1 < argc) {
+            T = atof(argv[++i]);
+            consumed += 2;
+        }
+    }
+    return consumed;
+}
+
 // Perfect-info Riccati solution (depends on b1, b2 for the bar dynamics)
 static void compute_perfect_info(double b1, double b2,
                                   std::array<double, N_MAX>& barD1_pi,
@@ -47,7 +86,7 @@ static void compute_perfect_info(double b1, double b2,
                                   std::array<double, N_MAX>& barX_pi) {
     std::array<double, N_MAX> S_pi;
     S_pi.fill(0.0);
-    S_pi[g_n - 1] = TERMINAL_STATE_WEIGHT;
+    S_pi[g_n - 1] = g_terminal_weight;
     for (int j = g_n - 2; j >= 0; --j)
         S_pi[j] = S_pi[j + 1] + g_dt * (1.0 - (1.0 / g_r1 + 1.0 / g_r2) * S_pi[j + 1] * S_pi[j + 1]);
 
@@ -62,40 +101,60 @@ static void compute_perfect_info(double b1, double b2,
 
 static int run_single(int argc, char* argv[]) {
     if (argc < 8) {
-        fprintf(stderr, "Usage: %s single <p1> <p2> <b1> <b2> <r1> <r2>\n", argv[0]);
+        fprintf(stderr, "Usage: %s single <p1> <p2> <b1> <b2> <r1> <r2> [qT] [--ce] [--N <N>] [--T <T>]\n", argv[0]);
         return 1;
     }
-    double p1 = atof(argv[2]), p2 = atof(argv[3]);
+    double p1_prec = atof(argv[2]), p2_prec = atof(argv[3]);
+    double obs_gain1 = std::sqrt(p1_prec), obs_gain2 = std::sqrt(p2_prec);
     double b1 = atof(argv[4]), b2 = atof(argv[5]);
     double r1 = atof(argv[6]), r2 = atof(argv[7]);
+    double qT = 0.0;
+    bool use_ce = false;
+    int n = g_n;
+    double T = g_T;
+    for (int i = 8; i < argc; ++i) {
+        if (strcmp(argv[i], "--ce") == 0)
+            use_ce = true;
+        else if (strcmp(argv[i], "--N") == 0 && i + 1 < argc)
+            n = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--T") == 0 && i + 1 < argc)
+            T = atof(argv[++i]);
+        else
+            qT = atof(argv[i]);
+    }
     SolverContext run_ctx = SolverContext::capture_current();
+    run_ctx.n = n;
+    run_ctx.T = T;
     run_ctx.b1 = b1;
     run_ctx.b2 = b2;
     run_ctx.r1 = r1;
     run_ctx.r2 = r2;
+    run_ctx.terminal_weight = qT;
     ScopedSolverContext guard(run_ctx);
 
-    auto eq = solve_equilibrium(p1, p2, false);
+    auto eq = use_ce ? solve_equilibrium_ce(obs_gain1, obs_gain2, false)
+                     : solve_equilibrium(obs_gain1, obs_gain2, false);
     auto bar = solve_bar_equilibrium(eq.env, eq.D1, eq.D2,
-                                      p1*p1, p2*p2, 2000, 0.08, 1e-10);
+                                      p1_prec, p2_prec, 2000, 0.08, 1e-10);
     auto costs = compute_costs_general(eq.env, eq.calD1, eq.calD2, bar, r1, r2, b1, b2);
 
     // Wedges
-    auto prec1_arr = make_constant_prec(p1 * p1);
-    auto prec2_arr = make_constant_prec(p2 * p2);
+    auto prec1_arr = make_constant_prec(p1_prec);
+    auto prec2_arr = make_constant_prec(p2_prec);
     auto bba1 = backward_bar_adjoints(eq.env.X, eq.env.Xtilde2, eq.D2,
-                                       bar.barX, b1, prec2_arr, 0.0);
+                                       bar.barX, b1, prec2_arr,
+                                       eq.env.obs_gain2, eq.env.obs_idx2, g_terminal_weight);
     auto bba2 = backward_bar_adjoints(eq.env.X, eq.env.Xtilde1, eq.D1,
-                                       bar.barX, b2, prec1_arr, 0.0);
+                                       bar.barX, b2, prec1_arr,
+                                       eq.env.obs_gain1, eq.env.obs_idx1, g_terminal_weight);
     std::array<double, N_MAX> V1_arr, V2_arr;
     for (int j = 0; j < g_n; ++j) {
-        double V1 = 0.0, V2 = 0.0;
-        for (int z = 0; z <= j; ++z) {
-            V1 += eq.env.Xtilde2[j][z].dot(bba1.barHk[j][z]);
-            V2 += eq.env.Xtilde1[j][z].dot(bba2.barHk[j][z]);
-        }
-        V1_arr[j] = V1 * p2 * p2 * g_dt;
-        V2_arr[j] = V2 * p1 * p1 * g_dt;
+        V1_arr[j] = mean_information_wedge_at(
+            eq.env.Xtilde2, bba1.barHk, prec2_arr,
+            eq.env.obs_gain2, eq.env.obs_idx2, j);
+        V2_arr[j] = mean_information_wedge_at(
+            eq.env.Xtilde1, bba2.barHk, prec1_arr,
+            eq.env.obs_gain1, eq.env.obs_idx1, j);
     }
 
     std::array<double, N_MAX> barD1_pi, barD2_pi, barX_pi;
@@ -131,30 +190,121 @@ static int run_single(int argc, char* argv[]) {
     printf(","); print_array("barX_pi", barX_pi.data(), g_n);
 
     printf(",\"J1\":%.12g,\"J2\":%.12g", costs.J1, costs.J2);
-    printf(",\"p1\":%.12g,\"p2\":%.12g,\"b1\":%.12g,\"b2\":%.12g", p1, p2, b1, b2);
+    printf(",\"p1\":%.12g,\"p2\":%.12g,\"b1\":%.12g,\"b2\":%.12g",
+           p1_prec, p2_prec, b1, b2);
+    printf(",\"r1\":%.12g,\"r2\":%.12g,\"N\":%d,\"T\":%.12g",
+           r1, r2, g_n, g_T);
+    printf(",\"obs_gain1\":%.12g,\"obs_gain2\":%.12g", obs_gain1, obs_gain2);
+    printf(",\"terminal_weight\":%.12g", g_terminal_weight);
+    printf(",\"ce_mode\":%s", use_ce ? "true" : "false");
     printf("}\n");
+    return 0;
+}
+
+static int run_check(int argc, char* argv[]) {
+    if (argc < 7) {
+        fprintf(stderr, "Usage: %s check <p1> <p2> <r1> <r2> <qT> [--ce] [--N <N>] [--T <T>]\n", argv[0]);
+        return 1;
+    }
+    double p1_prec = atof(argv[2]), p2_prec = atof(argv[3]);
+    double r1 = atof(argv[4]), r2 = atof(argv[5]);
+    double qT = atof(argv[6]);
+    bool use_ce = false;
+    int n = g_n;
+    double T = g_T;
+    parse_optional_flags(argc, argv, 7, use_ce, n, T);
+
+    SolverContext run_ctx = SolverContext::capture_current();
+    run_ctx.n = n;
+    run_ctx.T = T;
+    run_ctx.b1 = B1_DEFAULT;
+    run_ctx.b2 = B2_DEFAULT;
+    run_ctx.r1 = r1;
+    run_ctx.r2 = r2;
+    run_ctx.terminal_weight = qT;
+    ScopedSolverContext guard(run_ctx);
+
+    double obs_gain1 = std::sqrt(p1_prec), obs_gain2 = std::sqrt(p2_prec);
+    auto eq = use_ce ? solve_equilibrium_ce(obs_gain1, obs_gain2, false)
+                     : solve_equilibrium(obs_gain1, obs_gain2, false);
+    const double final = final_residual(eq.residuals);
+    const bool eq_ok = residual_converged(eq.residuals);
+
+    double bar_res = std::numeric_limits<double>::quiet_NaN();
+    double J1 = std::numeric_limits<double>::quiet_NaN();
+    double J2 = std::numeric_limits<double>::quiet_NaN();
+    bool bar_ok = false;
+    bool costs_ok = false;
+    if (eq_ok) {
+        auto bar = solve_bar_equilibrium(eq.env, eq.D1, eq.D2,
+                                          p1_prec, p2_prec, 2000, 0.08, 1e-10);
+        bar_res = bar.bar_residual;
+        bar_ok = std::isfinite(bar_res) && bar_res < 1e-8;
+        auto costs = compute_costs_general(eq.env, eq.calD1, eq.calD2,
+                                           bar, r1, r2, B1_DEFAULT, B2_DEFAULT);
+        J1 = costs.J1;
+        J2 = costs.J2;
+        costs_ok = std::isfinite(J1) && std::isfinite(J2);
+    }
+
+    printf("{\"p1\":%.12g,\"p2\":%.12g,\"r1\":%.12g,\"r2\":%.12g,\"qT\":%.12g,\"N\":%d,\"T\":%.12g",
+           p1_prec, p2_prec, r1, r2, qT, g_n, g_T);
+    printf(",\"ce_mode\":%s,\"n_iters\":%zu,\"final_residual\":", use_ce ? "true" : "false", eq.residuals.size());
+    print_val(final);
+    printf(",\"eq_converged\":%s,\"bar_residual\":", eq_ok ? "true" : "false");
+    print_val(bar_res);
+    printf(",\"bar_converged\":%s,\"J1\":", bar_ok ? "true" : "false");
+    print_val(J1);
+    printf(",\"J2\":");
+    print_val(J2);
+    printf(",\"costs_finite\":%s,\"ok\":%s}\n",
+           costs_ok ? "true" : "false",
+           (eq_ok && bar_ok && costs_ok) ? "true" : "false");
     return 0;
 }
 
 static int run_sweep(int argc, char* argv[]) {
     if (argc < 8) {
-        fprintf(stderr, "Usage: %s sweep <p1> <b1> <b2> <r1> <r2> <p2_0> [p2_1 ...]\n", argv[0]);
+        fprintf(stderr, "Usage: %s sweep <p1> <b1> <b2> <r1> <r2> [--qT <qT>] [--ce] [--N <N>] [--T <T>] <p2_0> [p2_1 ...]\n", argv[0]);
         return 1;
     }
-    double p1 = atof(argv[2]);
+    double p1_prec = atof(argv[2]);
+    double obs_gain1 = std::sqrt(p1_prec);
     double b1 = atof(argv[3]), b2 = atof(argv[4]);
     double r1 = atof(argv[5]), r2 = atof(argv[6]);
+    double qT = 0.0;
+    bool use_ce = false;
+    int n = g_n;
+    double T = g_T;
+    std::vector<double> p2_vals;
+    for (int i = 7; i < argc; ++i) {
+        if (strcmp(argv[i], "--qT") == 0 && i + 1 < argc) {
+            qT = atof(argv[++i]);
+        } else if (strcmp(argv[i], "--ce") == 0) {
+            use_ce = true;
+        } else if (strcmp(argv[i], "--N") == 0 && i + 1 < argc) {
+            n = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--T") == 0 && i + 1 < argc) {
+            T = atof(argv[++i]);
+        } else {
+            p2_vals.push_back(atof(argv[i]));
+        }
+    }
+    if (p2_vals.empty()) {
+        fprintf(stderr, "Usage: %s sweep <p1> <b1> <b2> <r1> <r2> [--qT <qT>] [--ce] [--N <N>] [--T <T>] <p2_0> [p2_1 ...]\n", argv[0]);
+        return 1;
+    }
     SolverContext run_ctx = SolverContext::capture_current();
+    run_ctx.n = n;
+    run_ctx.T = T;
     run_ctx.b1 = b1;
     run_ctx.b2 = b2;
     run_ctx.r1 = r1;
     run_ctx.r2 = r2;
+    run_ctx.terminal_weight = qT;
     ScopedSolverContext guard(run_ctx);
 
-    int n_p2 = argc - 7;
-    std::vector<double> p2_vals(n_p2);
-    for (int i = 0; i < n_p2; ++i)
-        p2_vals[i] = atof(argv[7 + i]);
+    int n_p2 = static_cast<int>(p2_vals.size());
 
     std::array<double, N_MAX> barD1_pi, barD2_pi, barX_pi;
     compute_perfect_info(b1, b2, barD1_pi, barD2_pi, barX_pi);
@@ -164,18 +314,24 @@ static int run_sweep(int argc, char* argv[]) {
     print_array("t", tg.data(), g_n);
     printf(","); print_array("barD1_pi", barD1_pi.data(), g_n);
     printf(","); print_array("barD2_pi", barD2_pi.data(), g_n);
-    printf(",\"p1\":%.12g,\"b1\":%.12g,\"b2\":%.12g", p1, b1, b2);
+    printf(",\"p1\":%.12g,\"b1\":%.12g,\"b2\":%.12g", p1_prec, b1, b2);
+    printf(",\"r1\":%.12g,\"r2\":%.12g,\"N\":%d,\"T\":%.12g",
+           r1, r2, g_n, g_T);
+    printf(",\"terminal_weight\":%.12g", g_terminal_weight);
+    printf(",\"ce_mode\":%s", use_ce ? "true" : "false");
 
     printf(",\"sweeps\":[");
     for (int i = 0; i < n_p2; ++i) {
-        double p2 = p2_vals[i];
+        double p2_prec = p2_vals[i];
+        double obs_gain2 = std::sqrt(p2_prec);
         if (i > 0) printf(",");
-        printf("{\"p2\":%.12g", p2);
+        printf("{\"p2\":%.12g", p2_prec);
 
         // Private equilibrium
-        auto eq = solve_equilibrium(p1, p2, false);
+        auto eq = use_ce ? solve_equilibrium_ce(obs_gain1, obs_gain2, false)
+                         : solve_equilibrium(obs_gain1, obs_gain2, false);
         auto bar = solve_bar_equilibrium(eq.env, eq.D1, eq.D2,
-                                          p1*p1, p2*p2, 2000, 0.08, 1e-10);
+                                          p1_prec, p2_prec, 2000, 0.08, 1e-10);
         auto costs_priv = compute_costs_general(eq.env, eq.calD1, eq.calD2,
                                                  bar, r1, r2, b1, b2);
 
@@ -186,11 +342,14 @@ static int run_sweep(int argc, char* argv[]) {
         printf(",\"n_iters\":%zu", eq.residuals.size());
 
         // Pooled equilibrium: both players see same signal through Pi1
-        double p_common = std::sqrt(p1*p1 + p2*p2);
-        auto eq_pool = solve_equilibrium(p_common, p_common, false,
-                                          Pi1(), 1, Pi1(), 1);
+        double p_common = p1_prec + p2_prec;
+        double obs_gain_common = std::sqrt(p_common);
+        auto eq_pool = use_ce ? solve_equilibrium_ce(obs_gain_common, obs_gain_common, false,
+                                                     Pi1(), 1, Pi1(), 1)
+                              : solve_equilibrium(obs_gain_common, obs_gain_common, false,
+                                                  Pi1(), 1, Pi1(), 1);
         auto bar_pool = solve_bar_equilibrium(eq_pool.env, eq_pool.D1, eq_pool.D2,
-                                               p_common*p_common, p_common*p_common,
+                                               p_common, p_common,
                                                2000, 0.08, 1e-10);
         auto costs_pool = compute_costs_general(eq_pool.env, eq_pool.calD1, eq_pool.calD2,
                                                  bar_pool, r1, r2, b1, b2);
@@ -199,21 +358,22 @@ static int run_sweep(int argc, char* argv[]) {
         printf(",\"p_common\":%.12g", p_common);
 
         // Wedges (private)
-        auto prec2_arr = make_constant_prec(p2 * p2);
-        auto prec1_arr = make_constant_prec(p1 * p1);
+        auto prec2_arr = make_constant_prec(p2_prec);
+        auto prec1_arr = make_constant_prec(p1_prec);
         auto bba1 = backward_bar_adjoints(eq.env.X, eq.env.Xtilde2, eq.D2,
-                                           bar.barX, b1, prec2_arr, 0.0);
+                                           bar.barX, b1, prec2_arr,
+                                           eq.env.obs_gain2, eq.env.obs_idx2, g_terminal_weight);
         auto bba2 = backward_bar_adjoints(eq.env.X, eq.env.Xtilde1, eq.D1,
-                                           bar.barX, b2, prec1_arr, 0.0);
+                                           bar.barX, b2, prec1_arr,
+                                           eq.env.obs_gain1, eq.env.obs_idx1, g_terminal_weight);
         std::array<double, N_MAX> V1_arr, V2_arr;
         for (int j = 0; j < g_n; ++j) {
-            double V1 = 0.0, V2 = 0.0;
-            for (int z = 0; z <= j; ++z) {
-                V1 += eq.env.Xtilde2[j][z].dot(bba1.barHk[j][z]);
-                V2 += eq.env.Xtilde1[j][z].dot(bba2.barHk[j][z]);
-            }
-            V1_arr[j] = V1 * p2 * p2 * g_dt;
-            V2_arr[j] = V2 * p1 * p1 * g_dt;
+            V1_arr[j] = mean_information_wedge_at(
+                eq.env.Xtilde2, bba1.barHk, prec2_arr,
+                eq.env.obs_gain2, eq.env.obs_idx2, j);
+            V2_arr[j] = mean_information_wedge_at(
+                eq.env.Xtilde1, bba2.barHk, prec1_arr,
+                eq.env.obs_gain1, eq.env.obs_idx1, j);
         }
         printf(","); print_array("V1", V1_arr.data(), g_n);
         printf(","); print_array("V2", V2_arr.data(), g_n);
@@ -232,13 +392,15 @@ int main(int argc, char* argv[]) {
     init_ctx.apply();
 
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s <single|sweep> ...\n", argv[0]);
+        fprintf(stderr, "Usage: %s <single|sweep|check> ...\n", argv[0]);
         return 1;
     }
     if (strcmp(argv[1], "sweep") == 0)
         return run_sweep(argc, argv);
     if (strcmp(argv[1], "single") == 0)
         return run_single(argc, argv);
+    if (strcmp(argv[1], "check") == 0)
+        return run_check(argc, argv);
 
     // Legacy: positional args without subcommand
     if (argc >= 5) {
@@ -246,6 +408,6 @@ int main(int argc, char* argv[]) {
         char* new_argv[] = {argv[0], (char*)"single", argv[1], argv[2], argv[3], argv[4]};
         return run_single(6, new_argv);
     }
-    fprintf(stderr, "Usage: %s <single|sweep> ...\n", argv[0]);
+    fprintf(stderr, "Usage: %s <single|sweep|check> ...\n", argv[0]);
     return 1;
 }

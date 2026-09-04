@@ -167,10 +167,10 @@ h1 { text-align: center; font-size: 1.15em; font-weight: 700; letter-spacing: 0.
 #sim-seed:focus { outline: none; border-color: #1f77b4; box-shadow: 0 0 0 2px rgba(31,119,180,0.15); }
 
 /* Impulse controls (match sim styling) */
-#impulse-channel, #rank-kernel-select { padding: 4px 10px; font-size: 0.85em;
+#impulse-channel, #rank-kernel-select, #stationary-channel, #kyle-source-select { padding: 4px 10px; font-size: 0.85em;
     border: 1px solid var(--input-border); border-radius: 5px;
     background: var(--input-bg); color: var(--text); }
-#impulse-channel:focus, #rank-kernel-select:focus {
+#impulse-channel:focus, #rank-kernel-select:focus, #stationary-channel:focus, #kyle-source-select:focus {
     outline: none; border-color: #1f77b4; box-shadow: 0 0 0 2px rgba(31,119,180,0.15); }
 
 /* Guide tab cross-links */
@@ -227,14 +227,14 @@ h1 { text-align: center; font-size: 1.15em; font-weight: 700; letter-spacing: 0.
         <div class="slider-group">
           <label>p&#x2081; (player 1)</label>
           <div class="slider-row">
-            <input type="range" id="sl-p1" min="0.5" max="20" step="0.5" value="3">
+            <input type="range" id="sl-p1" min="0.01" max="40" step="0.01" value="3">
             <span class="val" id="val-p1">3.0</span>
           </div>
         </div>
         <div class="slider-group">
           <label>p&#x2082; (player 2)</label>
           <div class="slider-row">
-            <input type="range" id="sl-p2" min="0.5" max="20" step="0.5" value="3">
+            <input type="range" id="sl-p2" min="0.01" max="40" step="0.01" value="3">
             <span class="val val-p2" id="val-p2">3.0</span>
           </div>
         </div>
@@ -248,14 +248,14 @@ h1 { text-align: center; font-size: 1.15em; font-weight: 700; letter-spacing: 0.
         <div class="slider-group">
           <label>r&#x2081; (player 1)</label>
           <div class="slider-row">
-            <input type="range" id="sl-r1" min="0.01" max="1" step="0.01" value="0.1">
+            <input type="range" id="sl-r1" min="0.05" max="1" step="0.01" value="0.1">
             <span class="val" id="val-r1">0.10</span>
           </div>
         </div>
         <div class="slider-group">
           <label>r&#x2082; (player 2)</label>
           <div class="slider-row">
-            <input type="range" id="sl-r2" min="0.01" max="1" step="0.01" value="0.1">
+            <input type="range" id="sl-r2" min="0.05" max="1" step="0.01" value="0.1">
             <span class="val val-p2" id="val-r2">0.10</span>
           </div>
         </div>
@@ -314,15 +314,22 @@ h1 { text-align: center; font-size: 1.15em; font-weight: 700; letter-spacing: 0.
   <div class="slider-group">
     <label>T (time horizon)</label>
     <div class="slider-row">
-      <input type="range" id="sl-T" min="0.25" max="5" step="0.25" value="1">
+      <input type="range" id="sl-T" min="0.25" max="1.25" step="0.25" value="1">
       <span class="val" id="val-T">1.00</span>
+    </div>
+  </div>
+  <div class="slider-group">
+    <label>q<sub>T</sub> (terminal target weight)</label>
+    <div class="slider-row">
+      <input type="range" id="sl-qT" min="0" max="0.25" step="0.05" value="0">
+      <span class="val" id="val-qT">0.00</span>
     </div>
   </div>
   <div class="slider-group">
     <label style="display:flex; align-items:center; gap:6px; cursor:pointer;">
       <input type="checkbox" id="cb-ce-mode" checked style="width:16px; height:16px;">
-      Exact discrete CE
-      <span style="font-size:0.82em; color:var(--text-faint);">(uses discrete conditional expectation in Picard loop and for F kernel)</span>
+      Exact projection filter
+      <span style="font-size:0.82em; color:var(--text-faint);">(uses the discrete conditional-expectation projection)</span>
     </label>
   </div>
 </div>
@@ -344,6 +351,8 @@ h1 { text-align: center; font-size: 1.15em; font-weight: 700; letter-spacing: 0.
   <span class="tab-sep"></span>
   <button class="tab-btn" data-tab="tab-statics">Statics</button>
   <button class="tab-btn" data-tab="tab-allocation">Allocation</button>
+  <button class="tab-btn" data-tab="tab-stationary">Stationary</button>
+  <button class="tab-btn" data-tab="tab-kyle-back">Kyle-Back</button>
   <span class="tab-sep"></span>
   <button class="tab-btn" data-tab="tab-diagnostics">Diagnostics</button>
 </div>
@@ -352,11 +361,25 @@ h1 { text-align: center; font-size: 1.15em; font-weight: 700; letter-spacing: 0.
 <div id="tab-model" class="tab-panel active">
   <div style="max-width:820px; margin:0 auto; line-height:1.7; font-size:1.05em;">
 
-    <h2 style="margin:10px 0 8px; font-size:1.25em;">The Game</h2>
+    <h2 style="margin:10px 0 8px; font-size:1.25em;">What This Example Shows</h2>
+    <p>
+      The paper studies finite-player dynamic games where each player acts on private
+      information and those actions also change what other players learn. That feedback
+      creates the usual infinite hierarchy of beliefs about beliefs. This explorer shows
+      the paper's two-player benchmark after rewriting the hierarchy as deterministic
+      maps from primitive Brownian shocks to beliefs, actions, and costs.
+    </p>
+    <p>
+      The main object to watch is the <em>information wedge</em>: the extra term in a
+      player's costate that prices how today's action shifts the opponent's future
+      posterior and therefore the opponent's future action.
+    </p>
+    <h2 style="margin:20px 0 8px; font-size:1.25em;">The Game</h2>
     <p>
       Two players jointly control a scalar state $X_t$ over $[0,T]$.
-      Each player privately observes one component of the driving Brownian noise
-      and chooses a control to steer the state toward their own target.
+      Player 1 wants the state near $b_1$; player 2 wants it near $b_2$.
+      Neither observes the state directly, and each chooses a control using only
+      their own private signal.
     </p>
 
     <h3 style="margin:18px 0 6px; font-size:1.1em;">State dynamics</h3>
@@ -366,20 +389,22 @@ h1 { text-align: center; font-size: 1.15em; font-weight: 700; letter-spacing: 0.
 
     <h3 style="margin:18px 0 6px; font-size:1.1em;">Private signals</h3>
     <p>Player $i$ continuously observes a private signal</p>
-    $$dY_t^i = p_i\,X_t\,dt + dW_t^i, \qquad i=1,2,$$
+    $$dY_t^i = \sqrt{p_i}\,X_t\,dt + dW_t^i, \qquad i=1,2,$$
     <p>
       where $W^1, W^2$ are independent Brownian motions (also independent of $W^0$),
-      and $p_i > 0$ is the signal root-precision (observation precision is $p_i^2$).
+      and $p_i > 0$ is the signal precision (observation gain $\sqrt{p_i}$).
       Player 1 sees only $Y^1$; player 2 sees only $Y^2$.
       Neither player observes the state $X_t$ directly.
     </p>
 
     <h3 style="margin:18px 0 6px; font-size:1.1em;">Cost functionals</h3>
     <p>Player $i$ minimizes</p>
-    $$J^i = \mathbb{E}\!\int_0^T \!\Bigl[\,(X_t - b_i)^2 + r_i\,(D_t^i)^2\,\Bigr]\,dt,$$
+    $$J^i = \mathbb{E}\!\int_0^T \!\Bigl[\,(X_t - b_i)^2 + r_i\,(D_t^i)^2\,\Bigr]\,dt
+      + q_T\,\mathbb{E}(X_T-b_i)^2,$$
     <p>
       where $b_i$ is player $i$'s bliss point (target state) and
-      $r_i > 0$ is the control cost weight.
+      $r_i > 0$ is the control cost weight. The paper benchmark sets $q_T=0$;
+      the slider lets you add a terminal target penalty using the same $b_i$ targets.
     </p>
 
     <h3 style="margin:18px 0 6px; font-size:1.1em;">Equilibrium concept</h3>
@@ -388,11 +413,13 @@ h1 { text-align: center; font-size: 1.15em; font-weight: 700; letter-spacing: 0.
       In equilibrium, each player's control decomposes into a deterministic
       mean path and a feedback response to their innovation process:
     </p>
-    $$D_t^i = \bar{D}^i(t) + \int_0^t D^i(t,s)\,d\widehat{W}^i_t(s),$$
+    $$D_t^i = \bar{D}^i(t) + \int_0^t D^i(t,u)\,d\widehat{W}^i_t(u),$$
     <p>
       where $\bar{D}^i(t)$ is the <em>mean control</em>,
       $D^i(t,s)$ is the <em>feedback kernel</em>, and
       $\widehat{W}^i_t$ is player $i$'s noise state.
+      In the plots, $\mathcal{D}^i$ is the same control re-expressed in primitive
+      Brownian coordinates, which is the coordinate system that drives the physical state.
       The solver finds $\bar{D}^1, \bar{D}^2, D^1, D^2$ such that
       neither player can reduce their cost by deviating.
     </p>
@@ -400,13 +427,15 @@ h1 { text-align: center; font-size: 1.15em; font-weight: 700; letter-spacing: 0.
     <h3 style="margin:18px 0 6px; font-size:1.1em;">Parameters</h3>
     <table style="border-collapse:collapse; margin:6px 0; font-size:0.95em;">
       <tr><td style="padding:3px 14px 3px 0; font-weight:600;">$p_1, p_2$</td>
-          <td>Signal root-precisions &mdash; observation precision is $p_i^2$</td></tr>
+          <td>Signal precisions &mdash; observation gain is $\sqrt{p_i}$</td></tr>
       <tr><td style="padding:3px 14px 3px 0; font-weight:600;">$b_1, b_2$</td>
           <td>Bliss points &mdash; each player's preferred state level</td></tr>
       <tr><td style="padding:3px 14px 3px 0; font-weight:600;">$r_1, r_2$</td>
           <td>Control cost weights &mdash; how expensive it is to act</td></tr>
       <tr><td style="padding:3px 14px 3px 0; font-weight:600;">$T$</td>
           <td>Time horizon</td></tr>
+      <tr><td style="padding:3px 14px 3px 0; font-weight:600;">$q_T$</td>
+          <td>Terminal tracking weight on $(X_T-b_i)^2$</td></tr>
       <tr><td style="padding:3px 14px 3px 0; font-weight:600;">$N$</td>
           <td>Grid points (numerical resolution)</td></tr>
     </table>
@@ -421,21 +450,22 @@ h1 { text-align: center; font-size: 1.15em; font-weight: 700; letter-spacing: 0.
   <div style="max-width:820px; margin:0 auto; line-height:1.7; font-size:1.05em;">
     <h2 style="margin:10px 0 8px; font-size:1.25em;">What the plots show</h2>
     <p>
-      Decentralized LQG games normally require each player to form beliefs about
-      the other's beliefs, and so on &mdash; the Townsend belief hierarchy.
-      This tool displays the equilibrium objects that emerge once that hierarchy
-      is resolved via a coordinate change into <em>noise-state</em> (primitive
-      Brownian) coordinates.
+      The paper's computational move is to stop tracking beliefs about beliefs directly.
+      Instead, it tracks how the underlying primitive shocks $W^0,W^1,W^2$ flow into
+      beliefs and actions. The plots below are those deterministic maps. They show why
+      private information is costly here not only because players estimate the state
+      imperfectly, but because each player can move the state to influence what the
+      opponent learns.
     </p>
-
     <h3 style="margin:22px 0 6px; font-size:1.15em;">The noise-state idea</h3>
     <p>
       Instead of tracking conditional distributions, work in the coordinates of
       the three underlying Brownian shocks $W^0, W^1, W^2$. Every adapted process
       admits a stochastic-integral representation governed by a <em>kernel</em>
       (a causal function of two time indices), and the equilibrium reduces to a
-      system of coupled kernel equations with no infinite regress. The channels
-      have distinct roles: $W^0$ is common noise observed by neither player,
+      system of coupled kernel equations with no infinite regress. For a first pass,
+      read a kernel value as "the response at time $t$ to a shock that arrived at
+      time $s$." The channels have distinct roles: $W^0$ is common noise observed by neither player,
       $W^1$ is player&nbsp;1's observation noise, $W^2$ is player&nbsp;2's.
     </p>
 
@@ -443,6 +473,7 @@ h1 { text-align: center; font-size: 1.15em; font-weight: 700; letter-spacing: 0.
     <p style="font-style:italic; color:var(--text-muted); margin-bottom:6px;">
       <a href="#" class="guide-link" data-target="tab-kernels">Kernels</a> tab.
     </p>
+
     <p>
       $X(t,s)$ is the impulse response of the state: how much a unit shock at
       source time $s$ persists in $X_t$. The $W^0$ channel starts at 1 and decays
@@ -459,10 +490,10 @@ h1 { text-align: center; font-size: 1.15em; font-weight: 700; letter-spacing: 0.
     </p>
     <p>
       $D^i(t,s)$ is player $i$'s feedback kernel in <em>filtered</em> coordinates
-      (what the player knows). $\mathcal{D}^i(t,s)$ is the same control
+      (what the player knows). This is the strategy rule. $\mathcal{D}^i(t,s)$ is the same control
       re-expressed in <em>primitive</em> coordinates (what drives the state),
       obtained by convolving $D^i$ with the filtration kernel $F^i$.
-      $\mathcal{D}^i$ is the kernel that enters the state equation and determines
+      This is the realized impulse response. $\mathcal{D}^i$ is the kernel that enters the state equation and determines
       equilibrium volatility.
     </p>
 
@@ -475,7 +506,7 @@ h1 { text-align: center; font-size: 1.15em; font-weight: 700; letter-spacing: 0.
     <p>
       $\widetilde{X}^i(t,s)$ is the component of the state's impulse response
       that player $i$ has not yet resolved at time $t$ &mdash; the filtering gain
-      in the noise-state innovation update (Theorem&nbsp;3.1). The $W^i$ channel
+      in the noise-state innovation update (Theorem&nbsp;4.1). The $W^i$ channel
       is identically zero: player $i$'s own observation noise enters the state
       only through their own (measurable) actions.
     </p>
@@ -502,7 +533,9 @@ h1 { text-align: center; font-size: 1.15em; font-weight: 700; letter-spacing: 0.
     <p>
       The deterministic components of the equilibrium. Dotted lines show the
       perfect-information Riccati benchmark. The gap is the mean-channel
-      distortion from bilateral belief manipulation.
+      distortion from bilateral belief manipulation. This is the paper's separation
+      failure in the mean channel: changing precision changes the policy rule itself,
+      not only the posterior variance.
     </p>
 
     <h3 style="margin:22px 0 6px; font-size:1.15em;">
@@ -515,22 +548,26 @@ h1 { text-align: center; font-size: 1.15em; font-weight: 700; letter-spacing: 0.
     <p>
       Player $i$'s optimality condition gives
       $D^i(t,s) = -(1/r_i)\,H^i_x(t,s)$, where $H^i_x$ is the kernel costate.
-      The backward equation for $H^i_x$ is
+      In the scalar benchmark, the backward equation for $H^i_x$ is
     </p>
     $$H^i_x(t,r) = H^i_x(T,r) + \int_t^T \bigl[\, X(u,r) + \mathcal{V}^i(u,r) \,\bigr]\,du$$
     <p>
       where $X(u,r)$ is the standard state-tracking term and
-      $\mathcal{V}^i$ is the information wedge:
+      $\mathcal{V}^i$ is the information wedge. For opponent $k=-i$,
     </p>
-    $$\mathcal{V}^i(t,r) \;=\; p_{-i}^2 \int_0^t \widetilde{X}^{-i}(t,z) \cdot H^{-i,i}(t,z,r)\,dz$$
+    $$\mathcal{V}^{k,i}(t,r)
+      = \sqrt{p_k}\,H^{k,i}(t,t,r)_{\mathrm{obs}}
+      + p_k \int_0^t \widetilde{X}^{k}(t,z)\cdot H^{k,i}(t,z,r)\,dz.$$
     <p>
-      $\widetilde{X}^{-i}$ governs how much a drift perturbation shifts the
-      opponent's posterior; $H^{-i,i}$ governs how that shifted posterior changes
-      the opponent's future actions; $p_{-i}^2$ scales by opponent precision.
+      The first term prices the newly born current innovation coordinate. The second
+      term prices accumulated drift inference through the opponent's filter. In matrix
+      form this is the Theorem&nbsp;4.2 / Appendix&nbsp;B expression
+      $\Gamma^k(t)^\top E^k H^{k,i}_t(t,\cdot)
+      + P^k(t)\int_0^t \widetilde{X}^k_t(z)H^{k,i}_t(z,\cdot)\,dz$.
       Without the wedge, the backward equation collapses to the perfect-information
-      Riccati solution. With it, player $i$ shades the drift to manipulate what the
-      opponent learns. The entire strategic information friction enters through this
-      single additive correction to the costate.
+      Riccati block. With it, player $i$ shades the drift to manipulate what the
+      opponent learns. This is a finite-player strategic channel; it disappears in
+      exogenous-signal or negligible-agent reductions.
     </p>
 
     <h3 style="margin:22px 0 6px; font-size:1.15em;">Comparative statics</h3>
@@ -538,10 +575,11 @@ h1 { text-align: center; font-size: 1.15em; font-weight: 700; letter-spacing: 0.
       <a href="#" class="guide-link" data-target="tab-statics">Statics</a> tab.
     </p>
     <p>
-      Sweeps $p_2$ with all else fixed. Dashed lines show pooled-information costs
-      (common filtration, no strategic friction). The gap reflects both the direct
-      cost of having less information and the additional distortion from bilateral
-      belief manipulation.
+      Sweeps $p_2$ with all else fixed. Solid lines show pooled-information costs
+      (common filtration, no strategic friction); dashed lines show private-signal
+      equilibrium costs. In the opposing-target benchmark, most of the gain from
+      pooling is strategic: pooling removes the bilateral manipulation channel, not
+      just estimation error.
     </p>
 
     <h3 style="margin:22px 0 6px; font-size:1.15em;">Precision allocation</h3>
@@ -549,7 +587,7 @@ h1 { text-align: center; font-size: 1.15em; font-weight: 700; letter-spacing: 0.
       <a href="#" class="guide-link" data-target="tab-allocation">Allocation</a> tab.
     </p>
     <p>
-      Sweeps the precision split under a quadratic budget $p_1^2 + p_2^2 = \bar{P}$.
+      Sweeps the precision split under the budget $p_1 + p_2 = \bar{P}$.
       The paper's headline result (Section 2.5): under competition with asymmetric
       effort costs, a planner should concentrate all precision on the efficient player.
       The mechanism is <em>information starvation</em>: denying the inefficient player
@@ -557,7 +595,8 @@ h1 { text-align: center; font-size: 1.15em; font-weight: 700; letter-spacing: 0.
       reduces the efficient player's incentive to manipulate, collapsing bilateral
       waste. The certainty-equivalent benchmark (dotted lines in the controls panel)
       is invariant to the precision split, directly visualizing separation failure
-      (Proposition 4.6).
+      (Proposition 4.6): equilibrium policy kernels move with information because
+      the wedge moves with information.
     </p>
 
     <h3 style="margin:22px 0 6px; font-size:1.15em;">Simulation</h3>
@@ -581,9 +620,9 @@ h1 { text-align: center; font-size: 1.15em; font-weight: 700; letter-spacing: 0.
       <a href="#" class="guide-link" data-target="tab-diagnostics">Diagnostics</a> tab.
     </p>
     <p>
-      Anderson-accelerated Picard iteration on the best-response map
-      $D \mapsto G(D)$. The residual $\|G(D)-D\|/\|G(D)\|$ may be non-monotonic
-      &mdash; Anderson mixing is not a descent method.
+      Damped Picard iteration on the best-response map $D \mapsto G(D)$.
+      The residual $\|G(D)-D\|/\|G(D)\|$ tracks convergence of the feedback
+      kernels.
     </p>
   </div>
 </div>
@@ -608,10 +647,11 @@ h1 { text-align: center; font-size: 1.15em; font-weight: 700; letter-spacing: 0.
       Mean information wedges $\bar{V}^1(t)$ and $\bar{V}^2(t)$.
       $\bar{V}^i(t)$ prices the marginal value to player $i$ of shifting the opponent's
       posterior at time $t$ &mdash; the additional costate term from bilateral belief
-      manipulation (Theorem 3.2). Both wedges are hump-shaped: zero at $t=0$ (no
-      inference yet) and $t=T$ (terminal condition on the belief adjoint). Higher
-      opponent precision amplifies the wedge, since a better-informed opponent reacts
-      more sharply to drift perturbations.
+      manipulation (Theorem&nbsp;4.2). In the benchmark these wedges are typically
+      hump-shaped: zero at $t=0$ before any signal increment has arrived and zero at
+      $t=T$ from the terminal condition on the belief adjoint. Changing precision
+      reshapes the wedge because it changes how sharply the opponent reacts to drift
+      perturbations.
     </div>
   </div>
 </div>
@@ -732,7 +772,7 @@ h1 { text-align: center; font-size: 1.15em; font-weight: 700; letter-spacing: 0.
     <div id="fkernel-spike-notice" style="display:none; font-size:0.82em; color:var(--text-muted);
          background:var(--notice-bg); border-left:3px solid #1f77b4; border-radius:0 4px 4px 0;
          padding:8px 14px; margin-bottom:12px; max-width:880px; line-height:1.5;">
-      <strong>Note (CE mode):</strong> The discrete filtration kernel has a Dirac-delta singularity
+      <strong>Note (exact projection mode):</strong> The discrete filtration kernel has a Dirac-delta singularity
       on the own-observation diagonal at $u=s$ (the player perfectly resolves their own innovation).
       <span id="fkernel-spike-detail"></span>
       The plots below clip these points so the remaining structure is visible.
@@ -757,7 +797,7 @@ h1 { text-align: center; font-size: 1.15em; font-weight: 700; letter-spacing: 0.
       <div id="plot-Vkernel1" class="plot"></div>
       <div class="figure-caption">
         Kernel information wedge $\mathcal{V}^1(t,r)$: the additive costate correction from
-        bilateral belief manipulation (eq. 3.5). Vanishes at $t=T$.
+        bilateral belief manipulation (Theorem&nbsp;4.2 and Appendix&nbsp;B). Vanishes at $t=T$.
       </div>
     </div>
     <div class="figure-block">
@@ -801,8 +841,9 @@ h1 { text-align: center; font-size: 1.15em; font-weight: 700; letter-spacing: 0.
 <!-- Tab 2.5: Impulse Response -->
 <div id="tab-impulse" class="tab-panel">
   <div class="figure-caption" style="margin-bottom:14px;">
-    A unit shock hits noise channel $W^r$ at source time $s$. The panels below show how it
-    propagates through the physical state, each player's controls, and their information sets.
+    A unit shock hits noise channel $W^r$ at source time $s$. The Physical State
+    panel shows the response of the state, estimates, and primitive controls; the
+    player panels show the same shock inside each player's private information state.
   </div>
   <div class="param-card" style="margin-bottom:14px;">
     <div style="display:flex; gap:24px; align-items:center; flex-wrap:wrap; padding:2px 0;">
@@ -902,7 +943,7 @@ h1 { text-align: center; font-size: 1.15em; font-weight: 700; letter-spacing: 0.
   <div class="param-card" style="margin-bottom:14px;">
     <div style="display:flex; align-items:center; gap:20px; flex-wrap:wrap; padding:2px 0;">
       <div class="slider-group" style="min-width:150px; max-width:100%;">
-        <label>$\bar{P}$ (precision budget, $p_1^2+p_2^2 = \bar{P}$)</label>
+        <label>$\bar{P}$ (precision budget, $p_1+p_2 = \bar{P}$)</label>
         <div class="slider-row">
           <input type="range" id="sl-Pbar" min="5" max="80" step="1" value="20">
           <span class="val" id="val-Pbar">20</span>
@@ -925,7 +966,7 @@ h1 { text-align: center; font-size: 1.15em; font-weight: 700; letter-spacing: 0.
     </div>
   </div>
   <div class="figure-caption">
-    Equilibrium quantities across the precision split with $p_1^2 + p_2^2 = \bar{P}$.
+    Equilibrium quantities across the precision split with $p_1 + p_2 = \bar{P}$.
     Top-left: individual costs (solid) vs full-information benchmark (dashed, independent of allocation).
     Top-right: total effort-weighted control cost &mdash; the key diagnostic for information starvation.
     Under asymmetric costs, concentrating precision on the efficient player (fraction $\to 1$) minimizes
@@ -936,16 +977,229 @@ h1 { text-align: center; font-size: 1.15em; font-weight: 700; letter-spacing: 0.
   </div>
 </div>
 
+<!-- Stationary tab -->
+<div id="tab-stationary" class="tab-panel">
+  <div class="figure-caption" style="margin-bottom:14px;">
+    Infinite-horizon stationary lag-domain responses evaluated from embedded
+    neural-network weights and the current sliders. Choose a primitive shock
+    source to inspect the induced IRFs for beliefs, controls, unresolved errors,
+    and backward wedge objects.
+  </div>
+  <div class="param-card" style="margin-bottom:14px;">
+    <div style="display:flex; gap:24px; align-items:center; flex-wrap:wrap; padding:2px 0;">
+      <div>
+        <label style="font-weight:600; font-size:0.85em;">Shock source:</label>
+        <select id="stationary-channel" style="margin-left:5px; padding:3px 8px; font-size:0.9em;">
+          <option value="0">W&#x2070; (state noise)</option>
+          <option value="1">W&#xB9; (player 1 obs.)</option>
+          <option value="2">W&#xB2; (player 2 obs.)</option>
+        </select>
+      </div>
+    </div>
+  </div>
+  <div id="stationary-summary" style="max-width:860px; margin:0 auto 18px; padding:12px 18px;
+       background:var(--card); border:1px solid var(--card-border); border-radius:8px;
+       font-size:0.88em; line-height:1.6; color:var(--text-muted);
+       box-shadow:0 2px 8px var(--card-shadow);"></div>
+
+  <div style="display:flex; flex-wrap:wrap; gap:2px; margin-bottom:12px; padding:6px 0;">
+    <button class="subtab-btn active" data-subtab="stationary-beliefs" data-group="stationary">Beliefs</button>
+    <button class="subtab-btn" data-subtab="stationary-actions" data-group="stationary">Actions</button>
+    <button class="subtab-btn" data-subtab="stationary-unresolved" data-group="stationary">Unresolved</button>
+    <button class="subtab-btn" data-subtab="stationary-wedges" data-group="stationary">Wedges</button>
+  </div>
+
+  <div id="stationary-beliefs" class="subtab-panel active">
+    <div class="figure-block">
+      <div id="plot-stationary-beliefs" class="plot"></div>
+      <div class="figure-caption">
+        Stationary belief IRFs. The state kernel $X(a)$ is the physical response;
+        player estimates are $X(a)-\widetilde{X}^i(a)$ in the causal lag coordinate.
+      </div>
+    </div>
+  </div>
+
+  <div id="stationary-actions" class="subtab-panel">
+    <div class="figure-block">
+      <div id="plot-stationary-actions" class="plot"></div>
+      <div class="figure-caption">
+        Primitive-control IRFs $\mathcal{D}^i(a)$ on the causal lag domain.
+        Unobserved zero-lag primitive shocks have no instantaneous action load;
+        a player can still react immediately to their own observed innovation.
+      </div>
+    </div>
+    <div class="figure-block">
+      <div id="plot-stationary-feedback" class="plot"></div>
+      <div class="figure-caption">
+        Noise-state feedback kernels $D^i(a)$ before conversion to primitive
+        Brownian control coordinates.
+      </div>
+    </div>
+  </div>
+
+  <div id="stationary-unresolved" class="subtab-panel">
+    <div class="figure-block">
+      <div id="plot-stationary-unresolved" class="plot"></div>
+      <div class="figure-caption">
+        Unresolved belief-error kernels $\widetilde{X}^i(a)$: the part of the
+        selected primitive shock not yet resolved by each player's information.
+      </div>
+    </div>
+  </div>
+
+  <div id="stationary-wedges" class="subtab-panel">
+    <div class="figure-block">
+      <div id="plot-stationary-adjoints" class="plot"></div>
+      <div class="figure-caption">
+        Two-sided lag-domain adjoints and information wedges for the selected
+        primitive shock channel. The backward block is solved as a dense stationary
+        linear system using the diagonal innovation-birth term.
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Kyle-Back tab -->
+<div id="tab-kyle-back" class="tab-panel">
+  <div class="figure-caption" style="margin-bottom:14px;">
+    Coupled stationary Kyle-Back PINN checkpoint. These plots use the same
+    stationary lag-equation solve for filters, primitive demand kernels,
+    noise-state IRFs, FOC terms, and diagnostics. The checkpoint is still a
+    residual solve, so read the convergence diagnostics before treating the
+    curves as an equilibrium.
+  </div>
+  <div class="param-card" style="margin-bottom:14px;">
+    <div style="display:flex; gap:20px; align-items:center; flex-wrap:wrap; padding:2px 0;">
+      <div>
+        <label style="font-weight:600; font-size:0.85em;">Source:</label>
+        <select id="kyle-source-select" style="margin-left:5px;">
+          <option value="v_noise">V noise</option>
+          <option value="z_noise">Z noise</option>
+          <option value="y1_noise">Y1 noise</option>
+          <option value="y2_noise">Y2 noise</option>
+        </select>
+      </div>
+    </div>
+  </div>
+  <div id="kyle-summary" style="max-width:900px; margin:0 auto 18px; padding:12px 18px;
+       background:var(--card); border:1px solid var(--card-border); border-radius:8px;
+       font-size:0.88em; line-height:1.6; color:var(--text-muted);
+       box-shadow:0 2px 8px var(--card-shadow);"></div>
+
+  <div style="display:flex; flex-wrap:wrap; gap:2px; margin-bottom:12px; padding:6px 0;">
+    <button class="subtab-btn active" data-subtab="kyle-model" data-group="kyle">Model</button>
+    <button class="subtab-btn" data-subtab="kyle-irfs" data-group="kyle">Value Shock</button>
+    <button class="subtab-btn" data-subtab="kyle-state" data-group="kyle">Noise States</button>
+    <button class="subtab-btn" data-subtab="kyle-diagnostics" data-group="kyle">Diagnostics</button>
+  </div>
+
+  <div id="kyle-model" class="subtab-panel active">
+    <div style="max-width:900px; margin:0 auto; line-height:1.7; font-size:1.02em;">
+      <h2 style="margin:8px 0 8px; font-size:1.2em;">Coupled Stationary Kyle-Back PINN</h2>
+      <p>
+        The Kyle-Back block shown here is separate from the two-player LQG game above.
+        It is a scalar stationary price-impact solve with a market maker, two
+        strategic traders, a fundamental shock, public order-flow noise, and two
+        private-signal shocks. The displayed objects all come from the coupled
+        stationary PINN: policy kernels, primitive demand kernels, filter
+        projections, adjoints, and local optimality residuals are fitted together.
+      </p>
+      <p>
+        The main displayed object is the response to a unit change in the
+        fundamental value: true $V$, market-maker price $P$, and each trader's
+        estimate of $V$. The noise-state tab lets you switch primitive sources
+        $(V,Z,Y^1,Y^2)$ and see how each observer's noise state and each trader's
+        primitive demand kernel respond.
+      </p>
+      <p>
+        The diagonal birth is an observed innovation coordinate, not a claim that
+        a trader directly sees the primitive noise-trade decomposition. The
+        lag-zero filter diagnostics separately report the observed birth boundary
+        and the unobserved primitive-coordinate boundary.
+      </p>
+      <div id="kyle-param-table" style="margin-top:12px;"></div>
+      <div id="kyle-nn-state" style="margin-top:18px;"></div>
+    </div>
+  </div>
+
+  <div id="kyle-irfs" class="subtab-panel">
+    <div class="figure-block">
+      <div id="plot-kyle-v-estimates" class="plot"></div>
+      <div class="figure-caption">
+        <strong>Belief IRFs from a unit fundamental-value shock.</strong>
+        True value $V$ is shown against the market-maker price $P$ and each
+        trader's estimate of $V$, matching the state/estimate layout used in the
+        LQG impulse and stationary panels.
+      </div>
+    </div>
+    <div class="figure-block">
+      <div id="plot-kyle-state-irfs" class="plot"></div>
+      <div class="figure-caption">
+        Information gaps and stationary best-response demand responses induced by
+        the same fundamental-value shock. The gaps are $\widehat V^i-P$; demand
+        is first read in each trader's noise state from the local range equation,
+        then converted to primitive coordinates with equations (8)-(9).
+      </div>
+    </div>
+  </div>
+
+  <div id="kyle-state" class="subtab-panel">
+    <div class="figure-block">
+      <div id="plot-kyle-noise-estimates" class="plot"></div>
+      <div class="figure-caption">
+        Scalar readouts and primitive demand-kernel responses to the selected
+        primitive shock source. For a $V$ shock, the readouts are the separate
+        price/value-estimate IRFs.
+      </div>
+    </div>
+    <div class="figure-block">
+      <div id="plot-kyle-raw-policy" class="plot"></div>
+      <div class="figure-caption">
+        Raw noise-state policy kernels $D^1$ and $D^2$. These are the action
+        responses as functions of each trader's own noise-state coordinates
+        before converting to primitive Brownian coordinates.
+      </div>
+    </div>
+    <div class="figure-block">
+      <div id="plot-kyle-noise-states" class="plot"></div>
+      <div class="figure-caption">
+        Vector observer noise-state IRFs to the selected primitive shock. Each
+        panel plots the selected shock's full four-coordinate projection in that
+        observer's noise state: value $V$, public order-flow noise $Z$, and the
+        two private-signal noises $Y^1,Y^2$.
+      </div>
+    </div>
+  </div>
+
+  <div id="kyle-diagnostics" class="subtab-panel">
+    <div class="figure-block">
+      <div id="plot-kyle-residuals" class="plot"></div>
+      <div class="figure-caption">
+        Coupled PINN filter closure residuals for the selected primitive
+        coordinate. These are residuals of the stationary filtering equations
+        implied by the coupled equilibrium network.
+      </div>
+    </div>
+    <div class="figure-block">
+      <div id="plot-kyle-equilibrium-foc" class="plot"></div>
+      <div class="figure-caption">
+        Coupled stationary PINN FOC terms for the selected primitive coordinate:
+        estimated mispricing/price-impact LHS, estimated future-profit impact
+        $\mathcal{H}$, and their mismatch.
+      </div>
+    </div>
+  </div>
+</div>
+
 <!-- Tab 5: Diagnostics -->
 <div id="tab-diagnostics" class="tab-panel">
   <div class="figure-block">
     <div id="plot-residual" class="plot"></div>
     <div class="figure-caption">
-      Relative residual $\|G(D)-D\|/\|G(D)\|$ of the Anderson-accelerated
-      Picard iteration on the best-response map (Definition C.2). Convergence to
-      $10^{-5}$ typically requires 19&ndash;47 iterations. The trace may be non-monotonic
-      &mdash; Anderson mixing is not a descent method and can overshoot before converging,
-      especially at small r (large control gains).
+      Relative residual $\|G(D)-D\|/\|G(D)\|$ of the adaptively damped Picard iteration
+      on the best-response map (Definition C.2). Convergence to $10^{-5}$
+      can be slower at small r (large control gains), where the fixed point
+      is stiffer.
     </div>
   </div>
   <div id="diag-summary" style="max-width:700px; margin:20px auto; padding:14px 20px;
@@ -964,6 +1218,9 @@ h1 { text-align: center; font-size: 1.15em; font-weight: 700; letter-spacing: 0.
 </script>
 
 <script>
+const STATIONARY_PARAM_NN = /* STATIONARY_PARAM_NN_INLINE */;
+const KYLE_BACK_EQUILIBRIUM = /* KYLE_BACK_EQUILIBRIUM_INLINE */;
+
 // --- toggle ---
 function toggleMore() {
     const el = document.getElementById('more-params');
@@ -989,10 +1246,10 @@ document.addEventListener('click', function(e) {
 
 // --- WASM solver interface ---
 let Module = null;
-let solveLight, solveFullBin, solveSweep, solveFKernelBin, wasmSetGrid, wasmSetCeMode, wasmSetSigma, wasmSetX0, wasmMalloc, wasmFree, wasmFullKernelCount;
+let solveLight, solveFullBin, solveSweep, solveFKernelBin, wasmSetGrid, wasmSetCeMode, wasmSetSigma, wasmSetX0, wasmSetTerminalWeight, wasmReleaseTransferBuffers, wasmMalloc, wasmFree, wasmFullKernelCount;
 
 let N = 40;
-const SWEEP_P2 = [0.5, 1, 1.5, 2, 3, 4, 5, 7, 10, 15, 20];
+const SWEEP_P2 = [0.01, 0.05, 0.1, 0.5, 1, 1.5, 2, 3, 4, 5, 7, 10, 15, 20, 30, 40];
 
 // Viridis-ish colors
 function viridisColor(frac) {
@@ -1028,7 +1285,7 @@ function showError(stage, error, params) {
     const timestamp = new Date().toLocaleTimeString();
     const reqN = params ? (params.N || N) : N;
     const paramStr = params
-        ? `p\u2081=${params.p1} p\u2082=${params.p2} b\u2081=${params.b1} b\u2082=${params.b2} r\u2081=${params.r1} r\u2082=${params.r2} N=${reqN} T=${params.T || currentT}`
+        ? `p\u2081=${params.p1} p\u2082=${params.p2} b\u2081=${params.b1} b\u2082=${params.b2} r\u2081=${params.r1} r\u2082=${params.r2} qT=${params.qT ?? 0} N=${reqN} T=${params.T || currentT}`
         : '';
     const gridInfo = `JS global N=${N}, currentN=${currentN}, currentT=${currentT}`;
     const stack = error && error.stack
@@ -1055,7 +1312,7 @@ function showConvergenceWarning(data, params) {
     const maxIters = data.max_picard_iters || 10000;
     const tol = data.picard_tol || 1e-5;
     const paramStr = params
-        ? `p\u2081=${params.p1} p\u2082=${params.p2} b\u2081=${params.b1} b\u2082=${params.b2} r\u2081=${params.r1} r\u2082=${params.r2} N=${params.N || N} T=${params.T || currentT}`
+        ? `p\u2081=${params.p1} p\u2082=${params.p2} b\u2081=${params.b1} b\u2082=${params.b2} r\u2081=${params.r1} r\u2082=${params.r2} qT=${params.qT ?? 0} N=${params.N || N} T=${params.T || currentT}`
         : '';
     const residNaN = data.residuals && data.residuals.some(r => r === null || !isFinite(r));
     const hitMaxIters = nIters >= maxIters;
@@ -1066,7 +1323,7 @@ function showConvergenceWarning(data, params) {
     if (data.bar_converged === false) detail += `\u26a0 Bar equilibrium also failed to converge (bar_residual=${data.bar_residual != null ? data.bar_residual.toExponential(4) : '?'}).\n`;
     if (data.costs_finite === false) detail += `\u26a0 Non-finite cost values detected \u2014 solution may be meaningless.\n`;
     detail += `Costs: J\u00b9=${data.J1 != null ? data.J1.toFixed(6) : '?'}, J\u00b2=${data.J2 != null ? data.J2.toFixed(6) : '?'}`;
-    detail += `\nMode: ${data.ce_mode ? 'CE (discrete conditional expectation)' : 'Standard Picard'}`;
+    detail += `\nMode: ${data.ce_mode ? 'Exact projection filter' : 'Standard Picard'}`;
     panel.innerHTML =
         `<button class="error-dismiss" onclick="dismissError()" title="Dismiss">\u00d7</button>` +
         `<div class="error-header">Convergence Failure [${timestamp}]</div>` +
@@ -1108,8 +1365,8 @@ function callLight(p1, p2, b1, b2, r1, r2) {
 
 function callFull(p1, p2, b1, b2, r1, r2) {
     try {
-        // Binary transfer: returns pointer to kernels × 3 channels × N×N doubles
-        // After recompilation, WASM outputs 7 kernels (X, D1, D2, calD1, calD2, Xtilde1, Xtilde2).
+        // Binary transfer: returns pointer to kernels × 3 channels × N×N doubles.
+        // Copy into JS-owned typed arrays immediately, then release the transfer buffer.
         // Detect count via wasm_full_kernel_count if available, otherwise assume 5 (old WASM).
         const nBefore = N;
         const ptr = solveFullBin(p1, p2, b1, b2, r1, r2);
@@ -1120,7 +1377,6 @@ function callFull(p1, p2, b1, b2, r1, r2) {
         const block = n * n;
         const numKernels = (typeof wasmFullKernelCount === 'function') ? wasmFullKernelCount() : 5;
         const total = numKernels * 3 * block;
-        console.log(`[callFull] N=${n}, numKernels=${numKernels}, total_doubles=${total}, ptr=${ptr}, heap_byte_len=${Module.HEAPF64.buffer.byteLength}`);
         if (ptr + total * 8 > Module.HEAPF64.buffer.byteLength) {
             throw new Error(`Buffer overrun: ptr=${ptr}, need=${total * 8} bytes, heap=${Module.HEAPF64.buffer.byteLength}`);
         }
@@ -1138,13 +1394,14 @@ function callFull(p1, p2, b1, b2, r1, r2) {
         for (let ch = 0; ch < 3; ch++) {
             const rows = [];
             for (let ti = 0; ti < n; ti++) {
-                rows.push(Array.from(arr.subarray(offset, offset + n)));
+                rows.push(arr.slice(offset, offset + n));
                 offset += n;
             }
             kernel['ch' + ch] = rows;
         }
         result[name] = kernel;
     }
+    if (wasmReleaseTransferBuffers) wasmReleaseTransferBuffers();
     return result;
     } catch (e) {
         showError('callFull \u2192 solve_full_bin WASM call', e, {p1, p2, b1, b2, r1, r2});
@@ -1154,21 +1411,23 @@ function callFull(p1, p2, b1, b2, r1, r2) {
 }
 
 function callSweep(p1, b1, b2, r1, r2, p2Arr) {
+    let buf = 0;
     try {
         const n = p2Arr.length;
-        const buf = wasmMalloc(n * 8);
+        buf = wasmMalloc(n * 8);
         // Re-read HEAPF64 after malloc (memory may have grown)
         const view = new Float64Array(Module.HEAPF64.buffer, buf, n);
         for (let i = 0; i < n; i++) view[i] = p2Arr[i];
         const ptr = solveSweep(p1, b1, b2, r1, r2, buf, n);
         const json = Module.UTF8ToString(ptr);
         const result = JSON.parse(json);
-        if (wasmFree) wasmFree(buf);
         return result;
     } catch (e) {
         showError('callSweep \u2192 solve_sweep WASM call', e, {p1, b1, b2, r1, r2, p2: 'sweep'});
         document.getElementById('status').textContent = 'Solver error (solve_sweep): ' + e.message;
         return null;
+    } finally {
+        if (buf && wasmFree) wasmFree(buf);
     }
 }
 
@@ -1179,7 +1438,6 @@ function callFKernel(p1, p2, b1, b2, r1, r2) {
         const n = N;
         const block = n * n;
         const total = 2 * 9 * block;
-        console.log(`[callFKernel] N=${n}, total_doubles=${total}, ptr=${ptr}, heap_byte_len=${Module.HEAPF64.buffer.byteLength}`);
         if (ptr + total * 8 > Module.HEAPF64.buffer.byteLength) {
             throw new Error(`Buffer overrun: ptr=${ptr}, need=${total * 8} bytes, heap=${Module.HEAPF64.buffer.byteLength}`);
         }
@@ -1193,13 +1451,14 @@ function callFKernel(p1, p2, b1, b2, r1, r2) {
                 for (let c = 0; c < 3; c++) {
                     const z = [];
                     for (let u = 0; u < n; u++) {
-                        z.push(Array.from(arr.subarray(offset, offset + n)));
+                        z.push(arr.slice(offset, offset + n));
                         offset += n;
                     }
                     result[player][`r${r}c${c}`] = z;
                 }
             }
         }
+        if (wasmReleaseTransferBuffers) wasmReleaseTransferBuffers();
         return result;
     } catch (e) {
         showError('callFKernel \u2192 solve_f_kernel_bin WASM call', e, {p1, p2, b1, b2, r1, r2});
@@ -1211,6 +1470,14 @@ function callFKernel(p1, p2, b1, b2, r1, r2) {
 
 // --- plot builders ---
 const plotCfg = {responsive: true, displayModeBar: false};
+
+function renderPlot(divId, traces, layout, cfg) {
+    const el = typeof divId === 'string' ? document.getElementById(divId) : divId;
+    if (el && layout && layout.height) {
+        el.style.height = `${layout.height}px`;
+    }
+    return Plotly.react(el || divId, traces, layout, cfg);
+}
 const margin = {t: 40, b: 40, l: 55, r: 20};
 
 function getThemeColors() {
@@ -1310,12 +1577,12 @@ function plotKernel(divId, t, kernelData, title) {
         layout['xaxis' + (i > 1 ? i : '')].title = {text: 's', font: {size: 11}};
         layout['yaxis' + (i > 1 ? i : '')].title = i === 1 ? {text: 'value', font: {size: 11}} : '';
     }
-    Plotly.react(divId, traces, layout, plotCfg);
+    renderPlot(divId, traces, layout, plotCfg);
 }
 
 function plotResidual(divId, data) {
     const iters = data.residuals.map((_, i) => i);
-    Plotly.react(divId, [{x: iters, y: data.residuals, mode: 'lines', line: {width: 2, color: '#1f77b4'}}], {
+    renderPlot(divId, [{x: iters, y: data.residuals, mode: 'lines', line: {width: 2, color: '#1f77b4'}}], {
         ...baseLayout, ...styledAxes(1),
         height: plotH(270), margin: {...margin, t: 50},
         annotations: [{
@@ -1371,7 +1638,7 @@ function plotControls(divId, data, b1, b2) {
                   bgcolor: c.legendBg, bordercolor: c.legendBorder, borderwidth: 1 },
     };
     for (let i = 1; i <= 3; i++) layout['xaxis' + (i > 1 ? i : '')].title = {text: 't', font: {size: 11}};
-    Plotly.react(divId, traces, layout, plotCfg);
+    renderPlot(divId, traces, layout, plotCfg);
 }
 
 function plotWedges(divId, data) {
@@ -1387,7 +1654,7 @@ function plotWedges(divId, data) {
         text: 'Mean Information Wedges', xref: 'paper', yref: 'paper',
         x: 0.5, y: 1.18, showarrow: false, font: {size: 13, color: getThemeColors().title},
     });
-    Plotly.react(divId, [
+    renderPlot(divId, [
         {x: t, y: data.V1, name: '$\\bar{V}^1$', line: {width: 2, color: '#1f77b4'}, xaxis: 'x1', yaxis: 'y1'},
         {x: t, y: data.V2, name: '$\\bar{V}^2$', line: {width: 2, color: '#d62728'}, xaxis: 'x2', yaxis: 'y2'},
     ], {
@@ -1508,7 +1775,7 @@ function plotFKernel(divId, t, fData, title, spikeInfo) {
         x: 0.5, y: 1.02, showarrow: false, font: {size: 13, color: getThemeColors().title},
     });
     layout.annotations = annotations;
-    Plotly.react(divId, traces, layout, plotCfg);
+    renderPlot(divId, traces, layout, plotCfg);
 }
 
 function plotCosts(divId, sweep) {
@@ -1533,7 +1800,7 @@ function plotCosts(divId, sweep) {
         xref: 'paper', yref: 'paper',
         x: 0.5, y: 1.18, showarrow: false, font: {size: 13, color: getThemeColors().title},
     });
-    Plotly.react(divId, traces, {
+    renderPlot(divId, traces, {
         ...baseLayout, ...styledAxes(2),
         height: plotH(350), margin: {...margin, t: 60},
         grid: {rows: 1, columns: 2, pattern: 'independent'},
@@ -1556,7 +1823,7 @@ function plotBarD1Sweep(divId, sweep) {
     }));
     traces.push({x: t, y: sweep.barD1_pi, name: 'Perfect info',
                  line: {width: 2, dash: 'dash', color: 'gray'}});
-    Plotly.react(divId, traces, {
+    renderPlot(divId, traces, {
         ...baseLayout, ...styledAxes(1),
         height: plotH(350), margin: {...margin, t: 50},
         annotations: [{
@@ -1580,7 +1847,7 @@ function plotBarD2Sweep(divId, sweep) {
     }));
     traces.push({x: t, y: sweep.barD2_pi, name: 'Perfect info',
                  line: {width: 2, dash: 'dash', color: 'gray'}});
-    Plotly.react(divId, traces, {
+    renderPlot(divId, traces, {
         ...baseLayout, ...styledAxes(1),
         height: plotH(350), margin: {...margin, t: 50},
         annotations: [{
@@ -1616,7 +1883,7 @@ function plotWedgesSweep(divId, sweep) {
         xref: 'paper', yref: 'paper',
         x: 0.5, y: 1.18, showarrow: false, font: {size: 13, color: getThemeColors().title},
     });
-    Plotly.react(divId, traces, {
+    renderPlot(divId, traces, {
         ...baseLayout, ...styledAxes(2),
         height: plotH(330), margin: {...margin, t: 60},
         grid: {rows: 1, columns: 2, pattern: 'independent'},
@@ -1691,7 +1958,7 @@ function plotImpulsePhysical(stateDiv, ctrlDiv, fullData, channel, sIdx) {
     impPhysLayout.yaxis2.title = {text: 'control', font: {size: 11}};
     impPhysLayout.xaxis3.title = {text: 't', font: {size: 11}};
     impPhysLayout.yaxis3.title = {text: 'unresolved', font: {size: 11}};
-    Plotly.react(stateDiv, traces, impPhysLayout, plotCfg);
+    renderPlot(stateDiv, traces, impPhysLayout, plotCfg);
 }
 
 // Compute F^i(t, u, source)[target][source] for all u at a given t_idx,
@@ -1855,7 +2122,7 @@ function plotImpulsePlayerSlices(divId, fullData, lightData, fkData, playerNum, 
         layout['xaxis' + (i > 1 ? i : '')].title = {text: 'u', font: {size: 11}};
         layout['yaxis' + (i > 1 ? i : '')].title = i === 1 ? {text: 'loading', font: {size: 11}} : '';
     }
-    Plotly.react(divId, traces, layout, plotCfg);
+    renderPlot(divId, traces, layout, plotCfg);
 }
 
 // --- SVD / rank analysis ---
@@ -1992,7 +2259,7 @@ function plotRankAnalysis(svdDivId, tableDivId, fullData, kernelName) {
             line: {dash: 'dot', color: 'rgba(0,0,0,0.3)', width: 1},
         }],
     };
-    Plotly.react(svdDivId, traces, layout, plotCfg);
+    renderPlot(svdDivId, traces, layout, plotCfg);
 
     // Table
     let html = '<table style="border-collapse:collapse; width:100%;">';
@@ -2010,38 +2277,586 @@ function plotRankAnalysis(svdDivId, tableDivId, fullData, kernelName) {
     document.getElementById(tableDivId).innerHTML = html;
 }
 
+// --- Kyle-Back diagrams ---
+function kyleFmt(v, digits = 3) {
+    if (typeof v !== 'number' || !isFinite(v)) return 'n/a';
+    const av = Math.abs(v);
+    if ((av > 0 && av < 1e-3) || av >= 1e4) return v.toExponential(2);
+    return v.toFixed(digits);
+}
+
+function kyleSeries(block, key) {
+    return block && Array.isArray(block[key]) ? block[key] : [];
+}
+
+function kyleSelectedSource() {
+    const el = document.getElementById('kyle-source-select');
+    return el ? el.value : 'v_noise';
+}
+
+function kyleSourceLabel(key) {
+    return ({
+        v_noise: 'V noise',
+        z_noise: 'Z noise',
+        y1_noise: 'Y1 noise',
+        y2_noise: 'Y2 noise',
+    })[key] || 'V noise';
+}
+
+function kyleSourceChannel(key) {
+    return ({
+        v_noise: 0,
+        z_noise: 1,
+        y1_noise: 2,
+        y2_noise: 3,
+    })[key] || 0;
+}
+
+function kyleVecComponent(rows, idx) {
+    return Array.isArray(rows)
+        ? rows.map(v => Array.isArray(v) ? (Number(v[idx]) || 0) : 0)
+        : [];
+}
+
+function kyleObserverNoiseStateSource(eq, observerKey, sourceIdx, coordIdx) {
+    const rows = eq && eq.noise_state_irfs && Array.isArray(eq.noise_state_irfs[observerKey])
+        ? eq.noise_state_irfs[observerKey]
+        : [];
+    return rows.map(mat =>
+        Array.isArray(mat) && Array.isArray(mat[sourceIdx])
+            ? (Number(mat[sourceIdx][coordIdx]) || 0)
+            : 0
+    );
+}
+
+function kyleObserverReadoutSource(eq, observerKey, sourceIdx, coordIdx) {
+    if (sourceIdx === 0 && coordIdx === 0 && eq && eq.value_irfs) {
+        const valueKey = {
+            market_maker: 'price',
+            trader1: 'trader1_estimate',
+            trader2: 'trader2_estimate',
+        }[observerKey];
+        const corrected = valueKey ? kyleVecComponent(eq.value_irfs[valueKey], 0) : [];
+        if (corrected.length) return corrected;
+    }
+    return kyleObserverNoiseStateSource(eq, observerKey, sourceIdx, coordIdx);
+}
+
+function kylePlayerComponent(group, player, idx) {
+    const rows = group && group[player] ? group[player] : [];
+    return rows.map(v => Array.isArray(v) ? (Number(v[idx]) || 0) : 0);
+}
+
+function kyleClosureSeries(eq, observerKey, rowIdx, coordIdx) {
+    const rows = eq && eq.filter_closure_residuals && Array.isArray(eq.filter_closure_residuals[observerKey])
+        ? eq.filter_closure_residuals[observerKey]
+        : [];
+    return rows.map(mat =>
+        Array.isArray(mat) && Array.isArray(mat[rowIdx])
+            ? (Number(mat[rowIdx][coordIdx]) || 0)
+            : 0
+    );
+}
+
+function kyleEquilibriumSummaryHtml(eq) {
+    if (!eq || !eq.diagnostics) {
+        return '<br><strong>Coupled stationary solve:</strong> not embedded.';
+    }
+    const d = eq.diagnostics || {};
+    const isLagReduced = eq.kind === 'kyle_back_lag_irf_pinn';
+    const isFilterOnly = !!((eq.params && eq.params.filter_only) || (eq.assumptions && eq.assumptions.filter_only));
+    const blocks = d.block_rms || {};
+    const closure = d.closure_rms_unweighted || {};
+    const closureRows = d.closure_row_rms_unweighted || {};
+    const zeroUnobs = d.zero_unobserved_rms_unweighted || {};
+    const zeroBirth = d.zero_birth_rms_unweighted || {};
+    const policyTarget = d.policy_target_rms || {};
+    const closureWorst = Math.max(
+        Number(closure.observer0) || 0,
+        Number(closure.observer1) || 0,
+        Number(closure.observer2) || 0
+    );
+    const opt = Number(blocks.foc_mismatch ?? blocks.local_optimality) || 0;
+    const proj = d.policy_projection_rms_unweighted || {};
+    const converged = isFilterOnly ? closureWorst < 0.1 : (closureWorst < 0.05 && opt < 0.02);
+    const title = isLagReduced ? 'Lag-reduced forward IRF solve' : (isFilterOnly ? 'Fixed-policy filter solve' : 'Coupled stationary solve');
+    const readout = d.readout_rms_unweighted || {};
+    const status = isLagReduced
+        ? 'transport and birth equations are hard-coded; residual readouts are trained for a fixed candidate environment'
+        : (isFilterOnly
+        ? (converged
+            ? 'filter residuals are moderate on the truncated lag grid; actions are fixed inputs'
+            : 'filter-only diagnostic solve; actions are fixed inputs, not an equilibrium')
+        : (converged
+            ? 'near convergence on the truncated lag grid'
+            : 'not fully converged; do not read as a stationary equilibrium yet'));
+    const finalLine = isLagReduced
+        ? `readout RMS: P1 spike=${kyleFmt(readout.player1_spike, 4)}, P2 spike=${kyleFmt(readout.player2_spike, 4)}; ` +
+          'FOC/filter closure are not trained in this diagnostic'
+        : (isFilterOnly
+        ? `policy projection: P1=${kyleFmt(proj.player1, 4)}, P2=${kyleFmt(proj.player2, 4)}; ` +
+          'FOC/adjoint terms are not trained in this checkpoint'
+        : `FOC mismatch=${kyleFmt(blocks.foc_mismatch ?? blocks.local_optimality, 4)}, ` +
+          `policy projection: P1=${kyleFmt(proj.player1, 4)}, P2=${kyleFmt(proj.player2, 4)}, ` +
+          `policy target gap: P1=${kyleFmt(policyTarget.player1, 4)}, P2=${kyleFmt(policyTarget.player2, 4)}`);
+    return (
+        '<div style="margin-top:10px; padding-top:10px; border-top:1px solid var(--card-border);">' +
+        `<strong>${title}:</strong> ${status}<br>` +
+        `loss=${kyleFmt(d.loss, 6)}, RMS=${kyleFmt(d.rms, 6)}, ` +
+        `endogenous impact scale=${kyleFmt(d.lambda, 6)}, step=${d.step || 'n/a'}<br>` +
+        `filter closure RMS: public=${kyleFmt(closure.observer0, 4)}, ` +
+        `trader 1=${kyleFmt(closure.observer1, 4)}, trader 2=${kyleFmt(closure.observer2, 4)}<br>` +
+        `closure rows: public order=${kyleFmt(closureRows.observer0 && closureRows.observer0.order_flow_tilde, 4)}, ` +
+        `T1 order=${kyleFmt(closureRows.observer1 && closureRows.observer1.order_flow_tilde, 4)}, ` +
+        `T1 private V=${kyleFmt(closureRows.observer1 && (closureRows.observer1.private_signal_V_residual ?? closureRows.observer1.private_value_tilde), 4)}, ` +
+        `T2 order=${kyleFmt(closureRows.observer2 && closureRows.observer2.order_flow_tilde, 4)}, ` +
+        `T2 private V=${kyleFmt(closureRows.observer2 && (closureRows.observer2.private_signal_V_residual ?? closureRows.observer2.private_value_tilde), 4)}<br>` +
+        `lag-zero RMS: unobserved public=${kyleFmt(zeroUnobs.observer0, 4)}, T1=${kyleFmt(zeroUnobs.observer1, 4)}, T2=${kyleFmt(zeroUnobs.observer2, 4)}; ` +
+        `birth public=${kyleFmt(zeroBirth.observer0, 4)}, T1=${kyleFmt(zeroBirth.observer1, 4)}, T2=${kyleFmt(zeroBirth.observer2, 4)}<br>` +
+        finalLine +
+        '</div>'
+    );
+}
+
+function kyleRowsHtml(rows) {
+    return rows.map(([name, value]) =>
+        `<tr><td style="padding:4px 12px 4px 0; font-weight:600; color:var(--text-muted);">${name}</td>` +
+        `<td style="padding:4px 0; font-family:'SF Mono','Cascadia Code',monospace;">${value}</td></tr>`
+    ).join('');
+}
+
+function kyleMetricRowsHtml(obj) {
+    if (!obj) return '';
+    return Object.entries(obj).map(([name, value]) =>
+        `<tr><td style="padding:3px 12px 3px 0; color:var(--text-muted);">${name}</td>` +
+        `<td style="padding:3px 0; font-family:'SF Mono','Cascadia Code',monospace;">${kyleFmt(value, 6)}</td></tr>`
+    ).join('');
+}
+
+function kyleNNStateHtml(eq) {
+    const eqd = eq && eq.diagnostics ? eq.diagnostics : null;
+    const eqArch = eq && eq.architecture ? eq.architecture : {};
+    const eqParams = Object.assign({}, eq && eq.params ? eq.params : {}, eq && eq.derived_params ? eq.derived_params : {});
+    const eqInnerQuad = eqParams.inner_quad || (eqParams.integral_quad ? Number(eqParams.integral_quad) + 2 : null);
+    const eqClosure = eqd && eqd.closure_rms_unweighted ? eqd.closure_rms_unweighted : {};
+    const eqClosureRows = eqd && eqd.closure_row_rms_unweighted ? eqd.closure_row_rms_unweighted : {};
+    const eqFoc = eqd && eqd.foc_mismatch_rms_unweighted ? eqd.foc_mismatch_rms_unweighted : {};
+    const eqPolicyTarget = eqd ? (eqd.policy_target_rms || {}) : {};
+    const eqProj = eqd && eqd.policy_projection_rms_unweighted ? eqd.policy_projection_rms_unweighted : {};
+    const eqBlocks = eqd && eqd.block_rms ? eqd.block_rms : {};
+    const eqZeroUnobs = eqd && eqd.zero_unobserved_rms_unweighted ? eqd.zero_unobserved_rms_unweighted : {};
+    const eqZeroBirth = eqd && eqd.zero_birth_rms_unweighted ? eqd.zero_birth_rms_unweighted : {};
+    const eqFields = eq && eq.fields ? eq.fields : {};
+    const isLagReduced = eq && eq.kind === 'kyle_back_lag_irf_pinn';
+    const isFilterOnly = !!((eq && eq.params && eq.params.filter_only) || (eq && eq.assumptions && eq.assumptions.filter_only));
+    const eqRows = eqd ? [
+        ['input', 'lag ell'],
+        ['mode', isLagReduced ? 'fixed candidate environment; lag-reduced forward IRF readout training' : (isFilterOnly ? 'fixed exponential actions; filter-only training' : 'coupled filter/action/adjoint/FOC training')],
+        ['outputs', isLagReduced ? 'residual readouts r0/rz/ry plus transport/birth reconstructed IRFs' : (isFilterOnly ? 'fixed D, projected calD, observer noise-state IRFs, filter residuals' : 'D, calD, observer noise-state IRFs, mispricing demand, calH, FOC mismatch')],
+        ['architecture', `${eqArch.depth || '?'}x${eqArch.hidden || '?'} tanh`],
+        ['parameters', eqArch.n_params || 'n/a'],
+        ['lag grid', `N=${eqParams.N || 'n/a'}, L=${kyleFmt(eqParams.L, 3)}, integral=${eqParams.integral_quad || 'n/a'}, inner=${eqInnerQuad || 'n/a'}, filter=${eqParams.filter_quad || 'n/a'}`],
+        ['loss / RMS', `${kyleFmt(eqd.loss, 6)} / ${kyleFmt(eqd.rms, 6)}`],
+        ['endogenous impact scale', kyleFmt(eqd.lambda, 6)],
+        ['closure RMS', `public=${kyleFmt(eqClosure.observer0, 4)}, trader1=${kyleFmt(eqClosure.observer1, 4)}, trader2=${kyleFmt(eqClosure.observer2, 4)}`],
+        ['closure rows', `public order=${kyleFmt(eqClosureRows.observer0 && eqClosureRows.observer0.order_flow_tilde, 4)}, T1 order=${kyleFmt(eqClosureRows.observer1 && eqClosureRows.observer1.order_flow_tilde, 4)}, T1 private V=${kyleFmt(eqClosureRows.observer1 && (eqClosureRows.observer1.private_signal_V_residual ?? eqClosureRows.observer1.private_value_tilde), 4)}, T2 order=${kyleFmt(eqClosureRows.observer2 && eqClosureRows.observer2.order_flow_tilde, 4)}, T2 private V=${kyleFmt(eqClosureRows.observer2 && (eqClosureRows.observer2.private_signal_V_residual ?? eqClosureRows.observer2.private_value_tilde), 4)}`],
+        ['zero unobserved', `public=${kyleFmt(eqZeroUnobs.observer0, 4)}, trader1=${kyleFmt(eqZeroUnobs.observer1, 4)}, trader2=${kyleFmt(eqZeroUnobs.observer2, 4)}`],
+        ['zero birth', `public=${kyleFmt(eqZeroBirth.observer0, 4)}, trader1=${kyleFmt(eqZeroBirth.observer1, 4)}, trader2=${kyleFmt(eqZeroBirth.observer2, 4)}`],
+        ['FOC mismatch', isFilterOnly ? 'not trained in this checkpoint' : `P1=${kyleFmt(eqFoc.player1, 4)}, P2=${kyleFmt(eqFoc.player2, 4)}`],
+        ['policy projection', `P1=${kyleFmt(eqProj.player1, 4)}, P2=${kyleFmt(eqProj.player2, 4)}`],
+        ['policy target gap', isFilterOnly ? 'not trained in this checkpoint' : `P1=${kyleFmt(eqPolicyTarget.player1, 4)}, P2=${kyleFmt(eqPolicyTarget.player2, 4)}`],
+        ['exported fields', Object.keys(eqFields).join(', ') || 'n/a'],
+    ] : [['status', 'no coupled stationary checkpoint embedded']];
+    return (
+        '<div style="border-top:1px solid var(--card-border); padding-top:14px;">' +
+        '<h3 style="margin:0 0 8px; font-size:1em;">Embedded Neural Network State</h3>' +
+        '<div style="border:1px solid var(--card-border); border-radius:8px; padding:12px; background:var(--pair-bg);">' +
+        '<div style="font-weight:700; margin-bottom:8px;">Coupled stationary PINN checkpoint</div>' +
+        '<table style="border-collapse:collapse; width:100%; font-size:0.88em;">' + kyleRowsHtml(eqRows) + '</table>' +
+        '<div style="font-weight:700; margin:12px 0 6px;">Residual blocks</div>' +
+        '<table style="border-collapse:collapse; width:100%; font-size:0.84em;">' + kyleMetricRowsHtml(eqBlocks) + '</table>' +
+        '</div>' +
+        '</div>'
+    );
+}
+
+function kyleFillSummary() {
+    const eq = KYLE_BACK_EQUILIBRIUM;
+    const summaryEl = document.getElementById('kyle-summary');
+    const tableEl = document.getElementById('kyle-param-table');
+    const nnEl = document.getElementById('kyle-nn-state');
+    if (!eq) {
+        if (summaryEl) {
+            summaryEl.innerHTML =
+                '<strong>No coupled Kyle-Back checkpoint embedded.</strong><br>' +
+                'Train/export the coupled stationary PINN, then rebuild <code>interactive.html</code>.';
+        }
+        if (nnEl) nnEl.innerHTML = '';
+        return;
+    }
+    const d = eq.diagnostics || {};
+    const arch = eq.architecture || {};
+    const params = Object.assign({}, eq.params || {}, eq.derived_params || {});
+    const assumptions = eq.assumptions || {};
+    const isLagReduced = eq.kind === 'kyle_back_lag_irf_pinn';
+    const isFilterOnly = !!(params.filter_only || assumptions.filter_only);
+    if (summaryEl) {
+        summaryEl.innerHTML =
+            `<strong>${eq.description || 'Coupled stationary Kyle-Back PINN'}</strong><br>` +
+            `scope=${assumptions.scope || 'coupled stationary residual solve'}<br>` +
+            `lag grid=${(eq.grid && eq.grid.length) || 'n/a'}, ` +
+            `network=${arch.depth || '?'}x${arch.hidden || '?'} tanh, params=${arch.n_params || 'n/a'}<br>` +
+            (isLagReduced ? 'mode=fixed candidate environment; network learns one-lag residual readouts and reconstructs transport/birth IRFs<br>' :
+             (isFilterOnly ? 'mode=fixed exponential actions; filter network trained with actions held fixed<br>' : '')) +
+            `loss=${kyleFmt(d.loss, 6)}, RMS=${kyleFmt(d.rms, 6)}, ` +
+            `endogenous impact scale=${kyleFmt(d.lambda, 6)}, selected primitive source=${kyleSourceLabel(kyleSelectedSource())}` +
+            kyleEquilibriumSummaryHtml(eq);
+    }
+    if (tableEl) {
+        const rows = [
+            ['rho', params.rho], ['std_v', params.std_v], ['std_z', params.std_z],
+            ['gamma1', params.gamma1], ['gamma2', params.gamma2],
+            ['train_mode', params.train_mode],
+        ];
+        if (params.fixed_policy) {
+            rows.push(
+                ['fixed_d1_v', params.fixed_d1_v ?? params.d1_v], ['fixed_d2_v', params.fixed_d2_v ?? params.d2_v],
+                ['fixed_d1_z', params.fixed_d1_z], ['fixed_d2_z', params.fixed_d2_z],
+                ['fixed_d1_y', params.fixed_d1_y ?? params.d1_y], ['fixed_d2_y', params.fixed_d2_y ?? params.d2_y],
+                ['fixed_policy_decay', params.fixed_policy_decay ?? params.d_decay], ['private_decay', params.private_decay],
+            );
+        }
+        rows.push(
+            ['tail_decay', params.tail_decay], ['filter_quad', params.filter_quad],
+            ['integral_quad', params.integral_quad], ['inner_quad', params.inner_quad || (params.integral_quad ? Number(params.integral_quad) + 2 : null)],
+            ['L', params.L],
+        );
+        tableEl.innerHTML =
+            '<table style="border-collapse:collapse; width:100%; font-size:0.9em;">' +
+            rows.map(([name, value]) => {
+                const displayed = typeof value === 'string' ? value : kyleFmt(value, 4);
+                return `<tr><td style="padding:4px 14px 4px 0; font-weight:600; color:var(--text-muted);">${name}</td>` +
+                    `<td style="padding:4px 0; font-family:'SF Mono','Cascadia Code',monospace;">${displayed}</td></tr>`;
+            }).join('') +
+            '</table>';
+    }
+    if (nnEl) {
+        nnEl.innerHTML = kyleNNStateHtml(eq);
+    }
+}
+
+function plotKyleBackResults() {
+    const eq = KYLE_BACK_EQUILIBRIUM;
+    kyleFillSummary();
+    if (!eq || !Array.isArray(eq.grid)) return false;
+
+    const c = getThemeColors();
+    const player1 = '#1f77b4';
+    const player2 = '#d62728';
+    const green = '#2ca02c';
+    const neutral = c.neutral || '#333';
+    const coordColors = [neutral, green, player1, player2];
+    const lag = eq.grid || [];
+    const selectedSourceKey = kyleSelectedSource();
+    const ch = kyleSourceChannel(selectedSourceKey);
+    const selectedSourceLabel = kyleSourceLabel(selectedSourceKey);
+    const chLabel = ['V', 'Z', 'Y1', 'Y2'][ch] || 'V';
+    const zeroLine = {type: 'line', x0: lag[0] || 0, x1: lag[lag.length - 1] || 1, y0: 0, y1: 0,
+                      line: {dash: 'dot', color: c.line, width: 1}};
+    const valueShock = eq.value_irfs || {};
+    const calD = eq.calD || {};
+    const rawPolicy = eq.policy_noise_state || {};
+    const coordLabels = ['V', 'Z', 'Y1', 'Y2'];
+
+    renderPlot('plot-kyle-v-estimates', [
+        {x: lag, y: kyleVecComponent(valueShock.true_value, 0), name: 'true V',
+         mode: 'lines', line: {width: 2.8, color: neutral}},
+        {x: lag, y: kyleVecComponent(valueShock.price, 0), name: 'price P',
+         mode: 'lines', line: {width: 2.5, color: green}},
+        {x: lag, y: kyleVecComponent(valueShock.trader1_estimate, 0), name: 'trader 1 estimate',
+         mode: 'lines', line: {width: 2.2, color: player1, dash: 'dash'}},
+        {x: lag, y: kyleVecComponent(valueShock.trader2_estimate, 0), name: 'trader 2 estimate',
+         mode: 'lines', line: {width: 2.2, color: player2, dash: 'dash'}},
+    ], {
+        ...baseLayout, ...styledAxes(1),
+        height: plotH(340), margin: {t: 50, b: 45, l: 58, r: 22},
+        title: {text: 'Belief IRFs from a fundamental V shock', font: {size: 13, color: c.title}, y: 0.98},
+        xaxis: {...styledAxes(1).xaxis, title: {text: 'lag a after value shock', font: {size: 11}}},
+        yaxis: {...styledAxes(1).yaxis, title: {text: 'estimate response', font: {size: 11}}},
+        shapes: [zeroLine],
+        legend: {orientation: 'h', y: 1.08, x: 0.5, xanchor: 'center', font: {size: 10},
+                 bgcolor: c.legendBg, bordercolor: c.legendBorder, borderwidth: 1},
+    }, plotCfg);
+
+    renderPlot('plot-kyle-state-irfs', [
+        {x: lag, y: kyleVecComponent(valueShock.mispricing_gap1, 0), name: 'trader 1 gap',
+         mode: 'lines', line: {width: 2.3, color: player1}, xaxis: 'x1', yaxis: 'y1'},
+        {x: lag, y: kyleVecComponent(valueShock.mispricing_gap2, 0), name: 'trader 2 gap',
+         mode: 'lines', line: {width: 2.3, color: player2}, xaxis: 'x1', yaxis: 'y1'},
+        {x: lag, y: kylePlayerComponent(calD, 'player1', 0), name: 'calD1 from V',
+         mode: 'lines', line: {width: 2.2, color: player1, dash: 'dash'}, xaxis: 'x2', yaxis: 'y2'},
+        {x: lag, y: kylePlayerComponent(calD, 'player2', 0), name: 'calD2 from V',
+         mode: 'lines', line: {width: 2.2, color: player2, dash: 'dash'}, xaxis: 'x2', yaxis: 'y2'},
+    ], {
+        ...baseLayout,
+        height: plotH(390), margin: {t: 58, b: 46, l: 58, r: 24},
+        title: {text: 'Information gaps and value-shock demand IRFs', font: {size: 13, color: c.title}, y: 0.99},
+        xaxis: {domain: [0, 0.47], gridcolor: c.grid, linecolor: c.line, tickfont: {color: c.font}, title: {text: 'lag a', font: {size: 11}}},
+        yaxis: {gridcolor: c.grid, linecolor: c.line, tickfont: {color: c.font}, title: {text: 'belief gap', font: {size: 11}}},
+        xaxis2: {domain: [0.55, 1], gridcolor: c.grid, linecolor: c.line, tickfont: {color: c.font}, title: {text: 'lag a', font: {size: 11}}},
+        yaxis2: {anchor: 'x2', gridcolor: c.grid, linecolor: c.line, tickfont: {color: c.font}, title: {text: 'best-response demand', font: {size: 11}}},
+        shapes: [{...zeroLine, xref: 'x1', yref: 'y1'}, {...zeroLine, xref: 'x2', yref: 'y2'}],
+        annotations: [
+            {x: 0.235, y: 1.08, xref: 'paper', yref: 'paper', text: 'information gap', showarrow: false, font: {size: 12, color: c.annotation}},
+            {x: 0.775, y: 1.08, xref: 'paper', yref: 'paper', text: 'projected best-response demand', showarrow: false, font: {size: 12, color: c.annotation}},
+        ],
+        legend: {orientation: 'h', y: -0.18, x: 0.5, xanchor: 'center', font: {size: 10},
+                 bgcolor: c.legendBg, bordercolor: c.legendBorder, borderwidth: 1},
+    }, plotCfg);
+
+    renderPlot('plot-kyle-noise-estimates', [
+        {x: lag, y: kyleObserverReadoutSource(eq, 'market_maker', ch, 0), name: 'price P',
+         mode: 'lines', line: {width: 2.5, color: green}, xaxis: 'x', yaxis: 'y'},
+        {x: lag, y: kyleObserverReadoutSource(eq, 'trader1', ch, 0), name: 'trader 1 estimate',
+         mode: 'lines', line: {width: 2.2, color: player1, dash: 'dash'}, xaxis: 'x', yaxis: 'y'},
+        {x: lag, y: kyleObserverReadoutSource(eq, 'trader2', ch, 0), name: 'trader 2 estimate',
+         mode: 'lines', line: {width: 2.2, color: player2, dash: 'dash'}, xaxis: 'x', yaxis: 'y'},
+        {x: lag, y: kylePlayerComponent(calD, 'player1', ch), name: 'trader 1 demand',
+         mode: 'lines', line: {width: 2.1, color: player1}, xaxis: 'x2', yaxis: 'y2'},
+        {x: lag, y: kylePlayerComponent(calD, 'player2', ch), name: 'trader 2 demand',
+         mode: 'lines', line: {width: 2.1, color: player2}, xaxis: 'x2', yaxis: 'y2'},
+    ], {
+        ...baseLayout,
+        height: plotH(390), margin: {t: 58, b: 46, l: 58, r: 24},
+        title: {text: `Scalar readout and demand IRFs from ${selectedSourceLabel}`, font: {size: 13, color: c.title}, y: 0.99},
+        xaxis: {domain: [0, 0.47], gridcolor: c.grid, linecolor: c.line, tickfont: {color: c.font}, title: {text: 'lag a', font: {size: 11}}},
+        yaxis: {gridcolor: c.grid, linecolor: c.line, tickfont: {color: c.font}, title: {text: 'price / estimate response', font: {size: 11}}},
+        xaxis2: {domain: [0.55, 1], gridcolor: c.grid, linecolor: c.line, tickfont: {color: c.font}, title: {text: 'lag a', font: {size: 11}}},
+        yaxis2: {anchor: 'x2', gridcolor: c.grid, linecolor: c.line, tickfont: {color: c.font}, title: {text: 'best-response demand', font: {size: 11}}},
+        shapes: [{...zeroLine, xref: 'x', yref: 'y'}, {...zeroLine, xref: 'x2', yref: 'y2'}],
+        annotations: [
+            {x: 0.235, y: 1.08, xref: 'paper', yref: 'paper', text: 'belief readouts', showarrow: false, font: {size: 12, color: c.annotation}},
+            {x: 0.775, y: 1.08, xref: 'paper', yref: 'paper', text: 'projected best-response demands', showarrow: false, font: {size: 12, color: c.annotation}},
+        ],
+        legend: {orientation: 'h', y: -0.18, x: 0.5, xanchor: 'center', font: {size: 10},
+                 bgcolor: c.legendBg, bordercolor: c.legendBorder, borderwidth: 1},
+    }, plotCfg);
+
+    const rawPolicyTraces = [];
+    coordLabels.forEach((label, idx) => {
+        rawPolicyTraces.push({
+            x: lag,
+            y: kylePlayerComponent(rawPolicy, 'player1', idx),
+            name: `P1 ${label}`,
+            mode: 'lines',
+            line: {width: idx === 0 ? 2.5 : 2.0, color: coordColors[idx], dash: idx === 0 ? 'solid' : 'dash'},
+            xaxis: 'x1',
+            yaxis: 'y1',
+            legendgroup: label,
+            showlegend: true,
+        });
+        rawPolicyTraces.push({
+            x: lag,
+            y: kylePlayerComponent(rawPolicy, 'player2', idx),
+            name: `P2 ${label}`,
+            mode: 'lines',
+            line: {width: idx === 0 ? 2.5 : 2.0, color: coordColors[idx], dash: idx === 0 ? 'solid' : 'dashdot'},
+            xaxis: 'x2',
+            yaxis: 'y2',
+            legendgroup: label,
+            showlegend: false,
+        });
+    });
+    renderPlot('plot-kyle-raw-policy', rawPolicyTraces, {
+        ...baseLayout,
+        height: plotH(390), margin: {t: 58, b: 46, l: 58, r: 24},
+        title: {text: 'Raw noise-state policy kernels D1 and D2', font: {size: 13, color: c.title}, y: 0.99},
+        xaxis: {domain: [0, 0.47], gridcolor: c.grid, linecolor: c.line, tickfont: {color: c.font}, title: {text: 'lag ell', font: {size: 11}}},
+        yaxis: {gridcolor: c.grid, linecolor: c.line, tickfont: {color: c.font}, title: {text: 'raw action loading', font: {size: 11}}},
+        xaxis2: {domain: [0.55, 1], gridcolor: c.grid, linecolor: c.line, tickfont: {color: c.font}, title: {text: 'lag ell', font: {size: 11}}},
+        yaxis2: {anchor: 'x2', gridcolor: c.grid, linecolor: c.line, tickfont: {color: c.font}, title: {text: 'raw action loading', font: {size: 11}}},
+        shapes: [{...zeroLine, xref: 'x1', yref: 'y1'}, {...zeroLine, xref: 'x2', yref: 'y2'}],
+        annotations: [
+            {x: 0.235, y: 1.08, xref: 'paper', yref: 'paper', text: 'player 1 raw policy D1', showarrow: false, font: {size: 12, color: c.annotation}},
+            {x: 0.775, y: 1.08, xref: 'paper', yref: 'paper', text: 'player 2 raw policy D2', showarrow: false, font: {size: 12, color: c.annotation}},
+        ],
+        legend: {orientation: 'h', y: -0.18, x: 0.5, xanchor: 'center', font: {size: 10},
+                 bgcolor: c.legendBg, bordercolor: c.legendBorder, borderwidth: 1},
+    }, plotCfg);
+
+    const observers = [
+        ['state_market_maker', 'market maker', 'x', 'y'],
+        ['state_trader1', 'trader 1', 'x2', 'y2'],
+        ['state_trader2', 'trader 2', 'x3', 'y3'],
+    ];
+    const stateTraces = [];
+    observers.forEach(([stateKey, observerLabel, xaxisName, yaxisName], obsIdx) => {
+        coordLabels.forEach((label, idx) => {
+            stateTraces.push({
+                x: lag,
+                y: kyleObserverNoiseStateSource(eq, stateKey.replace('state_', ''), ch, idx),
+                name: label,
+                mode: 'lines',
+                line: {width: idx === 0 ? 2.4 : 1.9, color: coordColors[idx], dash: idx === 0 ? 'solid' : 'dash'},
+                xaxis: xaxisName,
+                yaxis: yaxisName,
+                legendgroup: label,
+                showlegend: obsIdx === 0,
+                hovertemplate: `${observerLabel} ${label}<br>lag=%{x:.3g}<br>response=%{y:.3g}<extra></extra>`,
+            });
+        });
+    });
+    renderPlot('plot-kyle-noise-states', stateTraces, {
+        ...baseLayout,
+        height: plotH(430), margin: {t: 60, b: 48, l: 58, r: 24},
+        title: {text: `Vector noise-state IRFs from ${selectedSourceLabel}`, font: {size: 13, color: c.title}, y: 0.99},
+        xaxis: {domain: [0, 0.30], gridcolor: c.grid, linecolor: c.line, tickfont: {color: c.font}, title: {text: 'lag a', font: {size: 11}}},
+        yaxis: {gridcolor: c.grid, linecolor: c.line, tickfont: {color: c.font}, title: {text: 'state response', font: {size: 11}}},
+        xaxis2: {domain: [0.35, 0.65], gridcolor: c.grid, linecolor: c.line, tickfont: {color: c.font}, title: {text: 'lag a', font: {size: 11}}},
+        yaxis2: {anchor: 'x2', gridcolor: c.grid, linecolor: c.line, tickfont: {color: c.font}, title: {text: 'state response', font: {size: 11}}},
+        xaxis3: {domain: [0.70, 1], gridcolor: c.grid, linecolor: c.line, tickfont: {color: c.font}, title: {text: 'lag a', font: {size: 11}}},
+        yaxis3: {anchor: 'x3', gridcolor: c.grid, linecolor: c.line, tickfont: {color: c.font}, title: {text: 'state response', font: {size: 11}}},
+        shapes: [
+            {...zeroLine, xref: 'x', yref: 'y'},
+            {...zeroLine, xref: 'x2', yref: 'y2'},
+            {...zeroLine, xref: 'x3', yref: 'y3'},
+        ],
+        annotations: [
+            {x: 0.15, y: 1.08, xref: 'paper', yref: 'paper', text: 'market maker', showarrow: false, font: {size: 12, color: c.annotation}},
+            {x: 0.50, y: 1.08, xref: 'paper', yref: 'paper', text: 'trader 1', showarrow: false, font: {size: 12, color: c.annotation}},
+            {x: 0.85, y: 1.08, xref: 'paper', yref: 'paper', text: 'trader 2', showarrow: false, font: {size: 12, color: c.annotation}},
+        ],
+        legend: {orientation: 'h', y: -0.18, x: 0.5, xanchor: 'center', font: {size: 10},
+                 bgcolor: c.legendBg, bordercolor: c.legendBorder, borderwidth: 1},
+    }, plotCfg);
+
+    const residualTraces = [
+        {x: lag, y: kyleClosureSeries(eq, 'observer0', 0, ch), name: 'public row Z',
+         mode: 'lines', line: {width: 2.2, color: green}},
+        {x: lag, y: kyleClosureSeries(eq, 'observer1', 0, ch), name: 'trader 1 row Z',
+         mode: 'lines', line: {width: 2.0, color: player1}},
+        {x: lag, y: kyleClosureSeries(eq, 'observer1', 1, ch), name: 'trader 1 row Y1',
+         mode: 'lines', line: {width: 1.8, color: player1, dash: 'dash'}},
+        {x: lag, y: kyleClosureSeries(eq, 'observer2', 0, ch), name: 'trader 2 row Z',
+         mode: 'lines', line: {width: 2.0, color: player2}},
+        {x: lag, y: kyleClosureSeries(eq, 'observer2', 1, ch), name: 'trader 2 row Y2',
+         mode: 'lines', line: {width: 1.8, color: player2, dash: 'dash'}},
+    ];
+    renderPlot('plot-kyle-residuals', residualTraces, {
+        ...baseLayout, ...styledAxes(1),
+        height: plotH(360), margin: {t: 50, b: 45, l: 58, r: 22},
+        title: {text: `Filter closure residuals: ${chLabel} coordinate`, font: {size: 13, color: c.title}, y: 0.98},
+        xaxis: {...styledAxes(1).xaxis, title: {text: 'lag ell', font: {size: 11}}},
+        yaxis: {...styledAxes(1).yaxis, title: {text: 'closure residual', font: {size: 11}}},
+        shapes: [zeroLine],
+        legend: {orientation: 'h', y: -0.18, x: 0.5, xanchor: 'center', font: {size: 9},
+                 bgcolor: c.legendBg, bordercolor: c.legendBorder, borderwidth: 1},
+    }, plotCfg);
+
+    const eqLag = eq && Array.isArray(eq.grid) ? eq.grid : [];
+    const foc = eq && eq.foc_terms ? eq.foc_terms : null;
+    const isFilterOnly = !!((eq && eq.params && eq.params.filter_only) || (eq && eq.assumptions && eq.assumptions.filter_only));
+    if (isFilterOnly) {
+        const focEl = document.getElementById('plot-kyle-equilibrium-foc');
+        if (focEl) {
+            focEl.innerHTML =
+                '<div style="padding:28px; border:1px solid var(--card-border); border-radius:8px; color:var(--text-muted); background:var(--pair-bg);">' +
+                '<strong>FOC terms are not trained in the fixed-policy filter checkpoint.</strong><br>' +
+                'Use the Value Shock and Noise States subtabs for the learned filters, projected fixed actions, and filter residuals.' +
+                '</div>';
+        }
+    } else if (foc && eqLag.length) {
+        const lhs = foc.foc_lhs || {};
+        const calH = foc.estimated_calH || {};
+        const mismatch = foc.foc_mismatch || {};
+        renderPlot('plot-kyle-equilibrium-foc', [
+            {x: eqLag, y: kylePlayerComponent(lhs, 'player1', ch), name: 'P1 FOC LHS',
+             mode: 'lines', line: {width: 2.3, color: player1}, xaxis: 'x1', yaxis: 'y1'},
+            {x: eqLag, y: kylePlayerComponent(calH, 'player1', ch), name: 'P1 estimated calH',
+             mode: 'lines', line: {width: 1.9, color: player1, dash: 'dash'}, xaxis: 'x1', yaxis: 'y1'},
+            {x: eqLag, y: kylePlayerComponent(lhs, 'player2', ch), name: 'P2 FOC LHS',
+             mode: 'lines', line: {width: 2.3, color: player2}, xaxis: 'x1', yaxis: 'y1'},
+            {x: eqLag, y: kylePlayerComponent(calH, 'player2', ch), name: 'P2 estimated calH',
+             mode: 'lines', line: {width: 1.9, color: player2, dash: 'dash'}, xaxis: 'x1', yaxis: 'y1'},
+            {x: eqLag, y: kylePlayerComponent(mismatch, 'player1', ch), name: 'P1 mismatch',
+             mode: 'lines', line: {width: 2.0, color: player1}, xaxis: 'x2', yaxis: 'y2'},
+            {x: eqLag, y: kylePlayerComponent(mismatch, 'player2', ch), name: 'P2 mismatch',
+             mode: 'lines', line: {width: 2.0, color: player2}, xaxis: 'x2', yaxis: 'y2'},
+        ], {
+            ...baseLayout,
+            height: plotH(390), margin: {t: 58, b: 46, l: 58, r: 24},
+            title: {text: `Coupled stationary FOC terms: ${chLabel} coordinate`, font: {size: 13, color: c.title}, y: 0.99},
+            xaxis: {domain: [0, 0.47], gridcolor: c.grid, linecolor: c.line, tickfont: {color: c.font}, title: {text: 'lag ell', font: {size: 11}}},
+            yaxis: {gridcolor: c.grid, linecolor: c.line, tickfont: {color: c.font}, title: {text: 'FOC term', font: {size: 11}}},
+            xaxis2: {domain: [0.55, 1], gridcolor: c.grid, linecolor: c.line, tickfont: {color: c.font}, title: {text: 'lag ell', font: {size: 11}}},
+            yaxis2: {anchor: 'x2', gridcolor: c.grid, linecolor: c.line, tickfont: {color: c.font}, title: {text: 'LHS - calH', font: {size: 11}}},
+            shapes: [{...zeroLine, xref: 'x1', yref: 'y1'}, {...zeroLine, xref: 'x2', yref: 'y2'}],
+            annotations: [
+                {x: 0.235, y: 1.08, xref: 'paper', yref: 'paper', text: 'mispricing/price-impact LHS vs calH', showarrow: false, font: {size: 12, color: c.annotation}},
+                {x: 0.775, y: 1.08, xref: 'paper', yref: 'paper', text: 'FOC mismatch', showarrow: false, font: {size: 12, color: c.annotation}},
+            ],
+            legend: {orientation: 'h', y: -0.18, x: 0.5, xanchor: 'center', font: {size: 9},
+                     bgcolor: c.legendBg, bordercolor: c.legendBorder, borderwidth: 1},
+        }, plotCfg);
+    }
+
+    if (typeof MathJax !== 'undefined' && MathJax.Hub) {
+        MathJax.Hub.Queue(['Typeset', MathJax.Hub, document.getElementById('tab-kyle-back')]);
+    }
+    return true;
+}
+
 // --- app logic ---
 let debounceTimer = null;
 let activeTab = 'tab-model';
 let solving = false;  // Guard against concurrent solver calls
 let pendingUpdate = false;  // Re-run after current solve finishes
+const LIGHT_STATUS_TABS = new Set(['tab-equilibrium', 'tab-simulation', 'tab-kernels', 'tab-impulse', 'tab-diagnostics']);
 
 // Cached solver results + dirty flags per tab
 let lightData = null, fullData = null, sweepData = null, fKernelData = null;
 let allocData = null, lastAllocKey = '';
 let lastParamsKey = '';
-const dirty = { 'tab-equilibrium': true, 'tab-simulation': true, 'tab-kernels': true, 'tab-impulse': true, 'tab-statics': true, 'tab-allocation': true, 'tab-diagnostics': true };
+const dirty = { 'tab-equilibrium': true, 'tab-simulation': true, 'tab-kernels': true, 'tab-impulse': true, 'tab-statics': true, 'tab-allocation': true, 'tab-stationary': true, 'tab-kyle-back': true, 'tab-diagnostics': true };
 
 // Track current grid params to detect N/T changes
 let currentN = 40, currentT = 1.0;
 
+function clampSliderValue(el, value) {
+    let v = Number(value);
+    const min = Number(el.min);
+    const max = Number(el.max);
+    if (!Number.isFinite(v)) v = Number.isFinite(min) ? min : 0;
+    if (Number.isFinite(min)) v = Math.max(min, v);
+    if (Number.isFinite(max)) v = Math.min(max, v);
+    return v;
+}
+
+function readSliderNumber(id, integer = false) {
+    const el = document.getElementById(id);
+    const v = clampSliderValue(el, el.value);
+    el.value = integer ? String(Math.round(v)) : String(v);
+    return integer ? parseInt(el.value, 10) : parseFloat(el.value);
+}
+
 function getParams() {
     return {
-        p1: parseFloat(document.getElementById('sl-p1').value),
-        p2: parseFloat(document.getElementById('sl-p2').value),
-        b1: parseFloat(document.getElementById('sl-b1').value),
-        b2: parseFloat(document.getElementById('sl-b2').value),
-        r1: parseFloat(document.getElementById('sl-r1').value),
-        r2: parseFloat(document.getElementById('sl-r2').value),
-        x0: parseFloat(document.getElementById('sl-x0').value),
-        sigma: parseFloat(document.getElementById('sl-sigma').value),
-        N: parseInt(document.getElementById('sl-N').value),
-        T: parseFloat(document.getElementById('sl-T').value),
+        p1: readSliderNumber('sl-p1'),
+        p2: readSliderNumber('sl-p2'),
+        b1: readSliderNumber('sl-b1'),
+        b2: readSliderNumber('sl-b2'),
+        r1: readSliderNumber('sl-r1'),
+        r2: readSliderNumber('sl-r2'),
+        x0: readSliderNumber('sl-x0'),
+        sigma: readSliderNumber('sl-sigma'),
+        qT: readSliderNumber('sl-qT'),
+        N: readSliderNumber('sl-N', true),
+        T: readSliderNumber('sl-T'),
     };
 }
 
 function paramsToHash(p, tab) {
-    const defaults = {p1:3, p2:3, r1:0.1, r2:0.1, b1:1, b2:-1, x0:0, sigma:1, N:40, T:1};
+    const defaults = {p1:3, p2:3, r1:0.1, r2:0.1, b1:1, b2:-1, x0:0, sigma:1, qT:0, N:40, T:1};
     const parts = [];
     for (const [k, v] of Object.entries(p)) {
         if (v !== defaults[k]) parts.push(k + '=' + v);
@@ -2063,19 +2878,21 @@ function hashToParams() {
 
 function updateLabels() {
     const p = getParams();
-    document.getElementById('val-p1').textContent = p.p1.toFixed(1);
-    document.getElementById('val-p2').textContent = p.p2.toFixed(1);
+    const fmtPrec = v => v < 1 ? v.toFixed(2) : v.toFixed(1);
+    document.getElementById('val-p1').textContent = fmtPrec(p.p1);
+    document.getElementById('val-p2').textContent = fmtPrec(p.p2);
     document.getElementById('val-b1').textContent = p.b1.toFixed(1);
     document.getElementById('val-b2').textContent = p.b2.toFixed(1);
     document.getElementById('val-r1').textContent = p.r1.toFixed(2);
     document.getElementById('val-r2').textContent = p.r2.toFixed(2);
     document.getElementById('val-x0').textContent = p.x0.toFixed(1);
     document.getElementById('val-sigma').textContent = p.sigma.toFixed(1);
+    document.getElementById('val-qT').textContent = p.qT.toFixed(2);
     document.getElementById('val-N').textContent = p.N;
     document.getElementById('val-T').textContent = p.T.toFixed(2);
     const liveEl = document.getElementById('model-params-live');
     if (liveEl) {
-        liveEl.textContent = `Current: p\u2081=${p.p1} p\u2082=${p.p2} r\u2081=${p.r1} r\u2082=${p.r2} b\u2081=${p.b1} b\u2082=${p.b2} x\u2080=${p.x0} \u03C3=${p.sigma} T=${p.T} N=${p.N}`;
+        liveEl.textContent = `Current: p\u2081=${p.p1} p\u2082=${p.p2} r\u2081=${p.r1} r\u2082=${p.r2} b\u2081=${p.b1} b\u2082=${p.b2} x\u2080=${p.x0} \u03C3=${p.sigma} qT=${p.qT} T=${p.T} N=${p.N}`;
     }
 }
 
@@ -2090,13 +2907,14 @@ function applyGrid(p) {
     }
     if (wasmSetSigma) wasmSetSigma(p.sigma);
     if (wasmSetX0) wasmSetX0(p.x0);
+    if (wasmSetTerminalWeight) wasmSetTerminalWeight(p.qT);
 }
 
 // Invalidate all cached data when any parameter changes.
 function invalidateIfChanged(p) {
     applyGrid(p);
     const ceOn = document.getElementById('cb-ce-mode').checked;
-    const key = `${p.N},${p.T},${p.p1},${p.p2},${p.b1},${p.b2},${p.r1},${p.r2},${p.x0},${p.sigma},ce=${ceOn}`;
+    const key = `${p.N},${p.T},${p.p1},${p.p2},${p.b1},${p.b2},${p.r1},${p.r2},${p.x0},${p.sigma},${p.qT},ce=${ceOn}`;
     // Also invalidate if previous solve failed (lightData is null with matching key)
     if (key !== lastParamsKey || !lightData) {
         lightData = null;
@@ -2275,7 +3093,7 @@ function plotSimState(divId, t, paths, bands, lightData, showBands) {
                       showlegend: p === 0 });
     }
 
-    Plotly.react(divId, traces, {
+    renderPlot(divId, traces, {
         ...baseLayout, ...styledAxes(1),
         title: { text: 'State and Player Estimates', y: 0.98, font: {size: 13, color: getThemeColors().title} },
         xaxis: { ...styledAxes(1).xaxis, title: {text: 't', font: {size: 11}} },
@@ -2322,7 +3140,7 @@ function plotSimControls(divId, t, paths, bands, lightData, showBands) {
                       showlegend: p === 0 });
     }
 
-    Plotly.react(divId, traces, {
+    renderPlot(divId, traces, {
         ...baseLayout, ...styledAxes(1),
         title: { text: 'Realized Controls (Primitive)', y: 0.98, font: {size: 13, color: getThemeColors().title} },
         xaxis: { ...styledAxes(1).xaxis, title: {text: 't', font: {size: 11}} },
@@ -2370,7 +3188,7 @@ function plotSimFilterError(divId, t, paths, bands, showBands) {
                       showlegend: p === 0 });
     }
 
-    Plotly.react(divId, traces, {
+    renderPlot(divId, traces, {
         ...baseLayout, ...styledAxes(1),
         title: { text: 'Filter Errors', y: 0.98, font: {size: 13, color: getThemeColors().title} },
         xaxis: { ...styledAxes(1).xaxis, title: {text: 't', font: {size: 11}} },
@@ -2403,8 +3221,8 @@ function computeAllocationSweep(p, Pbar) {
 
     const results = [];
     for (const f of fractions) {
-        const p1 = Math.sqrt(f * Pbar);
-        const p2 = Math.sqrt((1 - f) * Pbar);
+        const p1 = f * Pbar;
+        const p2 = (1 - f) * Pbar;
         const result = callLight(p1, p2, p.b1, p.b2, p.r1, p.r2);
         if (!result) continue;
 
@@ -2436,7 +3254,7 @@ function plotAllocationCosts(divId, ad) {
         { x: [f[0], f[f.length-1]], y: [ad.J2_pi, ad.J2_pi], name: '$J^2$ full-info',
           mode: 'lines', line: { width: 1, dash: 'dash', color: '#d62728' } },
     ];
-    Plotly.react(divId, traces, {
+    renderPlot(divId, traces, {
         ...baseLayout, ...styledAxes(1),
         height: plotH(320), margin: { t: 45, b: 45, l: 55, r: 15 },
         xaxis: { ...styledAxes(1).xaxis, title: { text: 'Fraction to player 1', font: { size: 11 } } },
@@ -2455,7 +3273,7 @@ function plotAllocationEffort(divId, ad) {
         { x: [f[0], f[f.length-1]], y: [ad.effortPI, ad.effortPI], name: 'Full-info',
           mode: 'lines', line: { width: 1, dash: 'dash', color: '#999' } },
     ];
-    Plotly.react(divId, traces, {
+    renderPlot(divId, traces, {
         ...baseLayout, ...styledAxes(1),
         height: plotH(320), margin: { t: 45, b: 45, l: 55, r: 15 },
         xaxis: { ...styledAxes(1).xaxis, title: { text: 'Fraction to player 1', font: { size: 11 } } },
@@ -2480,7 +3298,7 @@ function plotAllocationControls(divId, ad) {
         { x: [f[0], f[f.length-1]], y: [ad.avgD2pi, ad.avgD2pi], name: '$\\bar{D}^2$ CE',
           mode: 'lines', line: { width: 1, dash: 'dot', color: '#d62728' } },
     ];
-    Plotly.react(divId, traces, {
+    renderPlot(divId, traces, {
         ...baseLayout, ...styledAxes(1),
         height: plotH(320), margin: { t: 45, b: 45, l: 55, r: 15 },
         xaxis: { ...styledAxes(1).xaxis, title: { text: 'Fraction to player 1', font: { size: 11 } } },
@@ -2499,7 +3317,7 @@ function plotAllocationWedges(divId, ad) {
         { x: f, y: ad.results.map(r => r.peakV2), name: '$\\max_t |\\bar{V}^2|$',
           mode: 'lines+markers', line: { width: 2, color: '#d62728' }, marker: { size: 5 } },
     ];
-    Plotly.react(divId, traces, {
+    renderPlot(divId, traces, {
         ...baseLayout, ...styledAxes(1),
         height: plotH(320), margin: { t: 45, b: 45, l: 55, r: 15 },
         xaxis: { ...styledAxes(1).xaxis, title: { text: 'Fraction to player 1', font: { size: 11 } } },
@@ -2508,6 +3326,540 @@ function plotAllocationWedges(divId, ad) {
         legend: { x: 0.5, y: 1.0, xanchor: 'center', orientation: 'h', font: { size: 10 },
                   bgcolor: getThemeColors().legendBg, bordercolor: getThemeColors().legendBorder, borderwidth: 1 },
     }, plotCfg);
+}
+
+function stationarySeries(obj, ch = 0) {
+    return obj && obj[`ch${ch}`] ? obj[`ch${ch}`] : [];
+}
+
+function formatStationaryNum(x) {
+    return typeof x === 'number' && isFinite(x) ? x.toExponential(2) : 'n/a';
+}
+
+function maxAbsSeries(...seriesList) {
+    let m = 0;
+    for (const series of seriesList) {
+        for (const v of (series || [])) {
+            const av = Math.abs(v || 0);
+            if (av > m) m = av;
+        }
+    }
+    return m;
+}
+
+function stationaryChannelInfo(ch) {
+    const labels = [
+        {name: 'W\u2070 state-noise shock', math: '$W^0$'},
+        {name: 'W\u00B9 player-1 observation shock', math: '$W^1$'},
+        {name: 'W\u00B2 player-2 observation shock', math: '$W^2$'},
+    ];
+    return labels[ch] || labels[0];
+}
+
+function stationarySelectedChannel() {
+    const el = document.getElementById('stationary-channel');
+    const ch = el ? parseInt(el.value, 10) : 0;
+    return Number.isFinite(ch) ? Math.max(0, Math.min(2, ch)) : 0;
+}
+
+function stationaryParamNNAvailable() {
+    if (!STATIONARY_PARAM_NN) return false;
+    if (Array.isArray(STATIONARY_PARAM_NN.layers)) return true;
+    return STATIONARY_PARAM_NN.kind === 'stationary_param_pinn' &&
+           STATIONARY_PARAM_NN.nets &&
+           Array.isArray(STATIONARY_PARAM_NN.nets.a) &&
+           Array.isArray(STATIONARY_PARAM_NN.nets.b);
+}
+
+function stationaryIsParamNN(data) {
+    return data && (data.kind === 'param_nn' || data.kind === 'param_pinn');
+}
+
+function denseLayer(x, layer, applyTanh) {
+    const out = new Array(layer.b.length).fill(0);
+    for (let j = 0; j < layer.b.length; j++) {
+        let v = layer.b[j];
+        for (let i = 0; i < x.length; i++) v += x[i] * layer.W[i][j];
+        out[j] = applyTanh ? Math.tanh(v) : v;
+    }
+    return out;
+}
+
+function evalDenseMLP(layers, input) {
+    let h = input.slice();
+    for (let i = 0; i < layers.length; i++) {
+        h = denseLayer(h, layers[i], i < layers.length - 1);
+    }
+    return h;
+}
+
+function stationaryRowsToField(rows, offset) {
+    const field = {ch0: [], ch1: [], ch2: []};
+    for (const row of rows) {
+        field.ch0.push(row[offset]);
+        field.ch1.push(row[offset + 1]);
+        field.ch2.push(row[offset + 2]);
+    }
+    return field;
+}
+
+function stationarySubtractFields(a, b) {
+    const out = {ch0: [], ch1: [], ch2: []};
+    for (const ch of ['ch0', 'ch1', 'ch2']) {
+        const n = Math.min((a && a[ch] || []).length, (b && b[ch] || []).length);
+        for (let i = 0; i < n; i++) out[ch].push(a[ch][i] - b[ch][i]);
+    }
+    return out;
+}
+
+function stationaryPINNParamEncoding(model, params) {
+    const ranges = model.input && model.input.ranges ? model.input.ranges : {};
+    const pMin = ranges.p_min || 0.1;
+    const pMax = ranges.p_max || 40.0;
+    const rMin = ranges.r_min || 0.05;
+    const rMax = ranges.r_max || 1.0;
+    const raw = [params.p1, params.p2, params.r1, params.r2].map(v => Math.log(Math.max(v, 1e-8)));
+    const mins = [pMin, pMin, rMin, rMin].map(v => Math.log(Math.max(v, 1e-8)));
+    const maxs = [pMax, pMax, rMax, rMax].map(v => Math.log(Math.max(v, 1e-8)));
+    return raw.map((v, i) => {
+        const center = 0.5 * (mins[i] + maxs[i]);
+        const scale = Math.max(0.5 * (maxs[i] - mins[i]), 1e-8);
+        return (v - center) / scale;
+    });
+}
+
+function stationaryPINNBaselineA(model, params, a) {
+    const sigma = model.params && typeof model.params.sigma === 'number' ? model.params.sigma : 1.0;
+    const r1 = Math.max(params.r1, 1e-6);
+    const r2 = Math.max(params.r2, 1e-6);
+    const invSum = 1.0 / r1 + 1.0 / r2;
+    const s = Math.sqrt(1.0 / Math.max(invSum, 1e-8));
+    const decay = invSum * s;
+    const x0 = sigma * Math.exp(-decay * a);
+    const d10 = -(s / r1) * x0;
+    const d20 = -(s / r2) * x0;
+    return [
+        x0, 0, 0,
+        d10, 0, 0,
+        d20, 0, 0,
+        0, 0, 0,
+        0, 0, 0,
+        x0, 0, 0,
+        x0, 0, 0,
+    ];
+}
+
+function stationaryPINNBaselineB(model, params, b) {
+    const sigma = model.params && typeof model.params.sigma === 'number' ? model.params.sigma : 1.0;
+    const r1 = Math.max(params.r1, 1e-6);
+    const r2 = Math.max(params.r2, 1e-6);
+    const invSum = 1.0 / r1 + 1.0 / r2;
+    const s = Math.sqrt(1.0 / Math.max(invSum, 1e-8));
+    const decay = invSum * s;
+    const bPos = Math.max(b, 0.0);
+    const hx0 = b >= 0.0 ? s * sigma * Math.exp(-decay * bPos) : 0.0;
+    return [
+        hx0, 0, 0,
+        hx0, 0, 0,
+        0, 0, 0,
+        0, 0, 0,
+    ];
+}
+
+function evalStationaryParamPINN(params) {
+    const model = STATIONARY_PARAM_NN;
+    if (!model || !model.nets) return null;
+    const lag = model.lag || [];
+    const bLag = model.b_lag || [];
+    const pEnc = stationaryPINNParamEncoding(model, params);
+    const L = model.params && typeof model.params.L === 'number' ? model.params.L : 3.0;
+    const scaleA = model.output && typeof model.output.output_scale_a === 'number' ? model.output.output_scale_a : 1.0;
+    const scaleB = model.output && typeof model.output.output_scale_b === 'number' ? model.output.output_scale_b : 1.0;
+
+    const aRows = lag.map(a => {
+        const y = evalDenseMLP(model.nets.a, [...pEnc, 2.0 * a / L - 1.0]);
+        const base = stationaryPINNBaselineA(model, params, a);
+        return base.map((v, i) => v + scaleA * y[i]);
+    });
+    const bRows = bLag.map(b => {
+        const y = evalDenseMLP(model.nets.b, [...pEnc, b / L]);
+        const base = stationaryPINNBaselineB(model, params, b);
+        return base.map((v, i) => v + scaleB * y[i]);
+    });
+
+    const x = stationaryRowsToField(aRows, 0);
+    const xtilde1 = stationaryRowsToField(aRows, 15);
+    const xtilde2 = stationaryRowsToField(aRows, 18);
+    return {
+        kind: 'param_pinn',
+        source: 'Embedded stationary PINN weights',
+        converged: null,
+        p1: params.p1,
+        p2: params.p2,
+        r1: params.r1,
+        r2: params.r2,
+        N: model.params && model.params.N ? model.params.N : lag.length,
+        L,
+        quadrature: model.params && model.params.quadrature ? model.params.quadrature : 'unknown',
+        inner_quad: model.params && model.params.inner_quad,
+        lag,
+        b_lag: bLag,
+        diagnostics: model.diagnostics || {},
+        x,
+        xhat1: stationarySubtractFields(x, xtilde1),
+        xhat2: stationarySubtractFields(x, xtilde2),
+        xtilde1,
+        xtilde2,
+        d1: stationaryRowsToField(aRows, 3),
+        d2: stationaryRowsToField(aRows, 6),
+        calD1: stationaryRowsToField(aRows, 9),
+        calD2: stationaryRowsToField(aRows, 12),
+        hx1: stationaryRowsToField(bRows, 0),
+        hx2: stationaryRowsToField(bRows, 3),
+        wedge1: stationaryRowsToField(bRows, 6),
+        wedge2: stationaryRowsToField(bRows, 9),
+    };
+}
+
+function evalStationaryLegacyParamNN(params) {
+    const model = STATIONARY_PARAM_NN;
+    if (!stationaryParamNNAvailable()) return null;
+    const eps = 1e-8;
+    let h = [
+        Math.log(Math.max(params.p1, eps)),
+        Math.log(Math.max(params.p2, eps)),
+        Math.log(Math.max(params.r1, eps)),
+        Math.log(Math.max(params.r2, eps)),
+    ];
+    h = h.map((v, i) => (v - model.input_mean[i]) / model.input_scale[i]);
+    for (let i = 0; i < model.layers.length; i++) {
+        h = denseLayer(h, model.layers[i], i < model.layers.length - 1);
+    }
+    const y = h.map((v, i) => model.output_mean[i] + model.output_scale[i] * v);
+    const out = {
+        kind: 'param_nn',
+        source: 'Embedded NN from sliders',
+        converged: null,
+        p1: params.p1,
+        p2: params.p2,
+        r1: params.r1,
+        r2: params.r2,
+        N: model.diagnostics && model.diagnostics.N,
+        L: model.diagnostics && model.diagnostics.L,
+        lag: model.lag,
+        b_lag: model.b_lag,
+        train_ranges: model.train_ranges,
+        diagnostics: model.diagnostics || {},
+    };
+    for (const spec of model.fields) {
+        const grid = spec.grid === 'lag' ? model.lag : model.b_lag;
+        const values = y.slice(spec.offset, spec.offset + spec.length);
+        const field = {ch0: [], ch1: [], ch2: []};
+        for (let row = 0; row < grid.length; row++) {
+            field.ch0.push(values[3 * row]);
+            field.ch1.push(values[3 * row + 1]);
+            field.ch2.push(values[3 * row + 2]);
+        }
+        out[spec.name] = field;
+    }
+    return out;
+}
+
+function evalStationaryParamNN(params) {
+    const model = STATIONARY_PARAM_NN;
+    if (!stationaryParamNNAvailable()) return null;
+    if (model.kind === 'stationary_param_pinn') {
+        return evalStationaryParamPINN(params);
+    }
+    return evalStationaryLegacyParamNN(params);
+}
+
+function stationaryOutsideTrainingRange(params, model) {
+    if (!model) return [];
+    const out = [];
+    const rawRanges = model.train_ranges || null;
+    const pinnRanges = model.input && model.input.ranges ? model.input.ranges : null;
+    for (const key of ['p1', 'p2', 'r1', 'r2']) {
+        let range = rawRanges ? rawRanges[key] : null;
+        if (!range && pinnRanges) {
+            const isP = key === 'p1' || key === 'p2';
+            range = isP ? [pinnRanges.p_min, pinnRanges.p_max] : [pinnRanges.r_min, pinnRanges.r_max];
+        }
+        if (!range) continue;
+        const v = params[key];
+        if (v < range[0] || v > range[1]) out.push(`${key} outside [${range[0]}, ${range[1]}]`);
+    }
+    return out;
+}
+
+function stationarySourceLabel(data) {
+    if (!data) return 'n/a';
+    if (stationaryIsParamNN(data)) {
+        return data.kind === 'param_pinn'
+            ? 'Embedded parameter PINN weights from sliders'
+            : 'Embedded parameter NN weights from sliders';
+    }
+    if (data.kind === 'neural') {
+        const n = data.N ? `N=${data.N}` : 'N=n/a';
+        const f = data.features ? `, features=${data.features}` : '';
+        return `JAX neural/Galerkin (${n}${f})`;
+    }
+    return 'Native C++ stationary grid';
+}
+
+function stationaryStatusHtml(data) {
+    if (!data || data.converged === null || typeof data.converged === 'undefined') {
+        return '<span style="color:#999; font-weight:600;">diagnostic</span>';
+    }
+    return data.converged
+        ? '<span style="color:#2d9e2d; font-weight:600;">converged</span>'
+        : '<span style="color:#d62728; font-weight:600;">not converged</span>';
+}
+
+function stationaryResidualText(data) {
+    if (!data) return 'residual=n/a';
+    if (stationaryIsParamNN(data)) {
+        const d = data.diagnostics || {};
+        if (data.kind === 'param_pinn') {
+            const train = typeof d.train_rms === 'number' ? formatStationaryNum(d.train_rms) : 'n/a';
+            const val = typeof d.val_rms === 'number' ? formatStationaryNum(d.val_rms) : 'n/a';
+            const best = typeof d.best_val_rms === 'number' ? formatStationaryNum(d.best_val_rms) : 'n/a';
+            return `PINN train residual RMS=${train}, validation residual RMS=${val}, best=${best}, step=${d.step || 'n/a'}`;
+        }
+        const train = typeof d.train_rmse === 'number' ? formatStationaryNum(d.train_rmse) : 'n/a';
+        const val = typeof d.val_rmse === 'number' ? formatStationaryNum(d.val_rmse) : 'n/a';
+        return `NN train RMSE=${train}, validation RMSE=${val}, random samples=${d.n_samples || 'n/a'}`;
+    }
+    if (data.kind === 'neural') {
+        return `residual RMS=${formatStationaryNum(data.residual_rms)}, ` +
+               `nfev=${data.nfev || 'n/a'}, elapsed=${typeof data.elapsed_s === 'number' ? data.elapsed_s.toFixed(1) + 's' : 'n/a'}`;
+    }
+    return `relative residual=${formatStationaryNum(data.relative_residual)}, ` +
+           `absolute residual=${formatStationaryNum(data.absolute_residual)}, ` +
+           `iterations=${data.n_iters}`;
+}
+
+function stationaryTraceSuffix(data, comparison = false) {
+    if (!comparison) return '';
+    if (stationaryIsParamNN(data)) return ' NN';
+    return data && data.kind === 'neural' ? ' NN' : ' native';
+}
+
+function plotStationaryResults(params) {
+    const summaryEl = document.getElementById('stationary-summary');
+    const sliderParams = params || getParams();
+    const data = evalStationaryParamNN(sliderParams);
+    const comparisonData = null;
+    const sourceNote = data
+        ? 'evaluated in the browser from embedded weights and the current p/r sliders'
+        : '';
+
+    if (!data) {
+        if (summaryEl) {
+            summaryEl.innerHTML =
+                '<strong>No stationary weight model embedded.</strong><br>' +
+                'Train/export the stationary parameter model, then rebuild <code>interactive.html</code>.';
+        }
+        return false;
+    }
+
+    const ch = stationarySelectedChannel();
+    const info = stationaryChannelInfo(ch);
+    const c = getThemeColors();
+    const player1 = '#1f77b4';
+    const player2 = '#d62728';
+    const neutral = c.neutral || '#333';
+    const lag = data.lag || [];
+    const blag = data.b_lag || [];
+    const q = data.quadrature || (data.params && data.params.use_simpson_quadrature ? 'simpson' : 'unknown');
+    const status = stationaryStatusHtml(data);
+    const x = stationarySeries(data.x, ch);
+    const xhat1 = stationarySeries(data.xhat1, ch);
+    const xhat2 = stationarySeries(data.xhat2, ch);
+    const xtilde1 = stationarySeries(data.xtilde1, ch);
+    const xtilde2 = stationarySeries(data.xtilde2, ch);
+    const calD1 = stationarySeries(data.calD1, ch);
+    const calD2 = stationarySeries(data.calD2, ch);
+    const d1 = stationarySeries(data.d1, ch);
+    const d2 = stationarySeries(data.d2, ch);
+    const hx1 = stationarySeries(data.hx1, ch);
+    const hx2 = stationarySeries(data.hx2, ch);
+    const wedge1 = stationarySeries(data.wedge1, ch);
+    const wedge2 = stationarySeries(data.wedge2, ch);
+    const cmp = comparisonData ? {
+        lag: comparisonData.lag || [],
+        blag: comparisonData.b_lag || [],
+        x: stationarySeries(comparisonData.x, ch),
+        xhat1: stationarySeries(comparisonData.xhat1, ch),
+        xhat2: stationarySeries(comparisonData.xhat2, ch),
+        xtilde1: stationarySeries(comparisonData.xtilde1, ch),
+        xtilde2: stationarySeries(comparisonData.xtilde2, ch),
+        calD1: stationarySeries(comparisonData.calD1, ch),
+        calD2: stationarySeries(comparisonData.calD2, ch),
+        d1: stationarySeries(comparisonData.d1, ch),
+        d2: stationarySeries(comparisonData.d2, ch),
+        hx1: stationarySeries(comparisonData.hx1, ch),
+        hx2: stationarySeries(comparisonData.hx2, ch),
+        wedge1: stationarySeries(comparisonData.wedge1, ch),
+        wedge2: stationarySeries(comparisonData.wedge2, ch),
+    } : null;
+    const calD10 = calD1[0] || 0;
+    const calD20 = calD2[0] || 0;
+    const zeroLineLag = {type: 'line', x0: 0, x1: lag[lag.length - 1] || 1, y0: 0, y1: 0,
+                         line: {dash: 'dot', color: c.line, width: 1}};
+    const zeroLineBLag = {type: 'line', x0: blag[0] || -1, x1: blag[blag.length - 1] || 1, y0: 0, y1: 0,
+                          line: {dash: 'dot', color: c.line, width: 1}};
+
+    if (summaryEl) {
+        const rangeWarnings = stationaryIsParamNN(data)
+            ? stationaryOutsideTrainingRange(sliderParams, STATIONARY_PARAM_NN)
+            : [];
+        const warningText = rangeWarnings.length
+            ? `<br><span style="color:#b7791f;">Warning: ${rangeWarnings.join('; ')}. The embedded NN is extrapolating.</span>`
+            : '';
+        summaryEl.innerHTML =
+            `<strong>${stationarySourceLabel(data)}</strong> &mdash; ${status}<br>` +
+            `p\u2081=${data.p1}, p\u2082=${data.p2}, r\u2081=${data.r1}, r\u2082=${data.r2}, ` +
+            `N=${data.N}, L=${data.L}, quadrature=${q}<br>` +
+            `${stationaryResidualText(data)}<br>` +
+            `${sourceNote}<br>` +
+            `selected source=${info.name}; ` +
+            `max belief response=${formatStationaryNum(maxAbsSeries(x, xhat1, xhat2))}, ` +
+            `max control response=${formatStationaryNum(maxAbsSeries(calD1, calD2))}<br>` +
+            `zero-lag primitive controls for this source: ` +
+            `|\uD835\uDCD3\u00B9(0)|=${formatStationaryNum(Math.abs(calD10))}, ` +
+            `|\uD835\uDCD3\u00B2(0)|=${formatStationaryNum(Math.abs(calD20))}` +
+            warningText;
+    }
+
+    renderPlot('plot-stationary-beliefs', [
+        {x: lag, y: x, name: '$X(a)$',
+         mode: 'lines', line: {width: 2.4, color: neutral}},
+        {x: lag, y: xhat1, name: '$\\hat{X}^1(a)$',
+         mode: 'lines', line: {width: 2, color: player1, dash: 'dash'}},
+        {x: lag, y: xhat2, name: '$\\hat{X}^2(a)$',
+         mode: 'lines', line: {width: 2, color: player2, dash: 'dash'}},
+        ...(cmp ? [
+            {x: cmp.lag, y: cmp.x, name: `$X(a)${stationaryTraceSuffix(comparisonData, true)}$`,
+             mode: 'lines', line: {width: 1.7, color: neutral, dash: 'dot'}},
+            {x: cmp.lag, y: cmp.xhat1, name: `$\\hat{X}^1(a)${stationaryTraceSuffix(comparisonData, true)}$`,
+             mode: 'lines', line: {width: 1.5, color: player1, dash: 'dot'}},
+            {x: cmp.lag, y: cmp.xhat2, name: `$\\hat{X}^2(a)${stationaryTraceSuffix(comparisonData, true)}$`,
+             mode: 'lines', line: {width: 1.5, color: player2, dash: 'dot'}},
+        ] : []),
+    ], {
+        ...baseLayout, ...styledAxes(1),
+        height: plotH(360), margin: {t: 48, b: 45, l: 55, r: 20},
+        title: {text: `Belief IRFs from ${info.name}`, font: {size: 13, color: c.title}, y: 0.98},
+        xaxis: {...styledAxes(1).xaxis, title: {text: 'lag a', font: {size: 11}}},
+        yaxis: {...styledAxes(1).yaxis, title: {text: 'response', font: {size: 11}}},
+        shapes: [zeroLineLag],
+        legend: {orientation: 'h', y: 1.05, x: 0.5, xanchor: 'center', font: {size: 10},
+                 bgcolor: c.legendBg, bordercolor: c.legendBorder, borderwidth: 1},
+    }, plotCfg);
+
+    renderPlot('plot-stationary-actions', [
+        {x: lag, y: calD1, name: '$\\mathcal{D}^1(a)$',
+         mode: 'lines', line: {width: 2.2, color: player1}},
+        {x: lag, y: calD2, name: '$\\mathcal{D}^2(a)$',
+         mode: 'lines', line: {width: 2.2, color: player2}},
+        ...(cmp ? [
+            {x: cmp.lag, y: cmp.calD1, name: `$\\mathcal{D}^1(a)${stationaryTraceSuffix(comparisonData, true)}$`,
+             mode: 'lines', line: {width: 1.6, color: player1, dash: 'dot'}},
+            {x: cmp.lag, y: cmp.calD2, name: `$\\mathcal{D}^2(a)${stationaryTraceSuffix(comparisonData, true)}$`,
+             mode: 'lines', line: {width: 1.6, color: player2, dash: 'dot'}},
+        ] : []),
+    ], {
+        ...baseLayout, ...styledAxes(1),
+        height: plotH(340), margin: {t: 48, b: 45, l: 55, r: 20},
+        title: {text: `Primitive-control IRFs from ${info.name}`, font: {size: 13, color: c.title}, y: 0.98},
+        xaxis: {...styledAxes(1).xaxis, title: {text: 'lag a', font: {size: 11}}},
+        yaxis: {...styledAxes(1).yaxis, title: {text: 'control response', font: {size: 11}}},
+        shapes: [zeroLineLag],
+        legend: {orientation: 'h', y: 1.05, x: 0.5, xanchor: 'center', font: {size: 10},
+                 bgcolor: c.legendBg, bordercolor: c.legendBorder, borderwidth: 1},
+    }, plotCfg);
+
+    renderPlot('plot-stationary-feedback', [
+        {x: lag, y: d1, name: '$D^1(a)$',
+         mode: 'lines', line: {width: 2.2, color: player1}},
+        {x: lag, y: d2, name: '$D^2(a)$',
+         mode: 'lines', line: {width: 2.2, color: player2}},
+        ...(cmp ? [
+            {x: cmp.lag, y: cmp.d1, name: `$D^1(a)${stationaryTraceSuffix(comparisonData, true)}$`,
+             mode: 'lines', line: {width: 1.6, color: player1, dash: 'dot'}},
+            {x: cmp.lag, y: cmp.d2, name: `$D^2(a)${stationaryTraceSuffix(comparisonData, true)}$`,
+             mode: 'lines', line: {width: 1.6, color: player2, dash: 'dot'}},
+        ] : []),
+    ], {
+        ...baseLayout, ...styledAxes(1),
+        height: plotH(320), margin: {t: 48, b: 45, l: 55, r: 20},
+        title: {text: `Noise-state feedback IRFs from ${info.name}`, font: {size: 13, color: c.title}, y: 0.98},
+        xaxis: {...styledAxes(1).xaxis, title: {text: 'lag a', font: {size: 11}}},
+        yaxis: {...styledAxes(1).yaxis, title: {text: 'feedback response', font: {size: 11}}},
+        shapes: [zeroLineLag],
+        legend: {orientation: 'h', y: 1.05, x: 0.5, xanchor: 'center', font: {size: 10},
+                 bgcolor: c.legendBg, bordercolor: c.legendBorder, borderwidth: 1},
+    }, plotCfg);
+
+    renderPlot('plot-stationary-unresolved', [
+        {x: lag, y: xtilde1, name: '$\\widetilde{X}^1(a)$',
+         mode: 'lines', line: {width: 2.2, color: player1}},
+        {x: lag, y: xtilde2, name: '$\\widetilde{X}^2(a)$',
+         mode: 'lines', line: {width: 2.2, color: player2}},
+        ...(cmp ? [
+            {x: cmp.lag, y: cmp.xtilde1, name: `$\\widetilde{X}^1(a)${stationaryTraceSuffix(comparisonData, true)}$`,
+             mode: 'lines', line: {width: 1.6, color: player1, dash: 'dot'}},
+            {x: cmp.lag, y: cmp.xtilde2, name: `$\\widetilde{X}^2(a)${stationaryTraceSuffix(comparisonData, true)}$`,
+             mode: 'lines', line: {width: 1.6, color: player2, dash: 'dot'}},
+        ] : []),
+    ], {
+        ...baseLayout, ...styledAxes(1),
+        height: plotH(340), margin: {t: 48, b: 45, l: 55, r: 20},
+        title: {text: `Unresolved belief-error IRFs from ${info.name}`, font: {size: 13, color: c.title}, y: 0.98},
+        xaxis: {...styledAxes(1).xaxis, title: {text: 'lag a', font: {size: 11}}},
+        yaxis: {...styledAxes(1).yaxis, title: {text: 'unresolved response', font: {size: 11}}},
+        shapes: [zeroLineLag],
+        legend: {orientation: 'h', y: 1.05, x: 0.5, xanchor: 'center', font: {size: 10},
+                 bgcolor: c.legendBg, bordercolor: c.legendBorder, borderwidth: 1},
+    }, plotCfg);
+
+    renderPlot('plot-stationary-adjoints', [
+        {x: blag, y: hx1, name: '$h_X^1(b)$',
+         mode: 'lines', line: {width: 2, color: player1}, xaxis: 'x1', yaxis: 'y1'},
+        {x: blag, y: hx2, name: '$h_X^2(b)$',
+         mode: 'lines', line: {width: 2, color: player2}, xaxis: 'x1', yaxis: 'y1'},
+        {x: blag, y: wedge1, name: '$v^1(b)$',
+         mode: 'lines', line: {width: 2, color: player1}, xaxis: 'x2', yaxis: 'y2'},
+        {x: blag, y: wedge2, name: '$v^2(b)$',
+         mode: 'lines', line: {width: 2, color: player2}, xaxis: 'x2', yaxis: 'y2'},
+        ...(cmp ? [
+            {x: cmp.blag, y: cmp.hx1, name: `$h_X^1(b)${stationaryTraceSuffix(comparisonData, true)}$`,
+             mode: 'lines', line: {width: 1.5, color: player1, dash: 'dot'}, xaxis: 'x1', yaxis: 'y1'},
+            {x: cmp.blag, y: cmp.hx2, name: `$h_X^2(b)${stationaryTraceSuffix(comparisonData, true)}$`,
+             mode: 'lines', line: {width: 1.5, color: player2, dash: 'dot'}, xaxis: 'x1', yaxis: 'y1'},
+            {x: cmp.blag, y: cmp.wedge1, name: `$v^1(b)${stationaryTraceSuffix(comparisonData, true)}$`,
+             mode: 'lines', line: {width: 1.5, color: player1, dash: 'dot'}, xaxis: 'x2', yaxis: 'y2'},
+            {x: cmp.blag, y: cmp.wedge2, name: `$v^2(b)${stationaryTraceSuffix(comparisonData, true)}$`,
+             mode: 'lines', line: {width: 1.5, color: player2, dash: 'dot'}, xaxis: 'x2', yaxis: 'y2'},
+        ] : []),
+    ], {
+        ...baseLayout,
+        height: plotH(370), margin: {t: 58, b: 45, l: 55, r: 25},
+        title: {text: `Backward adjoint and wedge IRFs from ${info.name}`, font: {size: 13, color: c.title}, y: 0.99},
+        xaxis: {domain: [0, 0.47], gridcolor: c.grid, linecolor: c.line, tickfont: {color: c.font}, title: {text: 'two-sided lag b', font: {size: 11}}},
+        yaxis: {gridcolor: c.grid, linecolor: c.line, tickfont: {color: c.font}, title: {text: 'adjoint', font: {size: 11}}},
+        xaxis2: {domain: [0.55, 1], gridcolor: c.grid, linecolor: c.line, tickfont: {color: c.font}, title: {text: 'two-sided lag b', font: {size: 11}}},
+        yaxis2: {anchor: 'x2', gridcolor: c.grid, linecolor: c.line, tickfont: {color: c.font}, title: {text: 'wedge', font: {size: 11}}},
+        shapes: [{...zeroLineBLag, xref: 'x1', yref: 'y1'}, {...zeroLineBLag, xref: 'x2', yref: 'y2'}],
+        annotations: [
+            {x: 0.235, y: 1.08, xref: 'paper', yref: 'paper', text: '$h_X^i$', showarrow: false, font: {size: 12, color: c.annotation}},
+            {x: 0.775, y: 1.08, xref: 'paper', yref: 'paper', text: '$v^i$', showarrow: false, font: {size: 12, color: c.annotation}},
+        ],
+        legend: {orientation: 'h', y: -0.16, x: 0.5, xanchor: 'center', font: {size: 10},
+                 bgcolor: c.legendBg, bordercolor: c.legendBorder, borderwidth: 1},
+    }, plotCfg);
+    return true;
 }
 
 function ensureLight(p) {
@@ -2657,7 +4009,7 @@ function renderTab(tab, p) {
             }
             case 'tab-allocation': {
                 const Pbar = parseFloat(document.getElementById('sl-Pbar').value);
-                const allocKey = `${p.r1},${p.r2},${p.b1},${p.b2},${p.T},${p.N},${Pbar}`;
+                const allocKey = `${p.r1},${p.r2},${p.b1},${p.b2},${p.qT},${p.T},${p.N},${Pbar}`;
                 if (allocKey !== lastAllocKey) {
                     allocData = null;
                     lastAllocKey = allocKey;
@@ -2673,6 +4025,24 @@ function renderTab(tab, p) {
                 plotAllocationWedges('plot-alloc-wedges', allocData);
                 break;
             }
+            case 'tab-stationary': {
+                const sPanels = document.querySelectorAll('#tab-stationary .subtab-panel');
+                const sActiveBtn = document.querySelector('#tab-stationary .subtab-btn.active');
+                const sActiveId = sActiveBtn ? sActiveBtn.dataset.subtab : 'stationary-beliefs';
+                sPanels.forEach(el => el.classList.add('active'));
+                ok = plotStationaryResults(p);
+                sPanels.forEach(el => { if (el.id !== sActiveId) el.classList.remove('active'); });
+                break;
+            }
+            case 'tab-kyle-back': {
+                const kbPanels = document.querySelectorAll('#tab-kyle-back .subtab-panel');
+                const kbActiveBtn = document.querySelector('#tab-kyle-back .subtab-btn.active');
+                const kbActiveId = kbActiveBtn ? kbActiveBtn.dataset.subtab : 'kyle-model';
+                kbPanels.forEach(el => el.classList.add('active'));
+                ok = plotKyleBackResults();
+                kbPanels.forEach(el => { if (el.id !== kbActiveId) el.classList.remove('active'); });
+                break;
+            }
             case 'tab-diagnostics': {
                 const data = ensureLight(p);
                 if (!data) { ok = false; break; }
@@ -2685,11 +4055,15 @@ function renderTab(tab, p) {
                         ? '<span style="color:#d62728; font-weight:600;">NOT CONVERGED</span>'
                         : '<span style="color:#2d9e2d; font-weight:600;">Converged</span>';
                     const ceStr = data.ce_mode
-                        ? '<span style="color:#1f77b4; font-weight:600;">Exact discrete CE</span>'
+                        ? '<span style="color:#1f77b4; font-weight:600;">Exact projection filter</span>'
                         : 'Volterra kernel (standard)';
+                    const relaxStr = data.picard_relax_min != null
+                        ? `Step length: adaptive, starts at ${data.picard_relax}, range [${data.picard_relax_min}, ${data.picard_relax_max}]<br>`
+                        : '';
                     summaryEl.innerHTML =
                         `<strong>Solver summary</strong><br>` +
-                        `Method: Anderson-accelerated Picard iteration on the best-response map D \u2192 G(D)<br>` +
+                        `Method: adaptively damped Picard iteration on the best-response map D \u2192 G(D)<br>` +
+                        relaxStr +
                         `Filter: ${ceStr}<br>` +
                         `Iterations: ${data.n_iters}<br>` +
                         `Final relative residual: ${finalResid}<br>` +
@@ -2700,6 +4074,12 @@ function renderTab(tab, p) {
                 // Projection check: (F^i + Pi^i)^2 = F^i + Pi^i
                 const projEl = document.getElementById('diag-projection');
                 if (projEl) {
+                    if (p.N > 80) {
+                        projEl.innerHTML =
+                            '<strong>Projection check skipped at high N.</strong><br>' +
+                            '<span style="font-size:0.88em; color:#888;">The full idempotence check is cubic in N and can dominate the browser runtime. Lower N to 80 or less to run it.</span>';
+                        break;
+                    }
                     const fk = ensureFKernel(p);
                     if (fk) {
                         const n = fk.t.length;
@@ -2743,7 +4123,7 @@ function renderTab(tab, p) {
                         const passColor = e => e < 1e-3 ? '#2d9e2d' : (e < 1e-1 ? '#e67e22' : '#d62728');
                         const passLabel = e => e < 1e-3 ? 'PASS' : (e < 1e-1 ? 'MARGINAL' : 'FAIL');
                         const ceMode = light && light.ce_mode;
-                        const projTitle = ceMode ? 'Exact discrete CE projection' : 'Filtration projection check';
+                        const projTitle = ceMode ? 'Exact discrete projection' : 'Filtration projection check';
                         const projDesc = ceMode
                             ? 'The exact discrete conditional expectation $M^i = H^T(HH^T)^{-1}H$ is an orthogonal projection by construction. The F kernel is extracted as $F^i = (M^i - \\Pi^i\\delta) / \\Delta t$.'
                             : 'The filtration kernel $F^i(T,u,s) + \\Pi^i \\delta(u{=}s)$ should be an orthogonal projection (idempotent) in $L^2([0,T]; \\mathbb{R}^3)$, representing the conditional expectation operator in noise-state coordinates.';
@@ -2767,14 +4147,16 @@ function renderTab(tab, p) {
         }
         if (ok) dirty[tab] = false;
         // If solver failed, leave tab dirty so it retries on next update
+        return ok;
     } catch (e) {
         showError(`renderTab \u2192 ${tab}`, e, p);
         document.getElementById('status').textContent = `Error rendering ${tab}: ${e.message}`;
+        return false;
     }
 }
 
 function resetSolverState() {
-    // Nuclear reset: wipe all caches, re-init WASM grid and CE mode
+    // Reset caches and re-init WASM grid/filter mode.
     lightData = null; fullData = null; sweepData = null; fKernelData = null;
     allocData = null; lastParamsKey = '';
     for (const k in dirty) dirty[k] = true;
@@ -2801,38 +4183,56 @@ function updateActive() {
         const p = getParams();
         try {
             const t0 = performance.now();
-            renderTab(activeTab, p);
+            const renderOk = renderTab(activeTab, p);
             const totalMs = performance.now() - t0;
 
             if (pendingUpdate) return;
-
-            const data = ensureLight(p);
-            if (data) {
-                const warn = data.converged === false ? ' | NOT CONVERGED' : '';
-                const ceTag = data.ce_mode ? ' | CE' : '';
-                const lastResid = data.residuals && data.residuals.length > 0
-                    ? data.residuals[data.residuals.length - 1] : null;
-                const finalResid = lastResid != null && typeof lastResid === 'number' && isFinite(lastResid)
-                    ? ` | resid=${lastResid.toExponential(2)}` : '';
-                statusEl.textContent =
-                    `N=${p.N} T=${p.T} p\u2081=${p.p1} p\u2082=${p.p2} b\u2081=${p.b1} b\u2082=${p.b2} r\u2081=${p.r1} r\u2082=${p.r2} x\u2080=${p.x0} \u03C3=${p.sigma} | ` +
-                    `${data.n_iters} iters | J\u00B9=${data.J1 != null ? data.J1.toFixed(4) : '?'} J\u00B2=${data.J2 != null ? data.J2.toFixed(4) : '?'} | ` +
-                    `${totalMs.toFixed(0)}ms${ceTag}${finalResid}${warn}`;
-                statusEl.style.color = data.converged === false ? '#d62728' : '';
-                // Show detailed convergence warning panel if not converged
-                if (data.converged === false) {
-                    showConvergenceWarning(data, p);
-                } else {
-                    dismissError();
-                }
-            } else {
-                statusEl.textContent = `Solver returned no data (solve_light returned null) \u2014 retrying on next change`;
+            if (!renderOk) {
+                statusEl.textContent = `Rendering ${activeTab.replace('tab-', '')} did not complete`;
                 statusEl.style.color = '#e67e22';
-                // showError may already have been called by callLight; if not, add context
-                if (document.getElementById('error-panel').style.display === 'none') {
-                    showError('updateActive \u2192 ensureLight', new Error('Solver returned null \u2014 WASM call may have thrown (check above) or returned invalid JSON'), p);
+                return;
+            }
+
+            if (activeTab === 'tab-kyle-back') {
+                const d = KYLE_BACK_EQUILIBRIUM && KYLE_BACK_EQUILIBRIUM.diagnostics ? KYLE_BACK_EQUILIBRIUM.diagnostics : {};
+                statusEl.textContent =
+                    `Kyle-Back coupled PINN rendered | RMS=${kyleFmt(d.rms, 6)} loss=${kyleFmt(d.loss, 6)} | ${totalMs.toFixed(0)}ms`;
+                statusEl.style.color = '';
+                dismissError();
+            } else if (!LIGHT_STATUS_TABS.has(activeTab)) {
+                statusEl.textContent =
+                    `N=${p.N} T=${p.T} p\u2081=${p.p1} p\u2082=${p.p2} b\u2081=${p.b1} b\u2082=${p.b2} r\u2081=${p.r1} r\u2082=${p.r2} x\u2080=${p.x0} \u03C3=${p.sigma} qT=${p.qT} | ${activeTab.replace('tab-', '')} rendered | ${totalMs.toFixed(0)}ms`;
+                statusEl.style.color = '';
+                dismissError();
+            } else {
+                const data = ensureLight(p);
+                if (data) {
+                    const warn = data.converged === false ? ' | NOT CONVERGED' : '';
+                    const ceTag = data.ce_mode ? ' | exact projection' : '';
+                    const lastResid = data.residuals && data.residuals.length > 0
+                        ? data.residuals[data.residuals.length - 1] : null;
+                    const finalResid = lastResid != null && typeof lastResid === 'number' && isFinite(lastResid)
+                        ? ` | resid=${lastResid.toExponential(2)}` : '';
+                    statusEl.textContent =
+                        `N=${p.N} T=${p.T} p\u2081=${p.p1} p\u2082=${p.p2} b\u2081=${p.b1} b\u2082=${p.b2} r\u2081=${p.r1} r\u2082=${p.r2} x\u2080=${p.x0} \u03C3=${p.sigma} qT=${p.qT} | ` +
+                        `${data.n_iters} iters | J\u00B9=${data.J1 != null ? data.J1.toFixed(4) : '?'} J\u00B2=${data.J2 != null ? data.J2.toFixed(4) : '?'} | ` +
+                        `${totalMs.toFixed(0)}ms${ceTag}${finalResid}${warn}`;
+                    statusEl.style.color = data.converged === false ? '#d62728' : '';
+                    // Show detailed convergence warning panel if not converged
+                    if (data.converged === false) {
+                        showConvergenceWarning(data, p);
+                    } else {
+                        dismissError();
+                    }
+                } else {
+                    statusEl.textContent = `Solver returned no data (solve_light returned null) \u2014 retrying on next change`;
+                    statusEl.style.color = '#e67e22';
+                    // showError may already have been called by callLight; if not, add context
+                    if (document.getElementById('error-panel').style.display === 'none') {
+                        showError('updateActive \u2192 ensureLight', new Error('Solver returned null \u2014 WASM call may have thrown (check above) or returned invalid JSON'), p);
+                    }
+                    resetSolverState();
                 }
-                resetSolverState();
             }
         } catch (e) {
             showError(`updateActive \u2192 ${activeTab}`, e, p);
@@ -2883,28 +4283,31 @@ SolverModule().then(mod => {
     solveFullBin = mod.cwrap('solve_full_bin', 'number', ['number', 'number', 'number', 'number', 'number', 'number']);
     solveSweep = mod.cwrap('solve_sweep', 'number', ['number', 'number', 'number', 'number', 'number', 'number', 'number']);
     solveFKernelBin = mod.cwrap('solve_f_kernel_bin', 'number', ['number', 'number', 'number', 'number', 'number', 'number']);
-wasmSetGrid = mod.cwrap('wasm_set_grid', null, ['number', 'number']);
+    wasmSetGrid = mod.cwrap('wasm_set_grid', null, ['number', 'number']);
     wasmSetSigma = mod.cwrap('wasm_set_sigma', null, ['number']);
     wasmSetX0 = mod.cwrap('wasm_set_x0', null, ['number']);
+    wasmSetTerminalWeight = mod.cwrap('wasm_set_terminal_weight', null, ['number']);
+    wasmReleaseTransferBuffers = mod.cwrap('wasm_release_transfer_buffers', null, []);
     wasmMalloc = mod._malloc;
     wasmFree = mod._free;
     try { wasmFullKernelCount = mod.cwrap('full_kernel_count', 'number', []); } catch(e) {}
 
-    // Set initial grid and CE mode
+    // Set initial grid and filter mode.
     wasmSetGrid(40, 1.0);
     wasmSetSigma(1.0);
     wasmSetX0(0.0);
+    wasmSetTerminalWeight(0.0);
     wasmSetCeMode = mod.cwrap('wasm_set_ce_mode', null, ['number']);
-    wasmSetCeMode(1);  // CE mode on by default
+    wasmSetCeMode(1);  // exact projection mode on by default
 
     document.getElementById('loading').style.display = 'none';
     document.getElementById('app').style.display = 'block';
 
-    for (const id of ['sl-p1', 'sl-p2', 'sl-b1', 'sl-b2', 'sl-r1', 'sl-r2', 'sl-x0', 'sl-sigma', 'sl-N', 'sl-T']) {
+    for (const id of ['sl-p1', 'sl-p2', 'sl-b1', 'sl-b2', 'sl-r1', 'sl-r2', 'sl-x0', 'sl-sigma', 'sl-qT', 'sl-N', 'sl-T']) {
         document.getElementById(id).addEventListener('input', onSliderChange);
     }
 
-    // CE mode toggle (wasmSetCeMode already initialized above)
+    // Filter mode toggle (wasmSetCeMode already initialized above)
     document.getElementById('cb-ce-mode').addEventListener('change', function() {
         wasmSetCeMode(this.checked ? 1 : 0);
         onSliderChange();
@@ -2945,6 +4348,23 @@ wasmSetGrid = mod.cwrap('wasm_set_grid', null, ['number', 'number']);
     }
     document.getElementById('impulse-s').addEventListener('input', onImpulseChange);
     document.getElementById('impulse-channel').addEventListener('change', onImpulseChange);
+
+    function onStationaryChange() {
+        if (activeTab !== 'tab-stationary') return;
+        dirty['tab-stationary'] = true;
+        updateActive();
+    }
+    document.getElementById('stationary-channel').addEventListener('change', onStationaryChange);
+
+    function onKyleBackChange() {
+        if (activeTab !== 'tab-kyle-back') return;
+        dirty['tab-kyle-back'] = true;
+        updateActive();
+    }
+    ['kyle-source-select'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.addEventListener('change', onKyleBackChange);
+    });
 
     // Simulation controls
     function onSimChange() {
@@ -2999,14 +4419,16 @@ wasmSetGrid = mod.cwrap('wasm_set_grid', null, ['number', 'number']);
         }
         // Restore slider values
         const sliderMap = {p1:'sl-p1', p2:'sl-p2', r1:'sl-r1', r2:'sl-r2',
-                           b1:'sl-b1', b2:'sl-b2', x0:'sl-x0', sigma:'sl-sigma', N:'sl-N', T:'sl-T'};
+                           b1:'sl-b1', b2:'sl-b2', x0:'sl-x0', sigma:'sl-sigma',
+                           qT:'sl-qT', N:'sl-N', T:'sl-T'};
         for (const [k, v] of Object.entries(hashParams)) {
             const el = document.getElementById(sliderMap[k]);
-            if (el && !isNaN(v)) el.value = v;
+            if (el && !isNaN(v)) el.value = clampSliderValue(el, v);
         }
     }
 
-updateLabels();
+    updateLabels();
+    history.replaceState(null, '', paramsToHash(getParams(), activeTab) || window.location.pathname);
     updateActive();
 }).catch(err => {
     const loadEl = document.getElementById('loading');
@@ -3017,7 +4439,7 @@ updateLabels();
         `<div class="error-header">WASM Load Failure</div>` +
         `<div class="error-stage">Stage: SolverModule() initialization</div>` +
         `<div>Message: ${err.message || String(err)}</div>` +
-        `<div>This usually means the solver.js or .wasm file failed to download or compile.</div>` +
+        `<div>This usually means the inline solver failed to compile or initialize.</div>` +
         (err.stack ? `<div class="error-stack">Stack trace:\n${err.stack.split('\n').slice(0, 6).join('\n')}</div>` : '');
     panel.style.display = 'block';
     console.error('WASM module load failed:', err);
