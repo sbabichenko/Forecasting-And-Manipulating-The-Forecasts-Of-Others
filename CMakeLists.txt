@@ -118,3 +118,17 @@ target_compile_options(test_stationarity PRIVATE -O3 -march=native)
 if(OpenMP_CXX_FOUND)
     target_link_libraries(test_stationarity PRIVATE OpenMP::OpenMP_CXX)
 endif()
+
+# Inventory variant of the Kyle-Back spectral solver (was never wired into the build before 2026-09-03).
+add_executable(kb_inventory kb_inventory.cpp)
+target_link_libraries(kb_inventory PRIVATE Eigen3::Eigen)
+target_compile_options(kb_inventory PRIVATE -O3 -march=native -DNDEBUG -std=c++17)
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(kb_inventory PRIVATE OpenMP::OpenMP_CXX)
+endif()
+
+# Tests: `cmake --build build && ctest --test-dir build`
+enable_testing()
+add_test(NAME exact_ce COMMAND test_exact_ce)
+add_test(NAME ce_picard COMMAND test_ce_picard)
+add_test(NAME stationarity_N40 COMMAND test_stationarity 40 1 1 1 1.0 0)
