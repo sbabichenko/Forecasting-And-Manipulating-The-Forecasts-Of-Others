@@ -1,6 +1,6 @@
 #!/bin/bash
 # continuation in p_Q at the target cost, warm-starting from the previous tilt
-cd /home/sbabichenko/.claude/jobs/fe98da7b/tmp
+cd "${WORKDIR:-.}"   # the directory holding the built solver binaries
 N=$1; L=$2; shift 2; prev=""
 echo "# N=$N L=$L" > chain_N${N}_L${L}.txt
 for pq in "$@"; do
